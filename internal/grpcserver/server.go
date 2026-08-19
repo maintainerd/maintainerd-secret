@@ -9,7 +9,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/maintainerd/sdk/kit/setup"
+	"github.com/maintainerd/kit/setup"
 
 	secretv1 "github.com/maintainerd/secret/gen/maintainerd/secret/v1"
 	"github.com/maintainerd/secret/internal/store"

@@ -2,10 +2,10 @@ module github.com/maintainerd/secret
 
 go 1.26.6
 
-replace github.com/maintainerd/sdk/kit => ../maintainerd-sdk/kit
+replace github.com/maintainerd/kit => ../maintainerd-kit
 
 require (
-	github.com/maintainerd/sdk/kit v0.0.0-00010101000000-000000000000
+	github.com/maintainerd/kit v0.0.0-00010101000000-000000000000
 	google.golang.org/grpc v1.83.1
 	google.golang.org/protobuf v1.36.11
 )

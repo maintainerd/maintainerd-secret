@@ -12,10 +12,10 @@ import (
 
 	"google.golang.org/grpc"
 
-	"github.com/maintainerd/sdk/kit/config"
-	"github.com/maintainerd/sdk/kit/log"
-	"github.com/maintainerd/sdk/kit/server"
-	"github.com/maintainerd/sdk/kit/setup"
+	"github.com/maintainerd/kit/config"
+	"github.com/maintainerd/kit/log"
+	"github.com/maintainerd/kit/server"
+	"github.com/maintainerd/kit/setup"
 
 	secretv1 "github.com/maintainerd/secret/gen/maintainerd/secret/v1"
 	"github.com/maintainerd/secret/internal/grpcserver"
