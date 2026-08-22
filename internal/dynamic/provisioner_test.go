@@ -356,7 +356,15 @@ func TestAMalformedDSNIsReportedWithoutEchoingIt(t *testing.T) {
 // so propagating a raw driver error writes a live credential into an error response, a
 // server log AND an append-only audit row, which cannot be taken back.
 func TestSanitizedKeepsAPasswordOutOfADriverError(t *testing.T) {
-	const password = "Xq7bR2mZ9pL4vT6yK1nW8sC3dG5hJ0fA"
+	// Generated rather than hardcoded, for two reasons. It exercises the shape the
+	// service actually produces — full length, real charset — instead of a shorter
+	// hand-picked stand-in that might be redacted by luck. And a high-entropy literal
+	// committed to a secret manager's own repository is what its secret scanner exists
+	// to flag; a fake one is indistinguishable from a real one to the scanner, so it
+	// would have to be permanently excepted, and every such exception is a place a real
+	// credential could later hide.
+	password, err := NewPassword()
+	require.NoError(t, err)
 	statement := fmt.Sprintf("CREATE ROLE m9d_abc LOGIN PASSWORD '%s' VALID UNTIL '2026-08-22T15:00:00Z'", password)
 
 	cases := map[string]error{
@@ -506,7 +514,15 @@ func TestScrubbedNeverLeavesTheContentOfAQuotedRun(t *testing.T) {
 // statement Render actually produces. Config.Validate now enforces exactly that, and
 // this test holds both halves: the refusal, and the disclosure that justifies it.
 func TestAnOverQuotedTemplateIsRefusedBecauseItDefeatsTheRedaction(t *testing.T) {
-	const password = "Xq7bR2mZ9pL4vT6yK1nW8sC3dG5hJ0fA"
+	// Generated rather than hardcoded, for two reasons. It exercises the shape the
+	// service actually produces — full length, real charset — instead of a shorter
+	// hand-picked stand-in that might be redacted by luck. And a high-entropy literal
+	// committed to a secret manager's own repository is what its secret scanner exists
+	// to flag; a fake one is indistinguishable from a real one to the scanner, so it
+	// would have to be permanently excepted, and every such exception is a place a real
+	// credential could later hide.
+	password, err := NewPassword()
+	require.NoError(t, err)
 
 	// THE REFUSAL. An over-quoted placeholder is unstorable, on either side of the
 	// placeholder and for the expiration literal as well — the same lexing argument

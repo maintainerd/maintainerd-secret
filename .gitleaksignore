@@ -1,0 +1,30 @@
+# Gitleaks false-positive fingerprints.
+#
+# Format: <commit>:<file>:<rule-id>:<line>
+#
+# THIS FILE IS FOR HISTORY, NOT FOR THE WORKING TREE. Gitleaks scans every commit,
+# so a finding stays reported after the offending line is removed — and rewriting
+# published history is not an option here (force-push is forbidden in this project).
+# So the rule is: fix the working tree forward, and fingerprint the commit that
+# already shipped. An entry here should always be paired with a fix, never used as
+# a way to keep a finding.
+#
+# Prefer a fingerprint over widening the allowlist in .gitleaks.toml. A fingerprint
+# excuses exactly one line of one file in one commit; a path allowlist excuses
+# everything in that path forever, which in a secret manager is the shape of hole
+# that lets a real key through unnoticed.
+
+# Two hardcoded high-entropy test passwords in the dynamic-credential provisioner
+# tests. They were fixtures for the redaction assertions — the value a test proves
+# does NOT reach an error, a log line or an audit row — so neither was ever a live
+# credential.
+#
+# FIXED FORWARD: both now come from dynamic.NewPassword() instead of a literal. That
+# is a better test as well as a clean scan, because it exercises the shape the service
+# actually generates (full length, real charset) rather than a shorter hand-picked
+# stand-in that could be redacted by luck. And it removes the underlying problem: to a
+# scanner a fake high-entropy literal is indistinguishable from a real one, so keeping
+# it would have required a permanent exception — and every permanent exception is a
+# place a real credential can later hide.
+f0ccdea844b37ec088f9440ea8638861b93cb3a0:internal/dynamic/provisioner_test.go:generic-api-key:359
+f0ccdea844b37ec088f9440ea8638861b93cb3a0:internal/dynamic/provisioner_test.go:generic-api-key:509
