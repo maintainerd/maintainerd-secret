@@ -91,13 +91,55 @@ too late.
 
 ## Owns
 
-`maintainerd.secret.v1.SecretService` (gRPC `:9092`): `Ping · Setup · Put · Get ·
+**gRPC `:9092`** — `maintainerd.secret.v1.SecretService`: `Ping · Setup · Put · Get ·
 List · Delete`. The flat key is mapped onto the real hierarchy
 (`db/primary/password` → folder `/db/primary`, key `password`), so a secret written
-through it is an ordinary secret. The hierarchical API, authorization middleware and
-console are the next wave.
+through it is an ordinary secret.
+
+**REST `:8092`** — the hierarchical API under `/api/v1`, plus an unguarded
+`/healthz`. Segments are **flat** (`/projects`, `/environments`, `/folders`,
+`/secrets`, `/bulk`, `/imports`, `/webhooks`, `/audit`, `/setup`) rather than nested,
+which is what makes the guard's per-segment permission allowlist meaningful: an
+unmapped segment is denied even to a valid token.
+
+Reveal and batch-get are **POSTs despite being reads**. A secret's address in a URL
+ends up in access logs, proxy logs, browser history and referer headers; a body does
+not. The permission required is still the read one — the HTTP verb is a transport
+detail and the privilege is not.
+
+### Authorization
+
+Two layers, answering different questions. The **surface guard** verifies the bearer
+token (Auth's JWKS + issuer + audience) and checks the segment's baseline permission;
+the **operation check** decides whether *this* principal may perform *this* action on
+*this* MRN. Both are required — layer 1 alone is a vault where anyone who may read one
+secret may read all of them.
+
+Permissions: `secret:ReadMetadata · GetSecret · PutSecret · DeleteSecret ·
+RotateSecret · ListSecrets · ManageProject · ManageEnvironment · ManageFolder ·
+ManageRotation · ReadAudit · Admin`. `ReadMetadata` and `GetSecret` are deliberately
+**different grants**: browsing what exists is what an engineer needs to operate a
+system; revealing a value is seeing the production database password.
+
+Outside `APP_ENV=development` a missing auth configuration does **not** degrade to
+open — REST answers 503 and gRPC serves health only.
+
+## Console
+
+The vault ships **its own console** at **`console.secret.maintainerd.local`**, in
+[`web/console`](web/console). Because maintainerd-secret is adoptable alone, its
+dashboard is a first-class SPA rather than a page inside maintainerd's core console.
+
+React 19 + Vite + TypeScript + Tailwind + Radix, authenticating with OAuth2
+authorization code + PKCE against maintainerd-auth and calling this service's
+`/api/v1` with the resulting bearer token. It holds no token in storage, never
+fetches a value for a list, and keeps a secret's address out of every URL. See
+[`web/console/README.md`](web/console/README.md) for its environment, the OAuth
+client it expects, and how to run it.
 
 ## Run
+
+### Locally
 
 ```bash
 export DB_HOST=localhost DB_PORT=5432 DB_USER=postgres DB_PASSWORD=postgres DB_NAME=maintainerd_secret
@@ -106,7 +148,30 @@ make run
 
 grpcurl -plaintext localhost:9092 maintainerd.secret.v1.SecretService/Ping
 curl localhost:8092/healthz
+curl localhost:8092/api/v1/setup/status
 ```
+
+### In the dev stack
+
+`maintainerd-dev` runs the service (`m9d-secret`), its Postgres (`m9d-secret-db`)
+and its console (`m9d-secret-console`) under the `maintainerd`, `all` and
+`all-observed` profiles:
+
+```bash
+cd ../maintainerd-dev
+./maintainerd up --profile=all -d
+```
+
+- Console: **https://console.secret.maintainerd.local** (nginx also proxies `/api/`
+  there to `m9d-secret:8092`, so the SPA is same-origin)
+- API direct: **https://console-api.secret.maintainerd.local**
+
+The dev service runs with `APP_ENV=development` and no `AUTH_*` variables, so the
+guard is **development-open** and the console talks to it without a token, saying so
+in a permanent banner. Set `MAINTAINERD_SECRET_AUTH_JWKS_URL`, `..._AUTH_ISSUER` and
+`..._AUTH_AUDIENCE` to exercise real enforcement.
+
+First run lands on the setup wizard; the dev bootstrap token is `devtoken`.
 
 Migrations are embedded and applied on boot. `make check` runs the full local gate
 (gofmt, vet, staticcheck, tests); `make sqlc` regenerates `internal/storage` from the
@@ -149,6 +214,28 @@ migrations and queries.
 | `SECRET_KEEP_VERSIONS` | `10` | default versions retained per secret (min 1) |
 | `SECRET_RECOVERY_WINDOW` | `720h` | how long a deleted secret stays restorable; `0` refused outside development |
 | `SECRET_REWRAP_BATCH_SIZE` | `500` | versions re-wrapped per rotation query |
+
+### Authorization (all three together, or none)
+| Var | Default | Purpose |
+|---|---|---|
+| `AUTH_JWKS_URL` | — | maintainerd-auth's JWKS endpoint — where token-verifying keys come from |
+| `AUTH_ISSUER` | — | the `iss` a token must carry |
+| `AUTH_AUDIENCE` | — | the `aud` a token must carry: this service's resource-API identifier in Auth |
+
+A **partial** set is a boot error. A JWKS URL without an issuer and audience check
+accepts any token Auth ever signed, including tokens minted for a different service.
+With none set, the API is disabled outside development (503 / health-only gRPC); in
+development it opens with a loud boot banner naming every guard that is off.
+
+### References, rotation and webhooks
+| Var | Default | Purpose |
+|---|---|---|
+| `SECRET_REFERENCE_MAX_DEPTH` | `8` | backstop on reference-chain depth; cycles are detected precisely, not merely bounded |
+| `SECRET_ROTATION_ENABLED` | `true` | runs the background rotator. Turning it off **preserves every policy** |
+| `SECRET_ROTATION_INTERVAL` | `5m` | how often the rotator scans for due secrets |
+| `SECRET_ROTATION_BATCH` | `50` | secrets rotated per pass |
+| `SECRET_WEBHOOKS_ENABLED` | `true` | deliver change/rotation notifications. A delivery never carries a value |
+| `SECRET_WEBHOOK_CONCURRENCY` | `4` | parallel deliveries per event |
 
 ### Setup and default scope
 | Var | Default | Purpose |
