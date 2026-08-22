@@ -1,0 +1,70 @@
+# Git metadata — including the .git dirs inside the checked-out siblings under
+# .deps/, which are large and never needed by the build.
+.git
+**/.git
+.gitignore
+.githooks/
+
+# CI / tooling config not read by the build
+.github/
+.claude/
+.codex/
+.agents/
+.obsidian/
+.opencode/
+graphify-out/
+
+# Documentation
+*.md
+docs/
+
+# Development files
+.env.example
+docker-compose.yml
+Dockerfile
+Dockerfile.local
+**/Dockerfile.local
+.air.toml
+
+# Build artifacts
+bin/
+tmp/
+*.log
+*.exe
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Dependencies vendored on the host (downloaded inside the image instead)
+vendor/
+
+# NOTE ON WHAT IS DELIBERATELY *NOT* IGNORED
+#   .deps/          — the checked-out maintainerd-kit / maintainerd-sdk siblings.
+#                     go.mod replaces point at them and the build repoints those
+#                     replaces at ./.deps/*, so ignoring this dir breaks the build.
+#                     See the Dockerfile header.
+#   gen/            — generated protobuf/gRPC code the build compiles against.
+#   migrations/     — embedded into the binary via migrations/embed.go.
+#   web/console/    — source for the SPA build stage.
+
+# Test files and coverage — not compiled into the production binary
+*_test.go
+tests/
+coverage.*
+*.out
+web/**/coverage/
+
+# Frontend deps / build output / secrets — rebuilt inside the image, never
+# copied from the host (would bloat context and leak local env).
+**/node_modules/
+**/dist/
+**/.env
+.env
+*.env

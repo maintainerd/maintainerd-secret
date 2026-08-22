@@ -1,0 +1,25 @@
+# Gitleaks configuration
+# https://github.com/gitleaks/gitleaks?tab=readme-ov-file#configuration
+#
+# False-positive fingerprints are managed in .gitleaksignore — that is the
+# idiomatic place for per-finding ignores in Gitleaks v8+. Prefer a fingerprint
+# there over widening the allowlist here: this repo is a secret manager, and a
+# broad path allowlist is exactly the kind of hole that lets a real key through.
+
+title = "maintainerd/secret gitleaks config"
+
+[extend]
+# Start from the full upstream default rule set, then narrow below.
+useDefault = true
+
+[allowlist]
+description = "Sample/example and generated files — placeholder values only, no real secrets."
+paths = [
+  # Documented env templates. Every value is a placeholder or empty; the console
+  # is a PUBLIC OAuth client (authorization code + PKCE) and holds no secret.
+  '''web/console/\.env\.example$''',
+  # Lockfiles: integrity hashes routinely trip the generic high-entropy rules.
+  '''web/console/package-lock\.json$''',
+  # Generated protobuf/gRPC code — no hand-written material, no credentials.
+  '''^gen/''',
+]

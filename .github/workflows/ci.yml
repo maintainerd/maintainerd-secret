@@ -1,0 +1,217 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Proto — buf lint + breaking checks.
+  # buf.yaml at the repo root is a v2 workspace declaring `modules: [{path: proto}]`,
+  # so buf runs from the root here (auth's older layout keeps buf.yaml inside proto/
+  # and has to `cd proto` first).
+  # ─────────────────────────────────────────────────────────────────────────────
+  proto:
+    name: Proto
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history so `buf breaking --against .git#branch=origin/main` has
+          # a base commit to diff the contracts against.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install buf
+        run: go install github.com/bufbuild/buf/cmd/buf@v1.59.0
+
+      - name: Lint proto contracts
+        run: make proto-lint
+
+      - name: Check proto breaking changes
+        run: make proto-breaking
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Test — build, vet and the unit suite with the race detector.
+  # ─────────────────────────────────────────────────────────────────────────────
+  test:
+    name: Build / Vet / Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # go.mod replaces the sibling modules with workspace-local paths
+      # (../maintainerd-kit, ../maintainerd-sdk). A runner has no siblings, so they
+      # are checked out here and the replaces repointed below — without this every
+      # job that loads the package graph fails with
+      # "replacement directory ../maintainerd-kit does not exist".
+      - name: Check out sibling deps (kit)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: maintainerd/maintainerd-kit
+          path: .deps/kit
+      - name: Check out sibling deps (sdk)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: maintainerd/maintainerd-sdk
+          path: .deps/sdk
+
+      - name: Set up Go
+        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Repoint replaces at checked-out siblings
+        run: |
+          go mod edit -replace github.com/maintainerd/kit=./.deps/kit
+          go mod edit -replace github.com/maintainerd/sdk=./.deps/sdk
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test (race detector)
+        run: go test -race -count=1 -timeout=600s ./...
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Lint — staticcheck, configured by staticcheck.conf at the repo root.
+  # ─────────────────────────────────────────────────────────────────────────────
+  lint:
+    name: staticcheck
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check out sibling deps (kit)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: maintainerd/maintainerd-kit
+          path: .deps/kit
+      - name: Check out sibling deps (sdk)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: maintainerd/maintainerd-sdk
+          path: .deps/sdk
+
+      - name: Set up Go
+        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Repoint replaces at checked-out siblings
+        run: |
+          go mod edit -replace github.com/maintainerd/kit=./.deps/kit
+          go mod edit -replace github.com/maintainerd/sdk=./.deps/sdk
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "${unformatted}" ]; then
+            echo "::error::gofmt found unformatted files:"; echo "${unformatted}"; exit 1
+          fi
+
+      - name: staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          staticcheck ./...
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Docker image — build the production image on every PR so a broken Dockerfile
+  # or a broken console build is caught here, not at release. Single-arch, no push;
+  # release.yml handles multi-arch publishing on tags.
+  # ─────────────────────────────────────────────────────────────────────────────
+  docker-image:
+    name: Docker image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The image build compiles the Go binary, so it needs the same sibling
+      # modules the Go jobs do — inside the build context this time, because a
+      # Docker build cannot reach outside its context. See the Dockerfile header.
+      - name: Check out sibling deps (kit)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: maintainerd/maintainerd-kit
+          path: .deps/kit
+      - name: Check out sibling deps (sdk)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: maintainerd/maintainerd-sdk
+          path: .deps/sdk
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3
+
+      - name: Build production image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
+        with:
+          context: .
+          push: false
+          build-args: |
+            VERSION=ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Frontend — the console SPA gates: lint, unit tests (vitest), a
+  # production-dependency audit, and the type-check + build (`tsc -b && vite build`).
+  # ─────────────────────────────────────────────────────────────────────────────
+  frontend:
+    name: Frontend (console)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web/console
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/console/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Type-check and build
+        # `npm run build` is `tsc -b && vite build`, so this is the type-check gate too.
+        run: npm run build

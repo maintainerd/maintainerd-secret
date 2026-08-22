@@ -3,9 +3,15 @@
 /secretd
 *.exe
 
-# Test / coverage
+# Test / coverage / scan reports
 *.out
 coverage.*
+*.sarif
+
+# Sibling modules staged into the Docker build context by `make docker-prep`.
+# go.mod replaces github.com/maintainerd/{kit,sdk} with ../maintainerd-{kit,sdk},
+# which a Docker build cannot reach; these are throwaway copies, never sources.
+/.deps/
 
 # Env / secrets
 .env

@@ -1,0 +1,158 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+env:
+  REGISTRY: docker.io
+  # Publishes to <namespace>/secret on Docker Hub. Namespace is the org if
+  # DOCKERHUB_ORG is set, otherwise the account username — so with the org set
+  # the image is maintainerd/secret (Docker Hub requires a namespace; there is
+  # no un-namespaced top-level repo for non-official images).
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_ORG || secrets.DOCKERHUB_USERNAME }}/secret  # nosemgrep
+
+# Minimal default token scope; each job escalates only what it needs.
+permissions:
+  contents: read
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # create the GitHub Release + attach the SBOM asset
+      packages: write
+      id-token: write
+      security-events: write  # upload the Trivy SARIF to Code Scanning
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The image build compiles the Go binary, and go.mod replaces the sibling
+      # modules with workspace-local paths that do not exist on a runner AND
+      # cannot be reached from inside a Docker build context. They are checked
+      # out INTO the context here; the Dockerfile repoints the replaces at them.
+      - name: Check out sibling deps (kit)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: maintainerd/maintainerd-kit
+          path: .deps/kit
+      - name: Check out sibling deps (sdk)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: maintainerd/maintainerd-sdk
+          path: .deps/sdk
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          # Pre-announcement: a single moving version. Publishes only the exact tag
+          # (e.g. 0.1.0) + latest — no {{major}}.{{minor}} alias — so Docker Hub stays
+          # at one version until the public launch locks it.
+          tags: |
+            type=semver,pattern={{version}}
+
+      # Build a single-arch (amd64) image locally and SCAN it BEFORE anything is
+      # published. A HIGH/CRITICAL fails the release, and nothing gets pushed.
+      - name: Build image for scanning (amd64)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          load: true
+          tags: maintainerd-secret:scan
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image with Trivy (fails on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@2736533278103862a861f4a35ebac3e97854d956 # master
+        with:
+          image-ref: maintainerd-secret:scan
+          format: sarif
+          output: trivy-results.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+      - name: Upload Trivy results to Code Scanning
+        uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3 # v4
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy
+
+      # Reached only if the scan passed: build the multi-arch image and push,
+      # with SLSA provenance + an SBOM attestation attached to the image.
+      - name: Build and push (multi-arch)
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Generate SBOM (SPDX) for the GitHub release
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          # Use the resolved semver tag (e.g. 0.1.0), NOT github.ref_name (v0.1.0):
+          # docker/metadata-action strips the leading "v", so :v0.1.0 was never pushed.
+          image: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          # Generate the file ONLY. The softprops step below does the attach and
+          # overwrites cleanly on a re-release; letting anchore also attach caused a
+          # 404 collision when the v0.1.0 tag is moved (single moving pre-release).
+          upload-release-assets: false
+
+      # Sign the SBOM with cosign keyless (Sigstore/Fulcio/Rekor) — no key management;
+      # the workflow's OIDC identity is the signer. Produces a detached signature +
+      # certificate over the SBOM, attached to the GitHub Release, so the release
+      # carries a verifiable signature (OpenSSF Scorecard: Signed-Releases).
+      #
+      # Deliberately NOT signing the image tag: `cosign sign <image>` pushes a
+      # `sha256-<digest>.sig` TAG to the registry, which clutters the Docker Hub tag
+      # list and confuses users about which version to pull. Keeping the signature on
+      # the GitHub Release keeps Docker Hub to just the version tag + latest.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@1aa8e0f2454b781fbf0fbf306a4c9533a0c57409 # v3.7.0
+
+      - name: Sign the SBOM (keyless)
+        env:
+          COSIGN_YES: "true"
+        run: |
+          cosign sign-blob --yes \
+            --output-signature sbom.spdx.json.sig \
+            --output-certificate sbom.spdx.json.pem \
+            sbom.spdx.json
+
+      - name: Attach SBOM + signatures to the GitHub release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          files: |
+            sbom.spdx.json
+            sbom.spdx.json.sig
+            sbom.spdx.json.pem
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
