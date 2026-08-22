@@ -833,6 +833,25 @@ With **none** set:
 | `SECRET_WEBHOOKS_ENABLED` | `true` | deliver change/rotation notifications. A delivery never carries a value |
 | `SECRET_WEBHOOK_CONCURRENCY` | `4` | parallel deliveries per event |
 
+### Dynamic-credential reaper
+
+This is what makes a dynamic credential short-lived. Issuing one creates a **real
+PostgreSQL role**; the lease row records when it must stop existing, but a row
+expiring does not drop a role — this sweep is the only thing that does.
+
+| Var | Default | Purpose |
+|---|---|---|
+| `SECRET_DYNAMIC_REAPER_ENABLED` | `true` | revoke dynamic credentials whose leases have expired. Turning it off means **issued credentials outlive their leases**, and the boot log says so in those words |
+| `SECRET_DYNAMIC_REAPER_INTERVAL` | `1m` | how often the sweep runs. Finer than the rotator's, because the overdue window is the window in which a credential nobody is entitled to still works |
+| `SECRET_DYNAMIC_REAPER_BATCH` | `100` | leases revoked per pass, so a mass expiry is not an unbounded run of DDL in one tick |
+
+It runs on the **election leader only**. Two replicas revoking the same lease means
+the loser drops an account that is already gone and records a failure for a lease
+that was correctly closed — indistinguishable, in the audit trail, from a
+revocation that genuinely did not happen. A revocation the target database refused
+leaves the lease **open** and increments an attempt counter: the account still
+exists, so the row demanding its removal has to survive.
+
 ### Setup and default scope
 | Var | Default | Purpose |
 |---|---|---|
