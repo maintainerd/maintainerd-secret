@@ -16,25 +16,61 @@
 // vocabulary, and it is what lives here:
 //
 //	the twelve secret: permission constants
-//	the REST route table       (segment -> read/write permission pair)
-//	the gRPC method table      (full method -> permission)
+//	the REST route table       (exact method+path -> rule; segment pair where uniform)
+//	the gRPC method table      (full method -> permission, + actor constraint)
 //	the exemption set          (health probes + the self-guarded setup surfaces)
 //
 // expressed as one authz.Map literal — which is the surface ALLOWLIST as well as
-// the table: Map.Required reports ok=false for anything not in it and the guard
+// the table: Map.Resolve reports ok=false for anything not in it and the guard
 // denies on ok=false, so mounting a route or registering an RPC without deciding
-// its permission fails CLOSED instead of shipping open. See
-// permissions_audit_test.go, which walks the live chi router and the live gRPC
-// service descriptors and fails if either grows a surface this file does not
-// account for.
+// its permission fails CLOSED instead of shipping open. See audit_test.go, which
+// walks the live chi router and the live gRPC service descriptors, checks each
+// surface against a WRITTEN specification of what it should demand, and fails if
+// either grows a surface this file does not account for.
 //
-// TWO LAYERS, TWO QUESTIONS. The Map is layer 1 (the surface guard): is the
-// caller authenticated, and is this a surface we decided a permission for? Layer
-// 2 is the operation check — may THIS principal perform THIS action on THIS
+// # Two layers, two questions — and the route guard is not the weak one
+//
+// LAYER 1 is the surface guard, this Map: is the caller authenticated, is this a
+// surface we decided a rule for, is this CLASS of caller allowed on it, and does
+// the caller hold the permission the surface actually performs?
+//
+// LAYER 2 is the operation check — may THIS principal perform THIS action on THIS
 // resource's MRN — and it happens inside internal/api against the concrete
-// target. The Map is the allowlist, never the authorization decision. Both are
-// required: layer 1 without layer 2 is a vault where anyone who may read one
-// secret may read all of them.
+// target. It is the only place "may read staging, must not read prod" can be
+// decided, and it is where an operation that needs a SECOND permission enforces
+// it (rollback also needs GetSecret; a folder delete also needs DeleteSecret;
+// creating a scope import also needs GetSecret on the source).
+//
+// Both are required, and layer 1 is DEFENCE IN DEPTH rather than the only
+// defence. This file used to state the opposite for the /secrets and /bulk
+// segments: it carried a metadata BASELINE there and deferred the real privilege
+// to internal/api. The reasoning was sound — a reveal is a read carried by a POST
+// so a secret's address never lands in an access log — but the ordering was
+// inverted. The weak check ran FIRST, the route table stopped saying what a route
+// does, and a new handler added on /secrets that forgot its internal/api check
+// would have shipped guarded by ReadMetadata alone. Every route now declares the
+// permission its operation really performs (authz.Map.Exact), so the route guard
+// is correct ON ITS OWN and the MRN check is the second layer.
+//
+// # The actor model — service-to-service is not browser-to-backend
+//
+// Two classes of caller reach this vault, through different trust contexts: a
+// USER principal signed in to the console through an interactive OAuth2
+// authorization-code + PKCE flow, and a SERVICE principal — a machine identity
+// carrying Auth's "svc" claim, calling m2m, which is the whole point of a secret
+// store. A permission answers "may this principal do X". It cannot answer "should
+// this class of caller be doing X at all", and that is the question that catches a
+// STOLEN m2m credential: its grants are real, so no permission check will refuse
+// it, but a workload creating a project or reading the audit trail is by itself
+// the signal.
+//
+// So every surface also declares an actor constraint (see the table below).
+// Administrative surfaces a human drives from the console are ActorUserOnly; the
+// fetch and write paths a workload legitimately uses are ActorAny, because an
+// operator does exactly the same things from the console. The kind is derived
+// from the VERIFIED claims (authz.ActorKindFromClaims) and is recorded on every
+// audit row, so an incident review can tell a human reading a value from a
+// workload reading it.
 package permissions
 
 import (
@@ -135,34 +171,134 @@ const (
 // exported by reference: the maps inside are the authorization table, and a
 // caller that could mutate them could open a surface at runtime.
 //
-// WHY "secrets" AND "bulk" CARRY THE SAME PERMISSION ON BOTH VERBS. Several
-// routes on those segments are reads carried by a POST (reveal takes a body so a
-// secret address never lands in an access log, proxy log or browser history;
-// batch get likewise), so a method-derived read/write split would demand a write
-// permission for a read. The baseline there is therefore metadata access, and the
-// real privilege — GetSecret to reveal, PutSecret to write, DeleteSecret to
-// delete — is enforced per operation against the target's MRN in internal/api,
-// which is the only place it can be enforced correctly anyway. Those deeper
-// permissions are declared in OperationPermissions so they are still registered
-// in Auth.
+// WHY /secrets AND /bulk ARE DECLARED ROUTE BY ROUTE AND NOT AS A SEGMENT PAIR.
+// A segment pair can only ever be as strong as the WEAKEST route on the segment,
+// because one pair guards them all — and /secrets carries a listing, a metadata
+// read, a write, a reveal, a rollback, a rotation, a delete and a destroy. The
+// pair used to collapse all of that to ReadMetadata on both verbs, with the real
+// privilege enforced deeper in internal/api. Those routes are now declared
+// exactly, and the two segments are NOT in Routes at all, which is strictly
+// stronger than a baseline: a new handler mounted beside them matches no exact
+// entry and no segment pair, so it is UNMAPPED and denied to every caller rather
+// than inheriting a weak permission.
+//
+// The POST-carrying-a-read argument still holds and is still why reveal and batch
+// get are POSTs — a secret's address in a URL ends up in access logs, proxy logs,
+// browser history and referer headers, and a body does not. It was never an
+// argument for a weak permission; it was an argument against DERIVING the
+// permission from the HTTP verb. Declaring the route exactly settles both.
 func Map() sdkauthz.Map {
 	return sdkauthz.Map{
 		Prefix: APIPrefix,
 
+		// EXACT SURFACES — method + path, winning over any segment pair. Each entry
+		// names the permission the handler's operation ACTUALLY performs (verified
+		// against internal/api; audit_test.go pins every one of them), and the actor
+		// class allowed to reach it.
+		//
+		// Where a handler enforces MORE than one permission the entry names the
+		// PRIMARY one and says so; internal/api keeps enforcing the rest against the
+		// concrete target MRN, which is the only place a second, resource-dependent
+		// check can be made.
+		Exact: map[string]sdkauthz.Rule{
+			// --- reads -------------------------------------------------------------
+			// Listing a whole scope is a broader capability than describing one secret
+			// you already know the name of, which is why ListSecrets is its own grant.
+			// api.ListSecrets authorizes against the FOLDER's MRN.
+			"GET /api/v1/secrets":          {Permission: PermListSecrets},
+			"GET /api/v1/secrets/deleted":  {Permission: PermListSecrets},
+			"GET /api/v1/secrets/describe": {Permission: PermReadMetadata},
+			// Version history is metadata: numbers, wrapping key ids and checksums, no
+			// payloads. Browsing it must never be a way to pull every value a
+			// credential has ever held.
+			"GET /api/v1/secrets/versions": {Permission: PermReadMetadata},
+
+			// --- reveal ------------------------------------------------------------
+			// THE PATH THE WHOLE SERVICE EXISTS TO PROTECT. A POST because its address
+			// belongs in a body; a reveal permission because that is what it does.
+			// ActorAny: a workload fetching its own secret is the core
+			// service-to-service case, and an operator does the same from the console.
+			"POST /api/v1/secrets/reveal": {Permission: PermGetSecret},
+
+			// --- writes ------------------------------------------------------------
+			// ActorAny on the write paths is a DELIBERATE choice, not an omission. A
+			// workload writing or rotating its OWN secret is a first-class case — a
+			// rotator replacing the credential it manages, a reconciler converging an
+			// environment it owns — and it is exactly the m2m story this service
+			// exists for. The blast radius is bounded by the MRN grant, not by the
+			// caller's class: a service principal can only write what its grant names.
+			// Restricting writes to humans would push rotation back into a person's
+			// hands, which is the outcome a secret store is meant to remove.
+			"POST /api/v1/secrets":  {Permission: PermPutSecret},
+			"PATCH /api/v1/secrets": {Permission: PermPutSecret},
+			// Rollback ALSO requires PermGetSecret, enforced in api.Rollback: it reads a
+			// value the caller did not supply and republishes it as current, so a
+			// principal that may write but not read could otherwise use it as a read
+			// primitive. The route guard demands the primary write permission.
+			"POST /api/v1/secrets/rollback": {Permission: PermPutSecret},
+			"POST /api/v1/secrets/rotate":   {Permission: PermRotateSecret},
+			"POST /api/v1/bulk/put":         {Permission: PermPutSecret},
+			// Every batch item is additionally authorized INDIVIDUALLY against its own
+			// MRN inside api.BatchGet/BatchPut. The route guard is the floor, not the
+			// whole check: a batch that checked once against the scope would be the
+			// easiest way to turn a narrow grant into a broad one.
+			"POST /api/v1/bulk/get": {Permission: PermGetSecret},
+
+			// --- lifecycle ---------------------------------------------------------
+			// A soft delete opens a recovery window and is scoped to the target's own
+			// MRN, so a workload decommissioning a secret it owns is legitimate.
+			"POST /api/v1/secrets/delete": {Permission: PermDeleteSecret},
+			// Restore and destroy are NOT: both are authorized at TENANT scope (the
+			// target's project and environment are not known until the row is read),
+			// so they need a grant far wider than any single workload's, and both are
+			// recovery-desk operations a human drives from the console. Destroy is
+			// additionally irreversible.
+			"POST /api/v1/secrets/restore": {Permission: PermDeleteSecret, Actor: sdkauthz.ActorUserOnly},
+			"POST /api/v1/secrets/destroy": {Permission: PermDeleteSecret, Actor: sdkauthz.ActorUserOnly},
+
+			// --- rotation policy ---------------------------------------------------
+			// Setting the policy is administration of the machinery, not a rotation:
+			// it decides when and how every future value is replaced. Console work.
+			"POST /api/v1/secrets/rotation-policy": {Permission: PermManageRotation, Actor: sdkauthz.ActorUserOnly},
+		},
+
+		// SEGMENT PAIRS — kept for the segments that genuinely are "browse these,
+		// manage these", where one read permission and one write permission say
+		// everything true about the whole noun.
+		//
 		// Keyed by the FIRST path segment under /api/v1. Segments are flat
 		// (/projects, /secrets, /audit, …) rather than nested precisely so that this
 		// allowlist is meaningful: with everything nested under /projects, one entry
 		// would cover the whole API and the allowlist would be a single row saying
 		// "yes".
+		//
+		// The WRITES are user-only: creating a project, moving a folder, rewiring a
+		// webhook and reading the access trail are administrative acts a human
+		// performs from the console, and a workload doing one is the signal rather
+		// than the workflow. The READS stay open to either class — a workload
+		// resolving its own scope legitimately browses the hierarchy.
 		Routes: map[string]sdkauthz.Perms{
-			"projects":     {Read: PermReadMetadata, Write: PermManageProject},
-			"environments": {Read: PermReadMetadata, Write: PermManageEnvironment},
-			"folders":      {Read: PermReadMetadata, Write: PermManageFolder},
-			"imports":      {Read: PermReadMetadata, Write: PermManageFolder},
-			"secrets":      {Read: PermReadMetadata, Write: PermReadMetadata},
-			"bulk":         {Read: PermReadMetadata, Write: PermReadMetadata},
-			"webhooks":     {Read: PermReadMetadata, Write: PermManageRotation},
-			"audit":        {Read: PermReadAudit, Write: PermAdmin},
+			"projects":     {Read: PermReadMetadata, Write: PermManageProject, WriteActor: sdkauthz.ActorUserOnly},
+			"environments": {Read: PermReadMetadata, Write: PermManageEnvironment, WriteActor: sdkauthz.ActorUserOnly},
+			// DELETE /folders ALSO requires PermDeleteSecret, enforced in
+			// api.DeleteFolder — removing a folder removes the secrets under it, and
+			// folder management alone must not be a way to delete values. The route
+			// guard demands the primary ManageFolder.
+			"folders": {Read: PermReadMetadata, Write: PermManageFolder, WriteActor: sdkauthz.ActorUserOnly},
+			// POST /imports ALSO requires PermGetSecret on the SOURCE scope, enforced
+			// in api.CreateImport: an import makes another scope's values readable
+			// through this one, so creating it must require the ability to read them.
+			// The route guard demands the primary ManageFolder.
+			"imports":  {Read: PermReadMetadata, Write: PermManageFolder, WriteActor: sdkauthz.ActorUserOnly},
+			"webhooks": {Read: PermReadMetadata, Write: PermManageRotation, WriteActor: sdkauthz.ActorUserOnly},
+			// The audit trail is user-only on BOTH verbs. It is the record an incident
+			// review reads, and a workload reading it is doing reconnaissance rather
+			// than work. There is no write route on /audit today; the pair keeps the
+			// answer for one that is added.
+			"audit": {
+				Read: PermReadAudit, Write: PermAdmin,
+				ReadActor: sdkauthz.ActorUserOnly, WriteActor: sdkauthz.ActorUserOnly,
+			},
 		},
 
 		Methods: map[string]string{
@@ -211,11 +347,13 @@ func Map() sdkauthz.Map {
 			SecretServicePrefix + "RestoreSecret":        PermDeleteSecret,
 			SecretServicePrefix + "DestroySecret":        PermDeleteSecret,
 
-			// Bulk. The baseline is metadata because a batch mixes items whose individual
-			// privileges differ; each item is checked with the operation's real permission
-			// against its own MRN inside the api service.
-			SecretServicePrefix + "BatchGetSecrets": PermReadMetadata,
-			SecretServicePrefix + "BatchPutSecrets": PermReadMetadata,
+			// Bulk. A batch is a TRANSPORT optimisation, not a weaker operation: a batch
+			// get is a reveal and a batch put is a write, so each demands the permission
+			// its single-item twin does. Every item is ADDITIONALLY authorized on its own
+			// MRN inside the api service, which is what stops a batch from turning a
+			// narrow grant into a broad one.
+			SecretServicePrefix + "BatchGetSecrets": PermGetSecret,
+			SecretServicePrefix + "BatchPutSecrets": PermPutSecret,
 
 			// Webhooks + audit.
 			SecretServicePrefix + "CreateWebhookEndpoint": PermManageRotation,
@@ -226,16 +364,62 @@ func Map() sdkauthz.Map {
 			SecretServicePrefix + "ListAuditEvents":       PermReadAudit,
 		},
 
-		// Enforced DEEPER than the surface — per operation, against the target MRN,
-		// inside internal/api. They demand no route of their own on the REST side
-		// (the /secrets and /bulk segments carry a metadata baseline), but Auth must
-		// still know they exist or no token could ever carry them.
+		// THE ACTOR CONSTRAINT FOR gRPC, method by method. An absent entry means
+		// ActorAny — the default, and the right answer for every fetch, write and
+		// metadata read, which a workload and a console operator both perform.
+		//
+		// The list below is the gRPC MIRROR of the user-only REST surfaces, and it has
+		// to stay one: the two transports sit on the same api service, so a constraint
+		// that held on one and not the other would be no constraint at all — a caller
+		// refused over REST would simply open a gRPC channel. audit_test.go asserts
+		// the two agree surface by surface.
+		MethodActors: map[string]sdkauthz.Actor{
+			// Hierarchy management — console work.
+			SecretServicePrefix + "CreateProject":     sdkauthz.ActorUserOnly,
+			SecretServicePrefix + "UpdateProject":     sdkauthz.ActorUserOnly,
+			SecretServicePrefix + "DeleteProject":     sdkauthz.ActorUserOnly,
+			SecretServicePrefix + "CreateEnvironment": sdkauthz.ActorUserOnly,
+			SecretServicePrefix + "UpdateEnvironment": sdkauthz.ActorUserOnly,
+			SecretServicePrefix + "DeleteEnvironment": sdkauthz.ActorUserOnly,
+			SecretServicePrefix + "CreateFolder":      sdkauthz.ActorUserOnly,
+			SecretServicePrefix + "MoveFolder":        sdkauthz.ActorUserOnly,
+			SecretServicePrefix + "DeleteFolder":      sdkauthz.ActorUserOnly,
+			SecretServicePrefix + "CreateImport":      sdkauthz.ActorUserOnly,
+			SecretServicePrefix + "UpdateImport":      sdkauthz.ActorUserOnly,
+			SecretServicePrefix + "DeleteImport":      sdkauthz.ActorUserOnly,
+
+			// Tenant-scoped recovery + the irreversible one.
+			SecretServicePrefix + "RestoreSecret": sdkauthz.ActorUserOnly,
+			SecretServicePrefix + "DestroySecret": sdkauthz.ActorUserOnly,
+
+			// The machinery that rotates values and announces the change.
+			SecretServicePrefix + "SetRotationPolicy":     sdkauthz.ActorUserOnly,
+			SecretServicePrefix + "CreateWebhookEndpoint": sdkauthz.ActorUserOnly,
+			SecretServicePrefix + "UpdateWebhookEndpoint": sdkauthz.ActorUserOnly,
+			SecretServicePrefix + "DeleteWebhookEndpoint": sdkauthz.ActorUserOnly,
+
+			// The access trail.
+			SecretServicePrefix + "ListAuditEvents": sdkauthz.ActorUserOnly,
+		},
+
+		// Enforced DEEPER than the surface — a SECOND permission checked per
+		// operation, against the target MRN, inside internal/api, on top of the
+		// primary one the route guard already demanded:
+		//
+		//	PermGetSecret     rollback (republishes a value the caller did not supply),
+		//	                  creating a scope import (on the SOURCE scope), and every
+		//	                  hop of a reference chain
+		//	PermDeleteSecret  deleting a folder (which deletes the secrets under it)
+		//
+		// Both are also primary permissions on routes of their own, so this list adds
+		// nothing to DeclaredPermissions today. It stays because the property it
+		// encodes is "a permission this service can demand must be registered in
+		// Auth", and that must survive a future where one of these is enforced ONLY
+		// as a second check — otherwise the guard would demand something no token
+		// could ever carry.
 		OperationPermissions: []string{
 			PermGetSecret,
-			PermPutSecret,
 			PermDeleteSecret,
-			PermRotateSecret,
-			PermListSecrets,
 		},
 
 		// secret:Admin covers every required action. It does NOT widen resource scope.

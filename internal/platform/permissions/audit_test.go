@@ -17,28 +17,260 @@ import (
 	"github.com/maintainerd/secret/internal/platform/permissions"
 )
 
-// THE GAP AUDIT.
+// THE GAP AUDIT — and, now, THE SPECIFICATION.
 //
 // Every other test in this repo checks that a surface behaves correctly. This one
-// checks that no surface was FORGOTTEN — which is the failure mode that actually
-// ships, because a forgotten route does not throw, does not log and does not look
-// wrong in review. It looks like a handler.
+// checks that no surface was FORGOTTEN, and that every surface demands what its
+// handler actually does — the two failure modes that actually ship, because
+// neither throws, neither logs and neither looks wrong in review. They look like
+// a handler.
 //
-// The property is: for every REST route the chi router serves and every gRPC
-// method the generated descriptors register, permissions.Map either (a) demands a
-// non-empty permission for it, or (b) exempts it — and every exemption is on a
-// short list with a written reason.
+// The property has two halves:
 //
-// BOTH SIDES ARE DERIVED FROM THE LIVE SURFACE, never from a hand-kept list. The
-// routes come from walking the real router this service mounts (chi.Walk), and
-// the methods come from the protoc-generated grpc.ServiceDesc values that
-// grpc.Server dispatches on. A hand-kept list would drift silently and the test
-// would keep passing, which is worse than no test: it would report "no gaps"
-// about a surface it had stopped reading.
+//  1. NO GAPS. For every REST route the chi router serves and every gRPC method
+//     the generated descriptors register, permissions.Map either demands a rule
+//     for it or exempts it — and every exemption is on a short list with a
+//     written reason.
+//
+//  2. NO WEAK GUARDS. Every surface resolves to EXACTLY the permission and actor
+//     class written down for it in restSpec / grpcSpec below, and no surface
+//     whose handler performs a WRITE resolves to a read-only permission.
+//
+// THE SPEC TABLES ARE WRITTEN INDEPENDENTLY OF THE MAP, and that is what makes
+// them a specification rather than a mirror. Each row was derived by reading the
+// handler in internal/httpapi or internal/grpcserver, following it to its
+// internal/api method, and recording the permission that method's s.guard call
+// actually demands. A row that merely restated permissions.Map would pass forever
+// and prove nothing; these rows disagree with the Map loudly if either moves. The
+// `mutates` column is likewise a fact about the HANDLER, not about the HTTP verb —
+// a reveal is a POST and is not a mutation, a rollback is a POST and is.
+//
+// THE SURFACE LISTS ARE DERIVED FROM THE LIVE SURFACE, never from a hand-kept
+// list. The routes come from walking the real router this service mounts
+// (chi.Walk), and the methods come from the protoc-generated grpc.ServiceDesc
+// values that grpc.Server dispatches on. So a NEW surface fails the spec (it has
+// no row) and a REMOVED surface fails it too (its row is stale) — the table
+// cannot quietly stop describing the service.
 //
 // The Map is an ALLOWLIST, so an unmapped surface already fails CLOSED at runtime
 // — a 403 to every caller, valid token or not. This test converts that from a
 // production incident with a baffling symptom into a red CI run naming the route.
+
+// ---------------------------------------------------------------------------
+// The specification
+// ---------------------------------------------------------------------------
+
+// surfaceSpec is what ONE surface must demand.
+type surfaceSpec struct {
+	// permission is the exact permission the surface guard must require. It is the
+	// permission the handler's operation performs, read off the s.guard call in
+	// internal/api — never a weaker baseline, because the surface guard runs FIRST.
+	permission string
+	// actor is the class of caller allowed to reach the surface at all.
+	actor sdkauthz.Actor
+	// mutates is a fact about the HANDLER: does reaching it change durable state?
+	// It is deliberately not derived from the HTTP verb — reveal and batch-get are
+	// POSTs carrying reads (a secret's address belongs in a body, not in an access
+	// log), and a GET is never a mutation. A mutating surface may not be guarded by
+	// a read-only permission; see TestNoMutatingSurfaceIsGuardedByAReadPermission.
+	mutates bool
+	// alsoEnforces are the permissions the OPERATION layer checks in addition,
+	// against the concrete target MRN, inside internal/api. The route guard demands
+	// the primary permission above; these are the second layer, and they are written
+	// down here so the pairing is visible to a reader of the specification rather
+	// than only to a reader of internal/api.
+	alsoEnforces []string
+	// why records the reasoning for a row a reader would otherwise question.
+	why string
+}
+
+// restSpec is the REST surface, keyed by "METHOD <chi pattern>".
+//
+// ACTOR CLASSIFICATION, in one sentence per group: hierarchy and webhook WRITES,
+// rotation-policy management, tenant-scoped restore/destroy and the audit trail are
+// user-only, because they are things a human does from a console and a workload
+// doing one is the signal rather than the workflow; everything else — every fetch,
+// every metadata read, and the ordinary write/rotate/delete of a secret a workload
+// owns — is open to both classes, because that IS the service-to-service story this
+// vault exists for and an operator does exactly the same things from the console.
+var restSpec = map[string]surfaceSpec{
+	// --- projects ----------------------------------------------------------
+	"GET /api/v1/projects/":             {permission: permissions.PermReadMetadata},
+	"GET /api/v1/projects/{project}":    {permission: permissions.PermReadMetadata},
+	"POST /api/v1/projects/":            {permission: permissions.PermManageProject, actor: sdkauthz.ActorUserOnly, mutates: true},
+	"PATCH /api/v1/projects/{project}":  {permission: permissions.PermManageProject, actor: sdkauthz.ActorUserOnly, mutates: true},
+	"DELETE /api/v1/projects/{project}": {permission: permissions.PermManageProject, actor: sdkauthz.ActorUserOnly, mutates: true},
+
+	// --- environments ------------------------------------------------------
+	"GET /api/v1/environments/":                           {permission: permissions.PermReadMetadata},
+	"GET /api/v1/environments/{project}/{environment}":    {permission: permissions.PermReadMetadata},
+	"POST /api/v1/environments/":                          {permission: permissions.PermManageEnvironment, actor: sdkauthz.ActorUserOnly, mutates: true},
+	"PATCH /api/v1/environments/{project}/{environment}":  {permission: permissions.PermManageEnvironment, actor: sdkauthz.ActorUserOnly, mutates: true},
+	"DELETE /api/v1/environments/{project}/{environment}": {permission: permissions.PermManageEnvironment, actor: sdkauthz.ActorUserOnly, mutates: true},
+
+	// --- folders -----------------------------------------------------------
+	"GET /api/v1/folders/":      {permission: permissions.PermReadMetadata},
+	"POST /api/v1/folders/":     {permission: permissions.PermManageFolder, actor: sdkauthz.ActorUserOnly, mutates: true},
+	"POST /api/v1/folders/move": {permission: permissions.PermManageFolder, actor: sdkauthz.ActorUserOnly, mutates: true, why: "api.MoveFolder checks ManageFolder against BOTH the source and the destination MRN"},
+	"DELETE /api/v1/folders/": {
+		permission: permissions.PermManageFolder, actor: sdkauthz.ActorUserOnly, mutates: true,
+		alsoEnforces: []string{permissions.PermDeleteSecret},
+		why:          "removing a folder removes the secrets under it, so folder management alone must not be a way to delete values",
+	},
+
+	// --- scope imports -----------------------------------------------------
+	"GET /api/v1/imports/": {permission: permissions.PermReadMetadata},
+	"POST /api/v1/imports/": {
+		permission: permissions.PermManageFolder, actor: sdkauthz.ActorUserOnly, mutates: true,
+		alsoEnforces: []string{permissions.PermGetSecret},
+		why:          "an import makes another scope's values readable through this one, so creating it also requires GetSecret on the SOURCE",
+	},
+	"PATCH /api/v1/imports/{importUUID}":  {permission: permissions.PermManageFolder, actor: sdkauthz.ActorUserOnly, mutates: true},
+	"DELETE /api/v1/imports/{importUUID}": {permission: permissions.PermManageFolder, actor: sdkauthz.ActorUserOnly, mutates: true},
+
+	// --- secrets: reads ----------------------------------------------------
+	"GET /api/v1/secrets/":         {permission: permissions.PermListSecrets, why: "api.ListSecrets authorizes a whole SCOPE against the folder MRN — a broader capability than describing one secret"},
+	"GET /api/v1/secrets/deleted":  {permission: permissions.PermListSecrets},
+	"GET /api/v1/secrets/describe": {permission: permissions.PermReadMetadata},
+	"GET /api/v1/secrets/versions": {permission: permissions.PermReadMetadata, why: "version history is numbers, key ids and checksums — never payloads"},
+
+	// --- secrets: reveal ---------------------------------------------------
+	"POST /api/v1/secrets/reveal": {
+		permission: permissions.PermGetSecret,
+		why: "a POST because a secret's address belongs in a body rather than an access log, " +
+			"but a REVEAL permission because that is what it does. Not a mutation.",
+	},
+	"POST /api/v1/bulk/get": {
+		permission: permissions.PermGetSecret,
+		why:        "a batch get is a reveal; every item is ADDITIONALLY authorized on its own MRN in api.BatchGet",
+	},
+
+	// --- secrets: writes ---------------------------------------------------
+	"POST /api/v1/secrets/":  {permission: permissions.PermPutSecret, mutates: true},
+	"PATCH /api/v1/secrets/": {permission: permissions.PermPutSecret, mutates: true, why: "retention and expiry decide when a value is destroyed, so editing them is a write"},
+	"POST /api/v1/secrets/rollback": {
+		permission: permissions.PermPutSecret, mutates: true,
+		alsoEnforces: []string{permissions.PermGetSecret},
+		why: "a rollback republishes a value the caller did not supply, so a principal that may " +
+			"write but not read could otherwise use it as a read primitive",
+	},
+	"POST /api/v1/secrets/rotate": {permission: permissions.PermRotateSecret, mutates: true},
+	"POST /api/v1/bulk/put":       {permission: permissions.PermPutSecret, mutates: true},
+
+	// --- secrets: lifecycle ------------------------------------------------
+	"POST /api/v1/secrets/delete": {
+		permission: permissions.PermDeleteSecret, mutates: true,
+		why: "a soft delete opens a recovery window and is scoped to the target's own MRN, so a " +
+			"workload decommissioning a secret it owns is legitimate",
+	},
+	"POST /api/v1/secrets/restore": {
+		permission: permissions.PermDeleteSecret, actor: sdkauthz.ActorUserOnly, mutates: true,
+		why: "authorized at TENANT scope (the project and environment are unknown until the row is " +
+			"read), so it needs a grant wider than any single workload's",
+	},
+	"POST /api/v1/secrets/destroy": {
+		permission: permissions.PermDeleteSecret, actor: sdkauthz.ActorUserOnly, mutates: true,
+		why: "tenant-scoped like restore, and irreversible",
+	},
+
+	// --- rotation policy ---------------------------------------------------
+	"POST /api/v1/secrets/rotation-policy": {
+		permission: permissions.PermManageRotation, actor: sdkauthz.ActorUserOnly, mutates: true,
+		why: "setting the policy administers the machinery — it decides when every FUTURE value is replaced",
+	},
+
+	// --- webhooks ----------------------------------------------------------
+	"GET /api/v1/webhooks/":                          {permission: permissions.PermReadMetadata},
+	"GET /api/v1/webhooks/{endpointUUID}/deliveries": {permission: permissions.PermReadMetadata},
+	"POST /api/v1/webhooks/":                         {permission: permissions.PermManageRotation, actor: sdkauthz.ActorUserOnly, mutates: true},
+	"PATCH /api/v1/webhooks/{endpointUUID}":          {permission: permissions.PermManageRotation, actor: sdkauthz.ActorUserOnly, mutates: true},
+	"DELETE /api/v1/webhooks/{endpointUUID}":         {permission: permissions.PermManageRotation, actor: sdkauthz.ActorUserOnly, mutates: true},
+
+	// --- audit -------------------------------------------------------------
+	"GET /api/v1/audit": {
+		permission: permissions.PermReadAudit, actor: sdkauthz.ActorUserOnly,
+		why: "the access trail is what an incident review reads; a workload reading it is reconnaissance, not work",
+	},
+}
+
+// grpcSpec is the same specification for the RPC surface. It must AGREE with
+// restSpec surface by surface — the two transports are thin adapters over one api
+// service, so a rule that held on one and not the other would be no rule at all: a
+// caller refused over REST would simply open a gRPC channel. See
+// TestTheTwoTransportsAgree.
+var grpcSpec = map[string]surfaceSpec{
+	// Legacy flat-key surface — the kit secret-provider client's contract. The
+	// permissions are the real ones for the operation, not a compatibility exemption.
+	"Put":    {permission: permissions.PermPutSecret, mutates: true},
+	"Get":    {permission: permissions.PermGetSecret, why: "the legacy flat Get calls api.Reveal"},
+	"List":   {permission: permissions.PermListSecrets},
+	"Delete": {permission: permissions.PermDeleteSecret, mutates: true},
+
+	// Hierarchy.
+	"CreateProject":     {permission: permissions.PermManageProject, actor: sdkauthz.ActorUserOnly, mutates: true},
+	"ListProjects":      {permission: permissions.PermReadMetadata},
+	"GetProject":        {permission: permissions.PermReadMetadata},
+	"UpdateProject":     {permission: permissions.PermManageProject, actor: sdkauthz.ActorUserOnly, mutates: true},
+	"DeleteProject":     {permission: permissions.PermManageProject, actor: sdkauthz.ActorUserOnly, mutates: true},
+	"CreateEnvironment": {permission: permissions.PermManageEnvironment, actor: sdkauthz.ActorUserOnly, mutates: true},
+	"ListEnvironments":  {permission: permissions.PermReadMetadata},
+	"GetEnvironment":    {permission: permissions.PermReadMetadata},
+	"UpdateEnvironment": {permission: permissions.PermManageEnvironment, actor: sdkauthz.ActorUserOnly, mutates: true},
+	"DeleteEnvironment": {permission: permissions.PermManageEnvironment, actor: sdkauthz.ActorUserOnly, mutates: true},
+	"CreateFolder":      {permission: permissions.PermManageFolder, actor: sdkauthz.ActorUserOnly, mutates: true},
+	"ListFolders":       {permission: permissions.PermReadMetadata},
+	"MoveFolder":        {permission: permissions.PermManageFolder, actor: sdkauthz.ActorUserOnly, mutates: true},
+	"DeleteFolder": {
+		permission: permissions.PermManageFolder, actor: sdkauthz.ActorUserOnly, mutates: true,
+		alsoEnforces: []string{permissions.PermDeleteSecret},
+	},
+	"CreateImport": {
+		permission: permissions.PermManageFolder, actor: sdkauthz.ActorUserOnly, mutates: true,
+		alsoEnforces: []string{permissions.PermGetSecret},
+	},
+	"ListImports":  {permission: permissions.PermReadMetadata},
+	"UpdateImport": {permission: permissions.PermManageFolder, actor: sdkauthz.ActorUserOnly, mutates: true},
+	"DeleteImport": {permission: permissions.PermManageFolder, actor: sdkauthz.ActorUserOnly, mutates: true},
+
+	// Secrets.
+	"GetSecret":            {permission: permissions.PermGetSecret},
+	"DescribeSecret":       {permission: permissions.PermReadMetadata},
+	"ListSecrets":          {permission: permissions.PermListSecrets},
+	"ListSecretVersions":   {permission: permissions.PermReadMetadata},
+	"ListDeletedSecrets":   {permission: permissions.PermListSecrets},
+	"PutSecret":            {permission: permissions.PermPutSecret, mutates: true},
+	"UpdateSecretMetadata": {permission: permissions.PermPutSecret, mutates: true},
+	"RollbackSecret": {
+		permission: permissions.PermPutSecret, mutates: true,
+		alsoEnforces: []string{permissions.PermGetSecret},
+	},
+	"RotateSecret":      {permission: permissions.PermRotateSecret, mutates: true},
+	"SetRotationPolicy": {permission: permissions.PermManageRotation, actor: sdkauthz.ActorUserOnly, mutates: true},
+	"DeleteSecret":      {permission: permissions.PermDeleteSecret, mutates: true},
+	"RestoreSecret":     {permission: permissions.PermDeleteSecret, actor: sdkauthz.ActorUserOnly, mutates: true},
+	"DestroySecret":     {permission: permissions.PermDeleteSecret, actor: sdkauthz.ActorUserOnly, mutates: true},
+
+	// Bulk. A batch is a TRANSPORT optimisation, never a weaker operation.
+	"BatchGetSecrets": {permission: permissions.PermGetSecret},
+	"BatchPutSecrets": {permission: permissions.PermPutSecret, mutates: true},
+
+	// Webhooks + audit.
+	"CreateWebhookEndpoint": {permission: permissions.PermManageRotation, actor: sdkauthz.ActorUserOnly, mutates: true},
+	"ListWebhookEndpoints":  {permission: permissions.PermReadMetadata},
+	"UpdateWebhookEndpoint": {permission: permissions.PermManageRotation, actor: sdkauthz.ActorUserOnly, mutates: true},
+	"DeleteWebhookEndpoint": {permission: permissions.PermManageRotation, actor: sdkauthz.ActorUserOnly, mutates: true},
+	"ListWebhookDeliveries": {permission: permissions.PermReadMetadata},
+	"ListAuditEvents":       {permission: permissions.PermReadAudit, actor: sdkauthz.ActorUserOnly},
+}
+
+// readOnlyPermissions are the permissions that grant NO ability to change anything.
+// A surface whose handler writes must never resolve to one of them: the route guard
+// runs first, so that would be the check an attacker meets at the door.
+var readOnlyPermissions = map[string]bool{
+	permissions.PermReadMetadata: true,
+	permissions.PermListSecrets:  true,
+	permissions.PermReadAudit:    true,
+}
 
 // ---------------------------------------------------------------------------
 // The exemptions, and why each one exists
@@ -113,47 +345,158 @@ func walkREST(t *testing.T) []restRoute {
 	return out
 }
 
-// TestEveryRESTRouteIsGuardedOrJustified is the REST half of the audit.
-func TestEveryRESTRouteIsGuardedOrJustified(t *testing.T) {
+// TestEveryRESTRouteMatchesItsSpecification is the REST half of the audit, and it
+// is now a SPECIFICATION check rather than a presence check.
+//
+// It used to require only a NON-EMPTY permission, which is a much weaker property
+// than it looks: a route mapped to the weakest permission in the vocabulary passes
+// "non-empty" exactly as well as a route mapped to the right one. That is how
+// /secrets and /bulk came to be guarded by ReadMetadata on every verb — including
+// the write, the delete and the destroy — with the real privilege enforced only
+// deeper, in internal/api. The route guard runs FIRST, so that made the weakest
+// statement in the system the one an attacker met at the door, and it meant a new
+// handler on the segment that forgot its deeper check would ship carrying
+// ReadMetadata alone.
+func TestEveryRESTRouteMatchesItsSpecification(t *testing.T) {
 	m := permissions.Map()
 
 	for _, r := range walkREST(t) {
-		t.Run(r.method+" "+r.pattern, func(t *testing.T) {
+		key := r.method + " " + r.pattern
+		t.Run(key, func(t *testing.T) {
 			surface := sdkauthz.Surface{Path: r.pattern, HTTPMethod: r.method}
 
 			if m.IsExempt(surface) {
 				_, justified := matchJustifiedPath(r.pattern)
 				assert.True(t, justified,
-					"%s %s is served with NO permission check and has no written justification in "+
-						"justifiedExemptPaths", r.method, r.pattern)
+					"%s is served with NO permission check and has no written justification in "+
+						"justifiedExemptPaths", key)
 				return
 			}
 
-			required, mapped := m.Required(surface)
+			spec, specified := restSpec[key]
+			require.True(t, specified,
+				"%s is a NEW route with no row in restSpec. Read the handler, follow it to its "+
+					"internal/api method, and write down the permission that method's s.guard call "+
+					"actually demands — plus whether it mutates and which class of caller may reach "+
+					"it. Adding the route to permissions.Map() without deciding those is how a "+
+					"surface ships guarded by the wrong thing.", key)
+
+			rule, mapped := m.Resolve(surface)
 			require.True(t, mapped,
-				"%s %s has no permission mapping. It is DENIED to every caller at runtime "+
-					"(the Map is an allowlist), which ships as a 403 nobody can explain. Add its "+
-					"segment to permissions.Map().Routes.", r.method, r.pattern)
-			assert.NotEmpty(t, required,
-				"%s %s is mapped to an EMPTY permission, which means any authenticated caller may "+
+				"%s has no permission mapping. It is DENIED to every caller at runtime "+
+					"(the Map is an allowlist), which ships as a 403 nobody can explain.", key)
+			assert.NotEmpty(t, rule.Permission,
+				"%s is mapped to an EMPTY permission, which means any authenticated caller may "+
 					"call it. That is only ever correct for a surface deliberately opened, and this "+
-					"service has none.", r.method, r.pattern)
+					"service has none.", key)
+
+			assert.Equal(t, spec.permission, rule.Permission,
+				"%s must demand the permission its OPERATION performs. %s", key, spec.why)
+			assert.Equal(t, spec.actor, rule.Actor,
+				"%s must be reachable by exactly the specified class of caller. %s", key, spec.why)
 		})
 	}
 }
 
-// TestEveryMappedRouteSegmentIsLive is the other direction: a segment in the
-// table that no route serves is dead weight, and dead weight is what makes an
-// authorization table stop being read.
-func TestEveryMappedRouteSegmentIsLive(t *testing.T) {
+// TestTheRESTSpecificationHasNoStaleRows is the other direction: a row describing a
+// route that no longer exists is a specification that has quietly stopped describing
+// the service, and it would keep the audit above passing while covering less and
+// less.
+func TestTheRESTSpecificationHasNoStaleRows(t *testing.T) {
 	live := map[string]bool{}
 	for _, r := range walkREST(t) {
+		live[r.method+" "+r.pattern] = true
+	}
+	for key := range restSpec {
+		assert.True(t, live[key], "restSpec describes %q, but no route serves it", key)
+	}
+}
+
+// TestEveryMappedRouteSurfaceIsLive: a segment or an exact entry in the table that
+// no route serves is dead weight, and dead weight is what makes an authorization
+// table stop being read.
+func TestEveryMappedRouteSurfaceIsLive(t *testing.T) {
+	liveSegments := map[string]bool{}
+	liveExact := map[string]bool{}
+	for _, r := range walkREST(t) {
 		if segment := sdkauthz.FirstSegment(permissions.APIPrefix, r.pattern); segment != "" {
-			live[segment] = true
+			liveSegments[segment] = true
 		}
+		liveExact[sdkauthz.ExactKey(r.method, r.pattern)] = true
 	}
 	for segment := range permissions.Map().Routes {
-		assert.True(t, live[segment], "route segment %q is mapped but no route serves it", segment)
+		assert.True(t, liveSegments[segment], "route segment %q is mapped but no route serves it", segment)
+	}
+	for key := range permissions.Map().Exact {
+		assert.True(t, liveExact[key], "exact route %q is mapped but no route serves it", key)
+	}
+}
+
+// TestNoMutatingSurfaceIsGuardedByAReadPermission is the property the old audit
+// could not express, stated over BOTH transports.
+//
+// A read-only grant is the one an operator hands out broadly — "let the team see
+// what exists" — precisely because it cannot change anything. If a surface that
+// writes, deletes or destroys resolves to one of those permissions, then the check
+// at the door is satisfied by a grant that was issued on the understanding that it
+// was harmless, and the only thing standing between it and the write is a deeper
+// check some future handler may forget to make.
+func TestNoMutatingSurfaceIsGuardedByAReadPermission(t *testing.T) {
+	m := permissions.Map()
+
+	t.Run("REST", func(t *testing.T) {
+		for _, r := range walkREST(t) {
+			key := r.method + " " + r.pattern
+			spec, specified := restSpec[key]
+			if !specified || !spec.mutates {
+				continue
+			}
+			rule, mapped := m.Resolve(sdkauthz.Surface{Path: r.pattern, HTTPMethod: r.method})
+			require.True(t, mapped, "%s is unmapped", key)
+			assert.False(t, readOnlyPermissions[rule.Permission],
+				"%s CHANGES DURABLE STATE but is guarded by %q, a read-only permission. The route "+
+					"guard runs first, so that is the check an attacker meets at the door — and a "+
+					"grant issued as harmless would satisfy it.", key, rule.Permission)
+		}
+	})
+
+	t.Run("gRPC", func(t *testing.T) {
+		for _, method := range grpcMethods() {
+			spec, specified := grpcSpec[shortMethod(method)]
+			if !specified || !spec.mutates {
+				continue
+			}
+			rule, mapped := m.Resolve(sdkauthz.Surface{FullMethod: method})
+			require.True(t, mapped, "%s is unmapped", method)
+			assert.False(t, readOnlyPermissions[rule.Permission],
+				"%s CHANGES DURABLE STATE but is guarded by the read-only permission %q",
+				method, rule.Permission)
+		}
+	})
+}
+
+// TestASecondaryPermissionIsStillDeclared. Where the operation layer enforces a
+// permission the route guard does not demand, that permission must still be
+// registered in Auth — otherwise the deeper check demands something no token can
+// ever carry, and the failure is a 403 with nothing in any log explaining it.
+func TestASecondaryPermissionIsStillDeclared(t *testing.T) {
+	declared := map[string]bool{}
+	for _, p := range permissions.DeclaredPermissions() {
+		declared[p] = true
+	}
+	check := func(t *testing.T, key string, spec surfaceSpec) {
+		t.Helper()
+		for _, p := range spec.alsoEnforces {
+			assert.True(t, declared[p],
+				"%s additionally enforces %q in internal/api, but it is not in DeclaredPermissions() "+
+					"— Auth would never register it and no token could carry it", key, p)
+		}
+	}
+	for key, spec := range restSpec {
+		check(t, key, spec)
+	}
+	for key, spec := range grpcSpec {
+		check(t, key, spec)
 	}
 }
 
@@ -220,8 +563,19 @@ func grpcMethods() []string {
 	return out
 }
 
-// TestEveryGRPCMethodIsGuardedOrJustified is the gRPC half of the audit.
-func TestEveryGRPCMethodIsGuardedOrJustified(t *testing.T) {
+// shortMethod reduces "/maintainerd.secret.v1.SecretService/GetSecret" to
+// "GetSecret", which is how grpcSpec is keyed — the service prefix is noise in a
+// table where every row shares it.
+func shortMethod(fullMethod string) string {
+	if i := strings.LastIndexByte(fullMethod, '/'); i >= 0 {
+		return fullMethod[i+1:]
+	}
+	return fullMethod
+}
+
+// TestEveryGRPCMethodMatchesItsSpecification is the gRPC half of the audit, held to
+// the same specification as REST.
+func TestEveryGRPCMethodMatchesItsSpecification(t *testing.T) {
 	m := permissions.Map()
 	methods := grpcMethods()
 	require.NotEmpty(t, methods)
@@ -239,18 +593,43 @@ func TestEveryGRPCMethodIsGuardedOrJustified(t *testing.T) {
 				return
 			}
 
-			required, mapped := m.Required(surface)
+			spec, specified := grpcSpec[shortMethod(method)]
+			require.True(t, specified,
+				"%s is a NEW RPC with no row in grpcSpec. Read the handler, follow it to its "+
+					"internal/api method, and write down what that method's s.guard call demands.",
+				method)
+
+			rule, mapped := m.Resolve(surface)
 			require.True(t, mapped,
 				"%s has no permission mapping. It is DENIED to every caller at runtime, which "+
 					"ships as a PermissionDenied nobody can explain. Add it to "+
 					"permissions.Map().Methods.", method)
-			assert.NotEmpty(t, required,
+			assert.NotEmpty(t, rule.Permission,
 				"%s is mapped to an EMPTY permission, so any authenticated caller may call it", method)
+
+			assert.Equal(t, spec.permission, rule.Permission,
+				"%s must demand the permission its OPERATION performs. %s", method, spec.why)
+			assert.Equal(t, spec.actor, rule.Actor,
+				"%s must be reachable by exactly the specified class of caller. %s", method, spec.why)
 		})
 	}
 }
 
-// TestEveryMappedMethodIsRegistered is the stale-entry direction.
+// TestTheGRPCSpecificationHasNoStaleRows mirrors the REST stale-row check.
+func TestTheGRPCSpecificationHasNoStaleRows(t *testing.T) {
+	live := map[string]bool{}
+	for _, method := range grpcMethods() {
+		live[shortMethod(method)] = true
+	}
+	for name := range grpcSpec {
+		assert.True(t, live[name], "grpcSpec describes %q, but no registered service serves it", name)
+	}
+}
+
+// TestEveryMappedMethodIsRegistered is the stale-entry direction for the Map itself,
+// including the actor overlay: a MethodActors row keyed by a method that does not
+// exist is a constraint nobody is enforcing, and it reads in review as though
+// somebody had.
 func TestEveryMappedMethodIsRegistered(t *testing.T) {
 	live := map[string]bool{}
 	for _, method := range grpcMethods() {
@@ -258,6 +637,73 @@ func TestEveryMappedMethodIsRegistered(t *testing.T) {
 	}
 	for mapped := range permissions.Map().Methods {
 		assert.True(t, live[mapped], "%s is mapped but no registered service serves it", mapped)
+	}
+	for mapped := range permissions.Map().MethodActors {
+		assert.True(t, live[mapped],
+			"%s has an actor constraint but no registered service serves it", mapped)
+		_, hasPermission := permissions.Map().Methods[mapped]
+		assert.True(t, hasPermission,
+			"%s has an actor constraint but NO permission — an actor-only entry is not in the "+
+				"allowlist at all, so the method is denied to everyone", mapped)
+	}
+}
+
+// TestTheTwoTransportsAgree. The REST handlers and the gRPC service are thin
+// adapters over ONE api service, so a rule that held on one transport and not the
+// other would be no rule at all: a caller refused over REST would simply open a gRPC
+// channel and do the same thing. This pins the pairs where both transports expose the
+// same operation.
+func TestTheTwoTransportsAgree(t *testing.T) {
+	pairs := []struct {
+		rest string
+		rpc  string
+	}{
+		{"POST /api/v1/secrets/reveal", "GetSecret"},
+		{"GET /api/v1/secrets/describe", "DescribeSecret"},
+		{"GET /api/v1/secrets/", "ListSecrets"},
+		{"GET /api/v1/secrets/versions", "ListSecretVersions"},
+		{"GET /api/v1/secrets/deleted", "ListDeletedSecrets"},
+		{"POST /api/v1/secrets/", "PutSecret"},
+		{"PATCH /api/v1/secrets/", "UpdateSecretMetadata"},
+		{"POST /api/v1/secrets/rollback", "RollbackSecret"},
+		{"POST /api/v1/secrets/rotate", "RotateSecret"},
+		{"POST /api/v1/secrets/rotation-policy", "SetRotationPolicy"},
+		{"POST /api/v1/secrets/delete", "DeleteSecret"},
+		{"POST /api/v1/secrets/restore", "RestoreSecret"},
+		{"POST /api/v1/secrets/destroy", "DestroySecret"},
+		{"POST /api/v1/bulk/get", "BatchGetSecrets"},
+		{"POST /api/v1/bulk/put", "BatchPutSecrets"},
+		{"POST /api/v1/projects/", "CreateProject"},
+		{"GET /api/v1/projects/", "ListProjects"},
+		{"POST /api/v1/environments/", "CreateEnvironment"},
+		{"POST /api/v1/folders/", "CreateFolder"},
+		{"POST /api/v1/folders/move", "MoveFolder"},
+		{"DELETE /api/v1/folders/", "DeleteFolder"},
+		{"POST /api/v1/imports/", "CreateImport"},
+		{"GET /api/v1/imports/", "ListImports"},
+		{"POST /api/v1/webhooks/", "CreateWebhookEndpoint"},
+		{"GET /api/v1/webhooks/", "ListWebhookEndpoints"},
+		{"GET /api/v1/webhooks/{endpointUUID}/deliveries", "ListWebhookDeliveries"},
+		{"GET /api/v1/audit", "ListAuditEvents"},
+	}
+
+	m := permissions.Map()
+	for _, p := range pairs {
+		t.Run(p.rest+" == "+p.rpc, func(t *testing.T) {
+			method, path, found := strings.Cut(p.rest, " ")
+			require.True(t, found)
+
+			restRule, ok := m.Resolve(sdkauthz.Surface{Path: path, HTTPMethod: method})
+			require.True(t, ok, "%s is unmapped", p.rest)
+			rpcRule, ok := m.Resolve(sdkauthz.Surface{FullMethod: permissions.SecretServicePrefix + p.rpc})
+			require.True(t, ok, "%s is unmapped", p.rpc)
+
+			assert.Equal(t, restRule.Permission, rpcRule.Permission,
+				"the same operation must demand the same permission on both transports")
+			assert.Equal(t, restRule.Actor, rpcRule.Actor,
+				"the same operation must accept the same class of caller on both transports — "+
+					"otherwise a caller refused over REST just opens a gRPC channel")
+		})
 	}
 }
 
@@ -375,17 +821,99 @@ func TestRevealIsADistinctGrantFromReadMetadata(t *testing.T) {
 	assert.Equal(t, permissions.PermGetSecret, m[permissions.SecretServicePrefix+"GetSecret"])
 	assert.Equal(t, permissions.PermReadMetadata, m[permissions.SecretServicePrefix+"DescribeSecret"])
 
-	// And the REST reveal is NOT covered by its segment's baseline: /secrets
-	// carries metadata on both verbs, and the reveal privilege is enforced per
-	// operation against the target MRN in internal/api.
-	required, mapped := permissions.Map().Required(sdkauthz.Surface{
+	// The REST reveal demands the REVEAL permission AT THE DOOR. It used to resolve
+	// to the /secrets segment's metadata baseline, with GetSecret checked only deeper
+	// against the target MRN. That inverted the layers: a metadata grant satisfied the
+	// first check on the one route this whole service exists to protect.
+	rule, mapped := permissions.Map().Resolve(sdkauthz.Surface{
 		Path: "/api/v1/secrets/reveal", HTTPMethod: http.MethodPost,
 	})
 	require.True(t, mapped)
-	assert.Equal(t, permissions.PermReadMetadata, required,
-		"the surface baseline is metadata; GetSecret is checked against the target MRN in the api layer")
-	assert.Contains(t, permissions.Map().OperationPermissions, permissions.PermGetSecret,
-		"a permission enforced only per-operation must still be DECLARED, or Auth never registers it")
+	assert.Equal(t, permissions.PermGetSecret, rule.Permission,
+		"the route guard for a reveal must be the reveal permission, not a metadata baseline")
+
+	// Describe, on the same segment, still resolves to metadata — which is the proof
+	// that the segment is not simply being guarded by its strongest route.
+	describe, mapped := permissions.Map().Resolve(sdkauthz.Surface{
+		Path: "/api/v1/secrets/describe", HTTPMethod: http.MethodGet,
+	})
+	require.True(t, mapped)
+	assert.Equal(t, permissions.PermReadMetadata, describe.Permission)
+}
+
+// ---------------------------------------------------------------------------
+// The actor model
+// ---------------------------------------------------------------------------
+
+// TestEveryConsoleSurfaceIsUserOnly names the administrative surfaces outright, so
+// that removing a constraint requires deleting a line from a list a reviewer reads
+// rather than quietly dropping a field from a map literal.
+//
+// The threat is the one no permission check can catch: a STOLEN m2m credential. Its
+// grants are real, so every permission check passes — and a workload creating a
+// project, rewiring a webhook, destroying a secret or reading the audit trail is by
+// itself the signal.
+func TestEveryConsoleSurfaceIsUserOnly(t *testing.T) {
+	m := permissions.Map()
+
+	for key, spec := range restSpec {
+		if spec.actor != sdkauthz.ActorUserOnly {
+			continue
+		}
+		method, path, _ := strings.Cut(key, " ")
+		rule, ok := m.Resolve(sdkauthz.Surface{Path: path, HTTPMethod: method})
+		require.True(t, ok, "%s is unmapped", key)
+		assert.Equal(t, sdkauthz.ActorUserOnly, rule.Actor,
+			"%s is an administrative console surface and must refuse a service principal", key)
+	}
+
+	for name, spec := range grpcSpec {
+		if spec.actor != sdkauthz.ActorUserOnly {
+			continue
+		}
+		rule, ok := m.Resolve(sdkauthz.Surface{FullMethod: permissions.SecretServicePrefix + name})
+		require.True(t, ok, "%s is unmapped", name)
+		assert.Equal(t, sdkauthz.ActorUserOnly, rule.Actor,
+			"%s is an administrative console surface and must refuse a service principal", name)
+	}
+}
+
+// TestTheWorkloadPathsAcceptBothClasses is the constraint that protects the PRODUCT
+// rather than the vault: a workload fetching its own secrets is the core
+// service-to-service case this service exists for, and an operator does exactly the
+// same things from the console. Locking either of these to one class would break one
+// of the two audiences, silently, at deploy time.
+func TestTheWorkloadPathsAcceptBothClasses(t *testing.T) {
+	workloadSurfaces := []string{
+		"POST /api/v1/secrets/reveal",
+		"POST /api/v1/bulk/get",
+		"POST /api/v1/bulk/put",
+		"GET /api/v1/secrets/",
+		"GET /api/v1/secrets/describe",
+		"GET /api/v1/secrets/versions",
+		"GET /api/v1/secrets/deleted",
+		"POST /api/v1/secrets/",
+		"PATCH /api/v1/secrets/",
+		"POST /api/v1/secrets/rollback",
+		"POST /api/v1/secrets/rotate",
+		"POST /api/v1/secrets/delete",
+		"GET /api/v1/projects/",
+		"GET /api/v1/environments/",
+		"GET /api/v1/folders/",
+		"GET /api/v1/imports/",
+		"GET /api/v1/webhooks/",
+	}
+
+	m := permissions.Map()
+	for _, key := range workloadSurfaces {
+		t.Run(key, func(t *testing.T) {
+			method, path, _ := strings.Cut(key, " ")
+			rule, ok := m.Resolve(sdkauthz.Surface{Path: path, HTTPMethod: method})
+			require.True(t, ok, "%s is unmapped", key)
+			assert.Equal(t, sdkauthz.ActorAny, rule.Actor,
+				"%s must stay reachable by a workload AND by a console operator", key)
+		})
+	}
 }
 
 // TestAdminIsTheOnlyBlanketAction. A second blanket action is a second key to the

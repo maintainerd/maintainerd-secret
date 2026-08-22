@@ -263,3 +263,132 @@ func TestBatchGetAbandonsTheWholeBatchWhenAuditingFails(t *testing.T) {
 	require.Error(t, err)
 	assert.Nil(t, results)
 }
+
+// ---------------------------------------------------------------------------
+// The actor kind on the audit row
+// ---------------------------------------------------------------------------
+
+// TestResolveCallerTakesTheActorKindFromTheVerifiedClaims.
+//
+// actor_kind is the one column that lets an incident review separate "a human read
+// the production database password" from "the billing workload read its own
+// credential". It is only worth anything if it cannot be influenced by the caller,
+// so it is taken from the token the guard VERIFIED and overwrites whatever the
+// transport supplied. This test drives that both ways round.
+func TestResolveCallerTakesTheActorKindFromTheVerifiedClaims(t *testing.T) {
+	fx := newFixture(t)
+	ctx := context.Background()
+
+	cases := []struct {
+		name         string
+		claimsKind   string
+		suppliedKind string
+		want         string
+	}{
+		{
+			name:       "a console login is recorded as a user",
+			claimsKind: sdkauthz.ActorKindUser,
+			want:       store.ActorKindUser,
+		},
+		{
+			name:       "an m2m caller is recorded as a service",
+			claimsKind: sdkauthz.ActorKindService,
+			want:       store.ActorKindService,
+		},
+		{
+			name:         "the verified claim overwrites anything the transport set",
+			claimsKind:   sdkauthz.ActorKindService,
+			suppliedKind: store.ActorKindUser,
+			want:         store.ActorKindService,
+		},
+		{
+			name:         "and in the other direction, so a workload cannot dress a human up either",
+			claimsKind:   sdkauthz.ActorKindUser,
+			suppliedKind: store.ActorKindService,
+			want:         store.ActorKindUser,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			claims := &sdkauthz.Claims{Subject: "p-1", Kind: tc.claimsKind, Tenant: "acme"}
+			c, err := fx.api.ResolveCaller(ctx, claims, audit.Actor{Kind: tc.suppliedKind, IP: "203.0.113.7"}, "acme")
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, c.Actor.Kind)
+		})
+	}
+}
+
+// TestTheAuditRowCarriesTheActorKind is the same property one layer out: what
+// actually lands in audit_log for a reveal performed by each class of caller.
+func TestTheAuditRowCarriesTheActorKind(t *testing.T) {
+	for _, kind := range []string{store.ActorKindUser, store.ActorKindService} {
+		t.Run(kind, func(t *testing.T) {
+			fx := newFixture(t)
+			fx.seed("prod", "/db", "PASSWORD", "prod-password")
+			ctx := context.Background()
+
+			// Built the way a real request is: verified claims in, an Actor carrying only
+			// observed provenance, and the kind derived by ResolveCaller.
+			claims := &sdkauthz.Claims{
+				Subject:        "p-1",
+				Kind:           kind,
+				Tenant:         "acme",
+				Grants:         []sdkauthz.Grant{{Action: permissions.PermAdmin}},
+				BlanketActions: permissions.BlanketActions(),
+			}
+			caller, err := fx.api.ResolveCaller(ctx, claims, audit.Actor{IP: "203.0.113.7", RequestID: "req-1"}, "acme")
+			require.NoError(t, err)
+
+			revealed, err := fx.api.Reveal(ctx, caller, addr("prod", "/db", "PASSWORD"), 0)
+			require.NoError(t, err)
+			defer revealed.Secret.Zero()
+
+			var seen int
+			for _, row := range fx.repo.auditRows() {
+				if row.Action != store.ActionReveal {
+					continue
+				}
+				seen++
+				assert.Equal(t, kind, row.ActorKind,
+					"a reveal must record WHICH CLASS of caller read the value")
+				assert.Equal(t, "p-1", row.ActorSubject)
+			}
+			require.Equal(t, 1, seen, "exactly one reveal row")
+		})
+	}
+}
+
+// TestADeniedAttemptRecordsTheActorKindToo. A refused access is the most interesting
+// row in the table — it is how an over-reaching or compromised principal is spotted —
+// and "which kind of caller was refused" is most of the signal.
+func TestADeniedAttemptRecordsTheActorKindToo(t *testing.T) {
+	fx := newFixture(t)
+	fx.seed("prod", "/db", "PASSWORD", "prod-password")
+	ctx := context.Background()
+
+	claims := &sdkauthz.Claims{
+		Subject:        "workload-1",
+		Kind:           sdkauthz.ActorKindService,
+		Tenant:         "acme",
+		Grants:         []sdkauthz.Grant{{Action: permissions.PermReadMetadata}},
+		BlanketActions: permissions.BlanketActions(),
+	}
+	caller, err := fx.api.ResolveCaller(ctx, claims, audit.Actor{IP: "203.0.113.7"}, "acme")
+	require.NoError(t, err)
+
+	_, err = fx.api.Reveal(ctx, caller, addr("prod", "/db", "PASSWORD"), 0)
+	require.Error(t, err, "a metadata grant is not a reveal grant")
+	assert.True(t, apperror.IsForbidden(err))
+
+	var denials int
+	for _, row := range fx.repo.auditRows() {
+		if row.Outcome != store.OutcomeDenied {
+			continue
+		}
+		denials++
+		assert.Equal(t, store.ActorKindService, row.ActorKind)
+		assert.Equal(t, "workload-1", row.ActorSubject)
+	}
+	assert.Equal(t, 1, denials)
+}

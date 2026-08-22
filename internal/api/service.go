@@ -159,7 +159,16 @@ func (s *Service) ResolveCaller(ctx context.Context, claims *sdkauthz.Claims, ac
 	if actor.Subject == "" && claims != nil {
 		actor.Subject = claims.Subject
 	}
-	if actor.Kind == "" && claims != nil {
+	// THE ACTOR KIND COMES FROM THE VERIFIED CLAIMS AND OVERWRITES WHATEVER THE
+	// TRANSPORT SUPPLIED. It is the one field that lets an incident review separate a
+	// human reading a production credential from a workload reading it, so it must be
+	// derived from the token the guard verified and from nothing a caller can
+	// influence — not a header, not a query parameter, not a request field. The
+	// transports pass an Actor carrying only observed provenance (peer IP, user agent,
+	// request id) and never set Kind; this line makes that a property rather than a
+	// convention. A claims-less path (the setup surface, which runs before any
+	// principal exists) supplies its own kind and never reaches here.
+	if claims != nil && claims.Kind != "" {
 		actor.Kind = claims.Kind
 	}
 	return Caller{

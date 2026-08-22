@@ -340,3 +340,106 @@ func TestMetadataHelpers(t *testing.T) {
 	assert.Equal(t, "", metadataValue(context.Background(), TenantMetadataKey))
 	assert.True(t, strings.HasPrefix(secretService, "/maintainerd.secret.v1."))
 }
+
+// ---------------------------------------------------------------------------
+// Service-to-service vs browser-to-backend, through the real interceptor
+// ---------------------------------------------------------------------------
+
+// TestTheActorConstraintIsEnforcedByTheUnaryInterceptor drives the constraint through
+// the interceptor this service actually installs, rather than through the Map alone.
+//
+// gRPC is the transport a stolen m2m credential would reach for: it is what the
+// workload was already using, so nothing about the connection looks new. The
+// administrative RPCs must refuse it even though its grants are real — a caller
+// holding secret:Admin is refused here purely for being the wrong CLASS of caller.
+func TestTheActorConstraintIsEnforcedByTheUnaryInterceptor(t *testing.T) {
+	principal := func(kind string) *sdkauthz.Principal {
+		return &sdkauthz.Principal{
+			Subject:        "principal-1",
+			Kind:           kind,
+			Grants:         []sdkauthz.Grant{{Action: permissions.PermAdmin}},
+			BlanketActions: permissions.BlanketActions(),
+		}
+	}
+	guardFor := func(kind string) sdkauthz.Guard {
+		return sdkauthz.Guard{
+			Mode:        sdkauthz.ModeEnforced,
+			Permissions: permissions.Map(),
+			Verify: func(context.Context, string) (*sdkauthz.Principal, error) {
+				return principal(kind), nil
+			},
+		}
+	}
+	call := func(t *testing.T, kind, method string) error {
+		t.Helper()
+		ctx := metadata.NewIncomingContext(context.Background(),
+			metadata.Pairs("authorization", "Bearer good"))
+		_, err := AuthUnaryInterceptor(guardFor(kind))(ctx, nil,
+			&grpc.UnaryServerInfo{FullMethod: method},
+			func(context.Context, any) (any, error) { return "reached", nil })
+		return err
+	}
+
+	consoleRPCs := []string{
+		"CreateProject", "UpdateProject", "DeleteProject",
+		"CreateEnvironment", "UpdateEnvironment", "DeleteEnvironment",
+		"CreateFolder", "MoveFolder", "DeleteFolder",
+		"CreateImport", "UpdateImport", "DeleteImport",
+		"SetRotationPolicy",
+		"CreateWebhookEndpoint", "UpdateWebhookEndpoint", "DeleteWebhookEndpoint",
+		"RestoreSecret", "DestroySecret",
+		"ListAuditEvents",
+	}
+	for _, name := range consoleRPCs {
+		t.Run("service is refused on "+name, func(t *testing.T) {
+			err := call(t, sdkauthz.ActorKindService, secretService+name)
+			require.Error(t, err, "a workload must not drive the administrative console surface")
+			assert.Equal(t, codes.PermissionDenied, status.Code(err))
+			assert.Contains(t, status.Convert(err).Message(), "user principals only")
+
+			assert.NoError(t, call(t, sdkauthz.ActorKindUser, secretService+name),
+				"the same RPC driven by a human must be allowed through")
+		})
+	}
+
+	// The workload surface — the reason this service exists — stays open to both.
+	workloadRPCs := []string{
+		"Get", "Put", "List", "Delete",
+		"GetSecret", "DescribeSecret", "ListSecrets", "ListSecretVersions", "ListDeletedSecrets",
+		"PutSecret", "UpdateSecretMetadata", "RollbackSecret", "RotateSecret", "DeleteSecret",
+		"BatchGetSecrets", "BatchPutSecrets",
+		"ListProjects", "GetProject", "ListEnvironments", "GetEnvironment",
+		"ListFolders", "ListImports", "ListWebhookEndpoints", "ListWebhookDeliveries",
+	}
+	for _, name := range workloadRPCs {
+		t.Run("both classes reach "+name, func(t *testing.T) {
+			for _, kind := range []string{sdkauthz.ActorKindService, sdkauthz.ActorKindUser} {
+				assert.NoError(t, call(t, kind, secretService+name),
+					"%s principals must reach %s", kind, name)
+			}
+		})
+	}
+}
+
+// TestAnUnclassifiedPrincipalIsRefusedOnAConsoleRPC. Failing closed on "we could not
+// tell what this caller is" is the only safe reading for a surface somebody restricted.
+func TestAnUnclassifiedPrincipalIsRefusedOnAConsoleRPC(t *testing.T) {
+	guard := sdkauthz.Guard{
+		Mode:        sdkauthz.ModeEnforced,
+		Permissions: permissions.Map(),
+		Verify: func(context.Context, string) (*sdkauthz.Principal, error) {
+			return &sdkauthz.Principal{
+				Subject:        "unknown-1",
+				Grants:         []sdkauthz.Grant{{Action: permissions.PermAdmin}},
+				BlanketActions: permissions.BlanketActions(),
+			}, nil
+		},
+	}
+	ctx := metadata.NewIncomingContext(context.Background(),
+		metadata.Pairs("authorization", "Bearer good"))
+	_, err := AuthUnaryInterceptor(guard)(ctx, nil,
+		&grpc.UnaryServerInfo{FullMethod: secretService + "CreateProject"},
+		func(context.Context, any) (any, error) { return nil, errors.New("the handler must not run") })
+	require.Error(t, err)
+	assert.Equal(t, codes.PermissionDenied, status.Code(err))
+}

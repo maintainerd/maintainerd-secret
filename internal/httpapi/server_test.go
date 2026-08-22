@@ -162,8 +162,13 @@ func TestGuardDenialsUseTheServiceEnvelope(t *testing.T) {
 // permission.
 func TestUnauthenticatedDenialsUseTheServiceEnvelope(t *testing.T) {
 	metadataOnly := &sdkauthz.Claims{
-		Subject: "svc-a",
-		Grants:  []sdkauthz.Grant{{Action: permissions.PermReadMetadata}},
+		Subject: "op-a",
+		// A USER principal, so this test measures the PERMISSION denial rather than
+		// the actor one: /projects writes are user-only, and a service principal would
+		// be refused a step earlier with a different code. The actor path has its own
+		// test — see TestServicePrincipalIsRefusedOnTheConsoleSurfaces.
+		Kind:   sdkauthz.ActorKindUser,
+		Grants: []sdkauthz.Grant{{Action: permissions.PermReadMetadata}},
 	}
 	router := NewServer(nil, nil, sdkauthz.Guard{
 		Mode: sdkauthz.ModeEnforced,
@@ -358,3 +363,146 @@ func TestClientIPIgnoresForwardedFor(t *testing.T) {
 	r.Header.Set("X-Forwarded-For", "10.0.0.1")
 	assert.Equal(t, "203.0.113.7", clientIP(r))
 }
+
+// ---------------------------------------------------------------------------
+// Service-to-service vs browser-to-backend, over the real router
+// ---------------------------------------------------------------------------
+
+// guardedRouterFor builds the real mux with an enforcing guard that verifies exactly
+// one token into the given principal. It is the shortest path from "a token of this
+// class arrives" to "the real route table decided", which is what these tests are
+// about — the SDK's Check has its own unit tests.
+func guardedRouterFor(p *sdkauthz.Claims) http.Handler {
+	return NewServer(nil, nil, sdkauthz.Guard{
+		Mode: sdkauthz.ModeEnforced,
+		Verify: func(_ context.Context, token string) (*sdkauthz.Claims, error) {
+			if token != "good" {
+				return nil, errors.New("bad token")
+			}
+			return p, nil
+		},
+	}, Options{}).Router()
+}
+
+func callAs(t *testing.T, p *sdkauthz.Claims, method, target string) (int, string) {
+	t.Helper()
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(method, target, strings.NewReader("{}"))
+	req.Header.Set("Authorization", "Bearer good")
+	guardedRouterFor(p).ServeHTTP(w, req)
+
+	var body struct {
+		Code string `json:"code"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	return w.Code, body.Code
+}
+
+// admin returns a principal of the given class holding secret:Admin — the widest
+// grant this service has. That is the point of these tests: the caller is refused
+// with EVERY permission, so the refusal can only be about which CLASS of caller it is.
+func admin(kind string) *sdkauthz.Claims {
+	return &sdkauthz.Claims{
+		Subject:        "principal-1",
+		Kind:           kind,
+		Grants:         []sdkauthz.Grant{{Action: permissions.PermAdmin}},
+		BlanketActions: permissions.BlanketActions(),
+	}
+}
+
+// TestServicePrincipalIsRefusedOnTheConsoleSurfaces is the stolen-m2m-credential
+// case, end to end over the real routing table: the token verifies, it carries
+// secret:Admin, and a workload still has no business creating a project, rewiring a
+// webhook, destroying a secret or reading the access trail.
+func TestServicePrincipalIsRefusedOnTheConsoleSurfaces(t *testing.T) {
+	consoleSurfaces := []struct {
+		method string
+		target string
+		why    string
+	}{
+		{http.MethodPost, "/api/v1/projects", "creating a project is console work"},
+		{http.MethodPatch, "/api/v1/projects/billing", "so is renaming one"},
+		{http.MethodDelete, "/api/v1/projects/billing", "and deleting one"},
+		{http.MethodPost, "/api/v1/environments", "environments are the same shape"},
+		{http.MethodPost, "/api/v1/folders", "so are folders"},
+		{http.MethodDelete, "/api/v1/folders", "a folder delete also deletes the secrets under it"},
+		{http.MethodPost, "/api/v1/imports", "an import makes another scope's values readable through this one"},
+		{http.MethodPost, "/api/v1/webhooks", "a webhook endpoint is where change announcements are sent"},
+		{http.MethodDelete, "/api/v1/webhooks/" + testUUID, "and unwiring one is how you silence them"},
+		{http.MethodPost, "/api/v1/secrets/rotation-policy", "the policy decides when every future value is replaced"},
+		{http.MethodPost, "/api/v1/secrets/restore", "restore is authorized at TENANT scope"},
+		{http.MethodPost, "/api/v1/secrets/destroy", "destroy is irreversible and tenant-scoped"},
+		{http.MethodGet, "/api/v1/audit", "the access trail is what an incident review reads"},
+	}
+
+	workload := admin(sdkauthz.ActorKindService)
+	operator := admin(sdkauthz.ActorKindUser)
+
+	for _, s := range consoleSurfaces {
+		t.Run(s.method+" "+s.target, func(t *testing.T) {
+			status, code := callAs(t, workload, s.method, s.target)
+			assert.Equal(t, http.StatusForbidden, status,
+				"a service principal must be refused here: %s", s.why)
+			assert.Equal(t, "actor_kind_not_permitted", code,
+				"and the refusal must be distinguishable from a missing grant — "+
+					"widening permissions is not the fix for a workload on the console surface")
+
+			// The same surface, driven by a human, is not blocked by the actor check.
+			// It reaches the handler (and fails on the nil dependencies these router
+			// tests use), which is enough to prove the guard let it past.
+			status, code = callAs(t, operator, s.method, s.target)
+			assert.NotEqual(t, "actor_kind_not_permitted", code,
+				"a user principal must not be refused by the ACTOR check on %s %s (status %d)",
+				s.method, s.target, status)
+		})
+	}
+}
+
+// TestBothClassesReachTheWorkloadSurfaces is the other half, and the one that would
+// break the product if it regressed: a workload fetching its own secrets is the core
+// service-to-service case this vault exists for, and an operator does exactly the
+// same things from the console. Neither class may be refused on these.
+func TestBothClassesReachTheWorkloadSurfaces(t *testing.T) {
+	workloadSurfaces := []struct {
+		method string
+		target string
+	}{
+		{http.MethodPost, "/api/v1/secrets/reveal"},
+		{http.MethodPost, "/api/v1/bulk/get"},
+		{http.MethodPost, "/api/v1/bulk/put"},
+		{http.MethodGet, "/api/v1/secrets"},
+		{http.MethodGet, "/api/v1/secrets/describe"},
+		{http.MethodGet, "/api/v1/secrets/versions"},
+		{http.MethodGet, "/api/v1/secrets/deleted"},
+		{http.MethodPost, "/api/v1/secrets"},
+		{http.MethodPatch, "/api/v1/secrets"},
+		{http.MethodPost, "/api/v1/secrets/rollback"},
+		{http.MethodPost, "/api/v1/secrets/rotate"},
+		{http.MethodPost, "/api/v1/secrets/delete"},
+		{http.MethodGet, "/api/v1/projects"},
+		{http.MethodGet, "/api/v1/folders"},
+		{http.MethodGet, "/api/v1/webhooks"},
+	}
+
+	for _, kind := range []string{sdkauthz.ActorKindService, sdkauthz.ActorKindUser} {
+		p := admin(kind)
+		for _, s := range workloadSurfaces {
+			t.Run(kind+" "+s.method+" "+s.target, func(t *testing.T) {
+				_, code := callAs(t, p, s.method, s.target)
+				assert.NotEqual(t, "actor_kind_not_permitted", code,
+					"%s principals must reach %s %s", kind, s.method, s.target)
+			})
+		}
+	}
+}
+
+// TestAnUnclassifiedPrincipalIsRefusedOnAConstrainedSurface. "We could not tell what
+// this caller is" is not a reason to admit it to the console surface.
+func TestAnUnclassifiedPrincipalIsRefusedOnAConstrainedSurface(t *testing.T) {
+	status, code := callAs(t, admin(""), http.MethodPost, "/api/v1/projects")
+	assert.Equal(t, http.StatusForbidden, status)
+	assert.Equal(t, "actor_kind_not_permitted", code)
+}
+
+// testUUID is a syntactically valid path parameter; no handler runs in these tests.
+const testUUID = "11111111-1111-1111-1111-111111111111"

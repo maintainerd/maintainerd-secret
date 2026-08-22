@@ -111,12 +111,13 @@ through it is an ordinary secret.
 **REST `:8092`** — the hierarchical API under `/api/v1`, plus an unguarded
 `/healthz`. Segments are **flat** (`/projects`, `/environments`, `/folders`,
 `/secrets`, `/bulk`, `/imports`, `/webhooks`, `/audit`, `/setup`) rather than nested,
-which is what makes the guard's per-segment permission allowlist meaningful: an
-unmapped segment is denied even to a valid token.
+which is what makes the guard's permission allowlist meaningful: with everything
+nested under `/projects`, one entry would cover the whole API. An unmapped surface is
+denied even to a valid token.
 
 Reveal and batch-get are **POSTs despite being reads**. A secret's address in a URL
 ends up in access logs, proxy logs, browser history and referer headers; a body does
-not. The permission required is still the read one — the HTTP verb is a transport
+not. The permission required is still the *reveal* one — the HTTP verb is a transport
 detail and the privilege is not.
 
 ### Authorization
@@ -124,22 +125,75 @@ detail and the privilege is not.
 **Permission checking is the SDK's job.** Every route and every RPC is guarded
 through `github.com/maintainerd/sdk/authz` — the shared enforcement point every
 maintainerd service and third-party resource server uses. This repo contributes only
-its *vocabulary*: the `secret:` permission constants, the route table, the gRPC
-method table and the exemption set, expressed as one `authz.Map` in
+its *vocabulary*: the `secret:` permission constants, the route table (with each
+surface's actor class), the gRPC method table and the exemption set, expressed as one
+`authz.Map` in
 [`internal/platform/permissions`](internal/platform/permissions/permissions.go).
 There is no hand-rolled authorization code here any more.
 
 Two layers, answering different questions. The **surface guard** verifies the bearer
-token (Auth's JWKS + issuer + audience) and checks the surface's baseline permission;
-the **operation check** decides whether *this* principal may perform *this* action on
-*this* MRN. Both are required — layer 1 alone is a vault where anyone who may read one
-secret may read all of them.
+token (Auth's JWKS + issuer + audience), checks that this **class** of caller is
+allowed on the surface, and checks the permission the surface actually performs; the
+**operation check** decides whether *this* principal may perform *this* action on
+*this* MRN — and enforces any *second* permission the operation needs. Both are
+required — layer 1 alone is a vault where anyone who may read one secret may read all
+of them.
+
+**The route guard names the real permission, not a baseline.** It runs *first*, so a
+deliberately weak entry there is the check an attacker meets at the door, and a new
+handler that forgets its layer-2 check would inherit that weakness silently. Every
+route on `/secrets` and `/bulk` is therefore declared **exactly** (method + path); the
+segment pair is kept only for the nouns that genuinely are *"browse these, manage
+these"*. Those two segments have **no** pair at all, which is stronger than a weak one:
+a new route mounted beside them matches nothing and is denied to every caller.
 
 The route/method table **is the allowlist**: an unmapped surface is denied even to a
 valid token, so mounting a route or registering an RPC without deciding its permission
 fails closed instead of shipping open. A test walks the live chi router and the live
-gRPC service descriptors and fails if either grows a surface the table does not
-account for — see [The gap audit](#the-gap-audit).
+gRPC service descriptors, checks each surface against a written specification of what
+it should demand, and fails if either grows a surface the table does not account for —
+see [The gap audit](#the-gap-audit).
+
+#### Two trust contexts: service-to-service and console
+
+Two classes of caller reach this vault, and the distinction is **not** expressible as
+a permission:
+
+- a **user principal** — signed in to the console through an interactive OAuth2
+  authorization-code + PKCE flow, with a browser session behind it;
+- a **service principal** — a machine identity carrying Auth's `svc` claim, calling
+  m2m. Workloads fetching their own secrets are the whole point of this service.
+
+A permission answers *"may this principal do X"*. Only the actor kind answers *"should
+this class of caller be doing X at all"* — and that is the question that catches a
+**stolen m2m credential**, whose grants are entirely real so no permission check will
+ever refuse it. A workload creating a project, rewiring a webhook, destroying a secret
+or reading the audit trail is by itself the signal.
+
+| Actor | Surfaces |
+|---|---|
+| **user only** | project · environment · folder · scope-import **writes**; webhook management; rotation-policy management; `restore` and `destroy`; the audit trail |
+| **either** | reveal, batch get, describe, list, version history; the ordinary write / rotate / soft-delete of a secret; every hierarchy **read** |
+
+Service principals are allowed to **write and rotate** — deliberately. A rotator
+replacing the credential it manages and a reconciler converging an environment it owns
+are first-class m2m cases, and the blast radius is bounded by the MRN grant rather than
+by the caller's class. Restricting writes to humans would push rotation back into a
+person's hands, which is the outcome a secret store exists to remove. `restore` and
+`destroy` are the exceptions because both authorize at **tenant scope** (the project
+and environment are unknown until the row is read), so they need a grant far wider than
+any single workload's.
+
+A refusal carries the distinct code **`actor_kind_not_permitted`** rather than
+`insufficient_permission`, because widening a grant is not the fix for a workload on
+the console surface. The status stays `403` / `PermissionDenied` — the reason differs,
+the answer does not — and the check runs *before* the permission check, so a
+wrong-class caller is never handed the name of the grant it would need.
+
+The class is derived from the **verified** claims (`authz.ActorKindFromClaims`), never
+from a header or any other caller-supplied field, and it is recorded on every audit row
+— which is what lets an incident review separate *"a human read the production database
+password"* from *"the billing workload read its own credential"*.
 
 #### Permissions
 
@@ -163,64 +217,95 @@ exists is what an engineer needs to operate a system; revealing a value is seein
 production database password. Collapsing them would mean every principal who can
 render a console page can also exfiltrate every credential on it.
 
-#### REST routes → permission
+#### REST routes → permission + actor
 
-Keyed by the first path segment under `/api/v1`. `GET`/`HEAD` require the read
-permission; every other verb requires the write one.
+Every route on `/secrets` and `/bulk` is declared **exactly** (method + path), because
+one segment pair could only ever be as strong as the weakest route on the segment.
 
-| Segment | Read (`GET`/`HEAD`) | Write (everything else) |
-|---|---|---|
-| `/projects` | `secret:ReadMetadata` | `secret:ManageProject` |
-| `/environments` | `secret:ReadMetadata` | `secret:ManageEnvironment` |
-| `/folders` | `secret:ReadMetadata` | `secret:ManageFolder` |
-| `/imports` | `secret:ReadMetadata` | `secret:ManageFolder` |
-| `/secrets` | `secret:ReadMetadata` | `secret:ReadMetadata` † |
-| `/bulk` | `secret:ReadMetadata` | `secret:ReadMetadata` † |
-| `/webhooks` | `secret:ReadMetadata` | `secret:ManageRotation` |
-| `/audit` | `secret:ReadAudit` | `secret:Admin` |
-| `/setup` | *exempt* ‡ | *exempt* ‡ |
-| `/healthz`, `/readyz` | *exempt* ‡ | — |
+| Route | Permission | Actor | Also enforced per-MRN in `internal/api` |
+|---|---|---|---|
+| `GET /secrets` | `secret:ListSecrets` | either | — |
+| `GET /secrets/deleted` | `secret:ListSecrets` | either | — |
+| `GET /secrets/describe` | `secret:ReadMetadata` | either | — |
+| `GET /secrets/versions` | `secret:ReadMetadata` | either | — |
+| `POST /secrets/reveal` † | `secret:GetSecret` | either | re-checked at **every reference hop** |
+| `POST /secrets` | `secret:PutSecret` | either | — |
+| `PATCH /secrets` | `secret:PutSecret` | either | — |
+| `POST /secrets/rollback` | `secret:PutSecret` | either | **`secret:GetSecret`** ‖ |
+| `POST /secrets/rotate` | `secret:RotateSecret` | either | — |
+| `POST /secrets/rotation-policy` | `secret:ManageRotation` | **user** | — |
+| `POST /secrets/delete` | `secret:DeleteSecret` | either | — |
+| `POST /secrets/restore` | `secret:DeleteSecret` | **user** | authorized at **tenant** scope |
+| `POST /secrets/destroy` | `secret:DeleteSecret` | **user** | authorized at **tenant** scope; irreversible |
+| `POST /bulk/get` † | `secret:GetSecret` | either | **every item**, on its own MRN |
+| `POST /bulk/put` | `secret:PutSecret` | either | **every item**, on its own MRN |
 
-† **Both verbs carry the metadata baseline on purpose.** Several routes on those
-segments are reads carried by a `POST` (reveal takes a body so a secret address never
-lands in an access log; batch get likewise), so a verb-derived split would demand a
-write permission for a read. The real privilege — `GetSecret` to reveal, `PutSecret`
-to write, `DeleteSecret` to delete — is enforced **per operation against the target's
-MRN** in `internal/api`, which is the only place it can be enforced correctly anyway.
-Those permissions are still *declared*, so Auth registers them.
+The remaining segments are uniform, so they keep the read/write pair: `GET`/`HEAD`
+requires the read permission, every other verb the write one.
+
+| Segment | Read (`GET`/`HEAD`) | Write (everything else) | Actor (read / write) | Also enforced per-MRN |
+|---|---|---|---|---|
+| `/projects` | `secret:ReadMetadata` | `secret:ManageProject` | either / **user** | — |
+| `/environments` | `secret:ReadMetadata` | `secret:ManageEnvironment` | either / **user** | — |
+| `/folders` | `secret:ReadMetadata` | `secret:ManageFolder` | either / **user** | `DELETE`: **`secret:DeleteSecret`** ‖ · `POST /move`: `ManageFolder` on **both** MRNs |
+| `/imports` | `secret:ReadMetadata` | `secret:ManageFolder` | either / **user** | `POST`: **`secret:GetSecret`** on the *source* scope ‖ |
+| `/webhooks` | `secret:ReadMetadata` | `secret:ManageRotation` | either / **user** | — |
+| `/audit` | `secret:ReadAudit` | `secret:Admin` | **user** / **user** | — |
+| `/setup` | *exempt* ‡ | *exempt* ‡ | — | — |
+| `/healthz`, `/readyz` | *exempt* ‡ | — | — | — |
+
+† A `POST` carrying a **read** — a secret's address belongs in a body, not in an access
+log. The verb is a transport detail; the permission is the reveal one.
+
+‖ **A second permission, on top of the one at the door.** A rollback republishes a value
+the caller did not supply, so a principal that may write but not read could otherwise
+use it as a read primitive. Deleting a folder deletes the secrets under it, so folder
+management alone must not be a way to delete values. A scope import makes another
+scope's values readable through this one, so creating it requires the ability to read
+them. In each case the route guard demands the **primary** permission and
+`internal/api` enforces the rest against the concrete target MRN — which is the only
+place a resource-dependent second check can be made.
 
 ‡ See [Exemptions](#exemptions).
 
-#### gRPC methods → permission
+#### gRPC methods → permission + actor
 
-`maintainerd.secret.v1.SecretService`:
+`maintainerd.secret.v1.SecretService`. The two transports are thin adapters over one
+application service, so this table **must agree with the REST one surface by surface** —
+otherwise a caller refused over REST would simply open a gRPC channel. A test asserts
+the pairing.
 
-| Method | Permission |
-|---|---|
-| `Put` | `secret:PutSecret` |
-| `Get` | `secret:GetSecret` *(the legacy flat Get is a reveal)* |
-| `List` | `secret:ListSecrets` |
-| `Delete` | `secret:DeleteSecret` |
-| `CreateProject` · `UpdateProject` · `DeleteProject` | `secret:ManageProject` |
-| `ListProjects` · `GetProject` | `secret:ReadMetadata` |
-| `CreateEnvironment` · `UpdateEnvironment` · `DeleteEnvironment` | `secret:ManageEnvironment` |
-| `ListEnvironments` · `GetEnvironment` | `secret:ReadMetadata` |
-| `CreateFolder` · `MoveFolder` · `DeleteFolder` | `secret:ManageFolder` |
-| `ListFolders` | `secret:ReadMetadata` |
-| `CreateImport` · `UpdateImport` · `DeleteImport` | `secret:ManageFolder` |
-| `ListImports` | `secret:ReadMetadata` |
-| `GetSecret` | `secret:GetSecret` |
-| `DescribeSecret` · `ListSecretVersions` | `secret:ReadMetadata` |
-| `ListSecrets` · `ListDeletedSecrets` | `secret:ListSecrets` |
-| `PutSecret` · `UpdateSecretMetadata` · `RollbackSecret` | `secret:PutSecret` |
-| `RotateSecret` | `secret:RotateSecret` |
-| `SetRotationPolicy` | `secret:ManageRotation` |
-| `DeleteSecret` · `RestoreSecret` · `DestroySecret` | `secret:DeleteSecret` |
-| `BatchGetSecrets` · `BatchPutSecrets` | `secret:ReadMetadata` † |
-| `CreateWebhookEndpoint` · `UpdateWebhookEndpoint` · `DeleteWebhookEndpoint` | `secret:ManageRotation` |
-| `ListWebhookEndpoints` · `ListWebhookDeliveries` | `secret:ReadMetadata` |
-| `ListAuditEvents` | `secret:ReadAudit` |
-| `Ping` · `Setup` | *exempt* ‡ |
+| Method | Permission | Actor | Also enforced per-MRN |
+|---|---|---|---|
+| `Put` | `secret:PutSecret` | either | — |
+| `Get` | `secret:GetSecret` *(the legacy flat Get is a reveal)* | either | — |
+| `List` | `secret:ListSecrets` | either | — |
+| `Delete` | `secret:DeleteSecret` | either | — |
+| `CreateProject` · `UpdateProject` · `DeleteProject` | `secret:ManageProject` | **user** | — |
+| `ListProjects` · `GetProject` | `secret:ReadMetadata` | either | — |
+| `CreateEnvironment` · `UpdateEnvironment` · `DeleteEnvironment` | `secret:ManageEnvironment` | **user** | — |
+| `ListEnvironments` · `GetEnvironment` | `secret:ReadMetadata` | either | — |
+| `CreateFolder` · `MoveFolder` | `secret:ManageFolder` | **user** | `MoveFolder`: both MRNs |
+| `DeleteFolder` | `secret:ManageFolder` | **user** | **`secret:DeleteSecret`** ‖ |
+| `ListFolders` | `secret:ReadMetadata` | either | — |
+| `CreateImport` | `secret:ManageFolder` | **user** | **`secret:GetSecret`** on the source ‖ |
+| `UpdateImport` · `DeleteImport` | `secret:ManageFolder` | **user** | — |
+| `ListImports` | `secret:ReadMetadata` | either | — |
+| `GetSecret` | `secret:GetSecret` | either | re-checked at every reference hop |
+| `DescribeSecret` · `ListSecretVersions` | `secret:ReadMetadata` | either | — |
+| `ListSecrets` · `ListDeletedSecrets` | `secret:ListSecrets` | either | — |
+| `PutSecret` · `UpdateSecretMetadata` | `secret:PutSecret` | either | — |
+| `RollbackSecret` | `secret:PutSecret` | either | **`secret:GetSecret`** ‖ |
+| `RotateSecret` | `secret:RotateSecret` | either | — |
+| `SetRotationPolicy` | `secret:ManageRotation` | **user** | — |
+| `DeleteSecret` | `secret:DeleteSecret` | either | — |
+| `RestoreSecret` · `DestroySecret` | `secret:DeleteSecret` | **user** | tenant scope |
+| `BatchGetSecrets` | `secret:GetSecret` | either | every item, on its own MRN |
+| `BatchPutSecrets` | `secret:PutSecret` | either | every item, on its own MRN |
+| `CreateWebhookEndpoint` · `UpdateWebhookEndpoint` · `DeleteWebhookEndpoint` | `secret:ManageRotation` | **user** | — |
+| `ListWebhookEndpoints` · `ListWebhookDeliveries` | `secret:ReadMetadata` | either | — |
+| `ListAuditEvents` | `secret:ReadAudit` | **user** | — |
+| `Ping` · `Setup` | *exempt* ‡ | — | — |
 
 `maintainerd.secret.v1.SetupService` — `GetSetupStatus` · `Setup` · `CompleteSetup` —
 is *exempt* ‡.
@@ -263,20 +348,39 @@ service that starts and answers 503 to everything.
 #### The gap audit
 
 `internal/platform/permissions/audit_test.go` is the test that keeps "no gaps" true
-tomorrow rather than only today. It:
+tomorrow rather than only today — and it is now a **specification** rather than a
+presence check. It:
 
 1. builds the **real chi router** this service mounts and walks it with `chi.Walk`;
 2. flattens the **generated `grpc.ServiceDesc` values** `grpc.Server` dispatches on —
    unary methods *and* streams;
-3. requires every one to be either mapped to a **non-empty** permission or covered by
-   an exemption that has a **written justification** in the test file;
-4. checks the reverse direction — no mapped segment or method that nothing serves;
-5. checks itself for vacuity, by requiring surfaces that do *not* exist to read as
+3. requires every one to match its row in `restSpec` / `grpcSpec` **exactly** — the
+   permission *and* the actor class — or be covered by an exemption that has a
+   **written justification** in the test file;
+4. fails any surface whose handler **mutates durable state** but resolves to a
+   read-only permission (`ReadMetadata`, `ListSecrets`, `ReadAudit`);
+5. asserts the REST and gRPC tables **agree** surface by surface, so a rule cannot hold
+   on one transport and not the other;
+6. checks the reverse directions — no mapped segment, exact route or method that
+   nothing serves, and no spec row describing a surface that no longer exists;
+7. checks itself for vacuity, by requiring surfaces that do *not* exist to read as
    gaps.
 
-Both lists are derived from the live surface, never hand-kept, because a hand-kept
-list drifts silently and a test that has stopped reading the surface is worse than no
-test: it reports "no gaps" with confidence.
+**Why the spec tables are not a mirror of the map.** Each row was derived by reading
+the handler, following it to its `internal/api` method, and recording the permission
+that method's `s.guard` call actually demands. A table that merely restated
+`permissions.Map()` would pass forever and prove nothing; these disagree loudly if
+either side moves. The `mutates` column is likewise a fact about the **handler**, not
+the HTTP verb — a reveal is a `POST` and is not a mutation, a rollback is a `POST` and
+is.
+
+Requiring only a *non-empty* permission — what this test used to do — is a much weaker
+property than it looks: a route mapped to the weakest permission in the vocabulary
+passes it exactly as well as one mapped to the right permission.
+
+The surface lists are derived from the live surface, never hand-kept, because a
+hand-kept list drifts silently and a test that has stopped reading the surface is worse
+than no test: it reports "no gaps" with confidence.
 
 ## Run modes
 
