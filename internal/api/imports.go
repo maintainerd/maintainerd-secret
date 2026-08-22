@@ -7,7 +7,7 @@ import (
 
 	"github.com/maintainerd/secret/internal/audit"
 	"github.com/maintainerd/secret/internal/platform/apperror"
-	"github.com/maintainerd/secret/internal/platform/authz"
+	"github.com/maintainerd/secret/internal/platform/permissions"
 	"github.com/maintainerd/secret/internal/store"
 )
 
@@ -69,10 +69,10 @@ func (s *Service) CreateImport(ctx context.Context, c Caller, in CreateImportInp
 	// is really a question about reading values.
 	sourceSecretPrefixMRN := c.mrn(in.SourceProject,
 		store.SecretResourcePath(in.SourceEnvironment, sourcePath, importProbeKey))
-	if err := s.guard(ctx, c, authz.PermManageFolder, store.ActionImportCreate, targetMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermManageFolder, store.ActionImportCreate, targetMRN); err != nil {
 		return nil, err
 	}
-	if err := s.guard(ctx, c, authz.PermGetSecret, store.ActionImportCreate, sourceSecretPrefixMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermGetSecret, store.ActionImportCreate, sourceSecretPrefixMRN); err != nil {
 		return nil, err
 	}
 
@@ -119,7 +119,7 @@ func (s *Service) ListImports(ctx context.Context, c Caller, in ListImportsInput
 		return nil, apperror.NewValidation(err.Error())
 	}
 	resourceMRN := c.mrn(in.Project, store.FolderResourcePath(in.Environment, normalized))
-	if err := s.guard(ctx, c, authz.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
 		return nil, err
 	}
 	edges, err := s.store.ListImports(ctx, c.TenantUUID, in.Project, in.Environment, normalized)
@@ -147,7 +147,7 @@ func (s *Service) SetImportEnabled(ctx context.Context, c Caller, in UpdateImpor
 		return nil, apperror.NewValidation("import_uuid must be a valid UUID")
 	}
 	resourceMRN := c.mrn("", store.ImportResourcePath(importUUID))
-	if err := s.guard(ctx, c, authz.PermManageFolder, store.ActionImportUpdate, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermManageFolder, store.ActionImportUpdate, resourceMRN); err != nil {
 		return nil, err
 	}
 	edge, err := s.store.SetImportEnabled(ctx, c.TenantUUID, importUUID, in.Enabled, in.Position)
@@ -176,7 +176,7 @@ func (s *Service) DeleteImport(ctx context.Context, c Caller, in ImportRef) erro
 		return apperror.NewValidation("import_uuid must be a valid UUID")
 	}
 	resourceMRN := c.mrn("", store.ImportResourcePath(importUUID))
-	if err := s.guard(ctx, c, authz.PermManageFolder, store.ActionImportDelete, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermManageFolder, store.ActionImportDelete, resourceMRN); err != nil {
 		return err
 	}
 	if err := s.store.DeleteImport(ctx, c.TenantUUID, importUUID); err != nil {

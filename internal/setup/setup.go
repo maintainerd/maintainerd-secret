@@ -137,6 +137,22 @@ type Options struct {
 	// DeclaredPermissions is what this service enforces, reported so a controller
 	// registers exactly that.
 	DeclaredPermissions []string
+	// CoreAttached is MAINTAINERD_MODE=core: the operator has DECLARED that a
+	// controller provisions this instance.
+	//
+	// It closes the REST wizard from the first boot rather than from the moment
+	// the controller wins the race. Without it there is a window — every second
+	// between "the instance is up" and "core has provisioned it" — in which the
+	// unauthenticated-by-Auth REST wizard is reachable by anything on the network
+	// and would hand the vault to whoever posts first. The bootstrap token still
+	// gates that window, but a declared mode is a second, free gate, and the
+	// operator has already told us which path they intend to use.
+	//
+	// FALSE (standalone) IS THE DEFAULT and leaves today's behaviour exactly as it
+	// was: the wizard is open until an orchestrator actually owns the instance.
+	// Nothing about the gRPC SetupService changes in either mode — an operator who
+	// runs standalone and later adopts core must still be able to be provisioned.
+	CoreAttached bool
 }
 
 // Service provisions the instance.
@@ -230,11 +246,26 @@ func (s *Service) Status(ctx context.Context) (Status, error) {
 
 // RefuseWhenOrchestrated reports whether the REST wizard must refuse this request.
 //
-// The condition is that an ORCHESTRATOR provisioned this instance. With the control
-// path unused there is no gRPC controller to bootstrap through, so closing REST too
-// would leave an instance with no way to be provisioned at all — which is exactly the
-// asymmetry maintainerd-auth's version documents.
+// TWO WAYS TO BE ORCHESTRATED, and either one closes the wizard:
+//
+//	DECLARED   MAINTAINERD_MODE=core (Options.CoreAttached). The operator has said
+//	           a controller owns first-run, so the wizard is shut from the first
+//	           boot rather than from the moment the controller wins the race.
+//	OBSERVED   an orchestrator actually provisioned this instance —
+//	           controller_kind = service in the durable setup_state row. This is
+//	           the original rule and it still applies in standalone mode, so an
+//	           instance that started standalone and was later adopted by core
+//	           closes its wizard the moment that happens.
+//
+// The condition is orchestration, NOT merely "setup is complete". With the
+// control path unused there is no gRPC controller to bootstrap through, so
+// closing REST on completion alone would leave an instance with no way to be
+// provisioned at all — which is exactly the asymmetry maintainerd-auth's version
+// documents.
 func (s *Service) RefuseWhenOrchestrated(ctx context.Context) (bool, error) {
+	if s.opts.CoreAttached {
+		return true, nil
+	}
 	state, err := s.store.SetupState(ctx)
 	if err != nil {
 		return false, err
@@ -243,6 +274,9 @@ func (s *Service) RefuseWhenOrchestrated(ctx context.Context) (bool, error) {
 }
 
 func (s *Service) orchestrated(state *store.SetupState) bool {
+	if s.opts.CoreAttached {
+		return true
+	}
 	return state != nil && state.Complete && state.ControllerKind == store.ControllerKindService
 }
 

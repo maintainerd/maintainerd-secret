@@ -7,204 +7,92 @@ import (
 	"strings"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
-	"google.golang.org/grpc/status"
 
-	"github.com/maintainerd/secret/internal/platform/authz"
+	sdkauthz "github.com/maintainerd/sdk/authz"
+
+	"github.com/maintainerd/secret/internal/platform/permissions"
 )
 
-// The gRPC twin of the HTTP guard (internal/platform/authz), mirroring
-// maintainerd-agent's interceptor: a method→permission map that DOUBLES AS THE
-// SURFACE ALLOWLIST, so adding an RPC to the proto without deciding its permission
-// fails closed instead of shipping an unguarded endpoint.
+// THE AUTH INTERCEPTOR IS THE SDK'S, NOT THIS PACKAGE'S.
 //
-// As on the HTTP side, the map is the BASELINE and the surface allowlist — not the
-// authorization decision. The real check is MRN-level and happens inside the api
-// service, because the target's MRN is not knowable from the method name.
-
-// methodPermissions maps every RPC to the permission its caller must carry. An empty
-// value means "any authenticated principal": identity proven, no extra grant.
+// This file used to carry a hand-rolled copy: a method→permission map, a bearer
+// extractor, a mode ladder and a deny-by-default switch. All of that now lives in
+// github.com/maintainerd/sdk/authz, shared with every other maintainerd service
+// and with third-party resource servers built beside them, and the only thing
+// that stayed behind is this service's own VOCABULARY — which moved to
+// internal/platform/permissions as one authz.Map literal. The map still doubles
+// as the surface allowlist, so registering an RPC without deciding its permission
+// still fails closed; it is just no longer this repo's job to implement that.
 //
-// A method that is NOT listed here is DENIED.
-var methodPermissions = map[string]string{
-	// Legacy flat-key surface — the kit secret-provider client's contract. The
-	// permissions are the real ones for the operation, not a compatibility
-	// exemption: an old client with a token that cannot read secrets could never
-	// read them through the old RPC either.
-	secretService + "Put":    authz.PermPutSecret,
-	secretService + "Get":    authz.PermGetSecret,
-	secretService + "List":   authz.PermListSecrets,
-	secretService + "Delete": authz.PermDeleteSecret,
+// TWO INTERCEPTORS ARE RETURNED, AND BOTH ARE REQUIRED. grpc-go dispatches unary
+// and streaming calls through different chains, so a server that installs only a
+// UnaryServerInterceptor leaves every server-streaming and bidi RPC completely
+// unguarded — no token check, no permission check, no allowlist. There is no
+// streaming RPC in maintainerd.secret.v1 today, which is exactly why that hole
+// was invisible; installing the stream interceptor now means the first streaming
+// RPC anybody adds arrives guarded rather than open.
 
-	// Projects / environments / folders / imports.
-	secretService + "CreateProject":     authz.PermManageProject,
-	secretService + "ListProjects":      authz.PermReadMetadata,
-	secretService + "GetProject":        authz.PermReadMetadata,
-	secretService + "UpdateProject":     authz.PermManageProject,
-	secretService + "DeleteProject":     authz.PermManageProject,
-	secretService + "CreateEnvironment": authz.PermManageEnvironment,
-	secretService + "ListEnvironments":  authz.PermReadMetadata,
-	secretService + "GetEnvironment":    authz.PermReadMetadata,
-	secretService + "UpdateEnvironment": authz.PermManageEnvironment,
-	secretService + "DeleteEnvironment": authz.PermManageEnvironment,
-	secretService + "CreateFolder":      authz.PermManageFolder,
-	secretService + "ListFolders":       authz.PermReadMetadata,
-	secretService + "MoveFolder":        authz.PermManageFolder,
-	secretService + "DeleteFolder":      authz.PermManageFolder,
-	secretService + "CreateImport":      authz.PermManageFolder,
-	secretService + "ListImports":       authz.PermReadMetadata,
-	secretService + "UpdateImport":      authz.PermManageFolder,
-	secretService + "DeleteImport":      authz.PermManageFolder,
+// The gRPC service prefixes, re-exported from the permission table so the
+// allowlist, the rate limiter and the handlers cannot disagree about what a
+// method is called.
+const (
+	secretService           = permissions.SecretServicePrefix
+	setupServicePrefix      = permissions.SetupServicePrefix
+	healthServicePrefix     = permissions.HealthServicePrefix
+	reflectionServicePrefix = permissions.ReflectionServicePrefix
+)
 
-	// Secrets. GetSecret is the reveal and carries the reveal permission; every
-	// metadata operation carries the metadata one. The distinction is the point.
-	secretService + "GetSecret":            authz.PermGetSecret,
-	secretService + "DescribeSecret":       authz.PermReadMetadata,
-	secretService + "ListSecrets":          authz.PermListSecrets,
-	secretService + "PutSecret":            authz.PermPutSecret,
-	secretService + "UpdateSecretMetadata": authz.PermPutSecret,
-	secretService + "ListSecretVersions":   authz.PermReadMetadata,
-	secretService + "RollbackSecret":       authz.PermPutSecret,
-	secretService + "RotateSecret":         authz.PermRotateSecret,
-	secretService + "SetRotationPolicy":    authz.PermManageRotation,
-	secretService + "DeleteSecret":         authz.PermDeleteSecret,
-	secretService + "ListDeletedSecrets":   authz.PermListSecrets,
-	secretService + "RestoreSecret":        authz.PermDeleteSecret,
-	secretService + "DestroySecret":        authz.PermDeleteSecret,
-
-	// Bulk. The baseline is metadata because a batch mixes items whose individual
-	// privileges differ; each item is checked with the operation's real permission
-	// against its own MRN inside the api service.
-	secretService + "BatchGetSecrets": authz.PermReadMetadata,
-	secretService + "BatchPutSecrets": authz.PermReadMetadata,
-
-	// Webhooks + audit.
-	secretService + "CreateWebhookEndpoint": authz.PermManageRotation,
-	secretService + "ListWebhookEndpoints":  authz.PermReadMetadata,
-	secretService + "UpdateWebhookEndpoint": authz.PermManageRotation,
-	secretService + "DeleteWebhookEndpoint": authz.PermManageRotation,
-	secretService + "ListWebhookDeliveries": authz.PermReadMetadata,
-	secretService + "ListAuditEvents":       authz.PermReadAudit,
-}
-
-const secretService = "/maintainerd.secret.v1.SecretService/"
-
-// selfGuardedMethods bypass the BEARER requirement because they must work before
-// Auth exists, and they carry their own gate instead:
+// AuthUnaryInterceptor enforces authentication and per-method permissions on
+// unary RPCs, through the SDK guard.
 //
-//	Ping   answers {ok, setup_complete} and nothing else — the same single bit the
-//	       anonymous REST setup status returns. An orchestrator has to be able to
-//	       ask "is this instance provisioned yet" before it has provisioned the
-//	       thing that mints tokens.
-//	Setup  (the legacy flat-surface RPC) is gated by the bootstrap token, compared
-//	       in constant time inside the handler.
-//
-// Nothing else may be added here without the same argument: a method on this list
-// is a method no token protects.
-var selfGuardedMethods = map[string]bool{
-	secretService + "Ping":  true,
-	secretService + "Setup": true,
-}
-
-// setupServicePrefix is the CONTROLLED setup surface. It is self-guarded by the
-// x-setup-token metadata header for the same reason the REST wizard is: it is what
-// provisions the instance, so it cannot require a token only a provisioned instance
-// can mint.
-const setupServicePrefix = "/maintainerd.secret.v1.SetupService/"
-
-// healthServicePrefix is the ONLY wholly unauthenticated surface: the standard
-// health protocol. Orchestrators and load balancers must probe liveness before they
-// have credentials, and the response leaks nothing beyond "serving".
-const healthServicePrefix = "/grpc.health.v1.Health/"
-
-// reflectionServicePrefix is gated on development. Reflection enumerates every RPC
-// and message in the service — a map of the vault's API handed to anyone who can
-// open a socket. Useful with grpcurl on a laptop, reconnaissance in production.
-const reflectionServicePrefix = "/grpc.reflection."
-
-// AuthUnaryInterceptor enforces authentication and per-method permissions.
-//
-// Fail-closed by construction:
+// Fail-closed by construction, all of it decided in authz.Guard.Check:
 //
 //	no token           -> Unauthenticated
 //	invalid token      -> Unauthenticated (never echoing WHY — that is oracle material)
 //	method not mapped  -> PermissionDenied (unknown surface, deny)
 //	permission missing -> PermissionDenied
 //	auth unconfigured  -> Unavailable, outside development
-func AuthUnaryInterceptor(guard authz.Guard) grpc.UnaryServerInterceptor {
-	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-		method := info.FullMethod
-		switch {
-		case strings.HasPrefix(method, healthServicePrefix):
-			return handler(ctx, req)
-		case strings.HasPrefix(method, reflectionServicePrefix):
-			if guard.Mode != authz.ModeDevOpen {
-				return nil, status.Error(codes.PermissionDenied, "server reflection is available only in development")
-			}
-			return handler(ctx, req)
-		case strings.HasPrefix(method, setupServicePrefix), selfGuardedMethods[method]:
-			// Self-guarded: the handler checks the setup/bootstrap token itself.
-			return handler(ctx, req)
-		}
-
-		switch guard.Mode {
-		case authz.ModeDevOpen:
-			return handler(authz.NewContext(ctx, authz.DevClaims()), req)
-		case authz.ModeUnavailable:
-			return nil, status.Errorf(codes.Unavailable,
-				"API authentication is not configured (%s); the API is disabled outside development", guard.Reason)
-		}
-
-		token := bearerFromMD(ctx)
-		if token == "" {
-			return nil, status.Error(codes.Unauthenticated, "missing bearer token")
-		}
-		claims, err := guard.Verify(ctx, token)
-		if err != nil {
-			return nil, status.Error(codes.Unauthenticated, "invalid token")
-		}
-		required, known := methodPermissions[method]
-		if !known {
-			return nil, status.Errorf(codes.PermissionDenied, "method %s has no permission mapping", method)
-		}
-		if required != "" && !claims.HasAction(required) {
-			return nil, status.Errorf(codes.PermissionDenied, "requires permission %s", required)
-		}
-		return handler(authz.NewContext(ctx, claims), req)
-	}
+//
+// Exempt methods — health, Ping, and the two self-guarded setup surfaces — are
+// let through with no principal attached; permissions.Map carries the argument
+// for each one. Server reflection is deliberately NEITHER mapped NOR exempt, so
+// it is denied by the allowlist under ModeEnforced and reachable only under
+// ModeDevOpen, where the guard admits every caller before it consults the map.
+// That is the same development-only posture the hand-rolled interceptor had, and
+// the bootstrap additionally registers the reflection service only in
+// development, so outside it there is nothing behind the door either.
+func AuthUnaryInterceptor(guard sdkauthz.Guard) grpc.UnaryServerInterceptor {
+	return guard.UnaryInterceptor()
 }
 
-// MappedMethods returns every RPC the interceptor guards, sorted. It exists so a
-// test can assert the map covers the whole registered surface: the allowlist only
-// fails closed if it is actually complete, and a method missing from it is a 403
-// nobody can explain.
+// AuthStreamInterceptor is the same decision path for streaming RPCs, carrying
+// the verified principal into the stream handler's context. It is not optional —
+// see the note at the top of this file.
+func AuthStreamInterceptor(guard sdkauthz.Guard) grpc.StreamServerInterceptor {
+	return guard.StreamInterceptor()
+}
+
+// MappedMethods returns every RPC the guard demands a permission for, sorted. It
+// exists so a test can assert the allowlist covers the whole registered surface:
+// an allowlist only fails closed if it is actually complete, and a method missing
+// from it is a 403 nobody can explain.
 func MappedMethods() []string {
-	out := make([]string, 0, len(methodPermissions))
-	for m := range methodPermissions {
-		out = append(out, m)
+	m := permissions.Map()
+	out := make([]string, 0, len(m.Methods))
+	for method := range m.Methods {
+		out = append(out, method)
 	}
 	sort.Strings(out)
 	return out
 }
 
 // bearerFromMD extracts a "Bearer <token>" authorization header from the incoming
-// gRPC metadata.
+// gRPC metadata, delegating to the SDK's parser so the guard and anything else
+// that inspects a call read the header identically.
 func bearerFromMD(ctx context.Context) string {
-	md, ok := metadata.FromIncomingContext(ctx)
-	if !ok {
-		return ""
-	}
-	vals := md.Get("authorization")
-	if len(vals) == 0 {
-		return ""
-	}
-	header := vals[0]
-	if len(header) > 7 && strings.EqualFold(header[:7], "bearer ") {
-		return strings.TrimSpace(header[7:])
-	}
-	return ""
+	return sdkauthz.BearerFromMetadata(ctx)
 }
 
 // metadataValue reads the first value of a metadata key.

@@ -354,6 +354,46 @@ func TestStandaloneCompletionDoesNotMarkTheInstanceOrchestrated(t *testing.T) {
 	assert.False(t, refuse, "a standalone install was never orchestrated")
 }
 
+// TestCoreModeClosesTheRESTWizardFromTheFirstBoot.
+//
+// MAINTAINERD_MODE=core is the operator DECLARING that a controller owns
+// first-run. Without this, there is a window between "the instance is up" and
+// "core has provisioned it" in which the REST wizard is reachable by anything on
+// the network and would hand the vault to whoever posts first. The bootstrap
+// token still gates that window; a declared mode is a second, free gate.
+func TestCoreModeClosesTheRESTWizardFromTheFirstBoot(t *testing.T) {
+	svc, _ := newTestService(t, Options{BootstrapToken: "t", CoreAttached: true})
+	ctx := context.Background()
+
+	refuse, err := svc.RefuseWhenOrchestrated(ctx)
+	require.NoError(t, err)
+	assert.True(t, refuse, "core mode refuses the wizard before anything has been provisioned")
+
+	status, err := svc.Status(ctx)
+	require.NoError(t, err)
+	assert.False(t, status.RESTWizardOpen)
+	assert.False(t, status.Completed, "refusing the wizard is not the same as being provisioned")
+}
+
+// TestStandaloneIsTheDefaultAndLeavesTheWizardOpen is the other half, and the
+// reason CoreAttached defaults to false: an operator who never adopts core, and
+// therefore never sets MAINTAINERD_MODE, must still be able to provision. Nothing
+// about the gRPC SetupService changes in either mode — an instance that starts
+// standalone and is later adopted by core has to remain provisionable.
+func TestStandaloneIsTheDefaultAndLeavesTheWizardOpen(t *testing.T) {
+	svc, _ := newTestService(t, Options{BootstrapToken: "t"})
+	ctx := context.Background()
+
+	refuse, err := svc.RefuseWhenOrchestrated(ctx)
+	require.NoError(t, err)
+	assert.False(t, refuse)
+
+	_, status, err := svc.ProvisionAndComplete(ctx, ProvisionInput{Controller: "operator"}, audit.Actor{})
+	require.NoError(t, err)
+	assert.True(t, status.Completed)
+	assert.Equal(t, ModeStandalone, status.Mode)
+}
+
 // TestAnonymousStatusIsOneBit: a client has to know whether to show a wizard, and
 // nothing else about an unprovisioned vault is safe to hand out.
 func TestAnonymousStatusIsOneBit(t *testing.T) {

@@ -8,7 +8,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
 
-	"github.com/maintainerd/secret/internal/platform/authz"
+	sdkauthz "github.com/maintainerd/sdk/authz"
 	"github.com/maintainerd/secret/internal/platform/response"
 )
 
@@ -64,7 +64,7 @@ func RequestLogger(next http.Handler) http.Handler {
 			"bytes", recorder.written,
 			"client_ip", PeerIP(r),
 		}
-		if claims, ok := authz.FromContext(r.Context()); ok && claims != nil {
+		if claims, ok := sdkauthz.FromContext(r.Context()); ok && claims != nil {
 			attrs = append(attrs, "principal", claims.Subject, "principal_kind", claims.Kind)
 			if claims.Tenant != "" {
 				attrs = append(attrs, "tenant", claims.Tenant)

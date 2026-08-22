@@ -15,7 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/maintainerd/secret/internal/platform/authz"
+	sdkauthz "github.com/maintainerd/sdk/authz"
 	"github.com/maintainerd/secret/internal/platform/logging"
 )
 
@@ -249,8 +249,8 @@ func TestRequestLoggerLogsNoPayload(t *testing.T) {
 	body := strings.NewReader(`{"key":"DB_PASSWORD","value":"` + value + `"}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/secrets?tenant="+value, body)
 	req.Header.Set("Authorization", "Bearer "+value)
-	req = req.WithContext(authz.NewContext(req.Context(), &authz.Claims{
-		Subject: "svc-billing", Kind: authz.ActorKindService, Tenant: "acme",
+	req = req.WithContext(sdkauthz.NewContext(req.Context(), &sdkauthz.Claims{
+		Subject: "svc-billing", Kind: sdkauthz.ActorKindService, Tenant: "acme",
 	}))
 
 	RequestLogger(echoingHandler).ServeHTTP(httptest.NewRecorder(), req)

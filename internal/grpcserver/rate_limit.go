@@ -9,7 +9,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/maintainerd/secret/internal/platform/authz"
+	sdkauthz "github.com/maintainerd/sdk/authz"
 	mw "github.com/maintainerd/secret/internal/platform/middleware"
 )
 
@@ -133,7 +133,7 @@ func classify(ctx context.Context, method string, opts RateLimitOptions) (class 
 // principalKey derives the limiter key from the verified claims, falling back to the
 // peer address before authentication has run.
 func principalKey(ctx context.Context) string {
-	if claims, ok := authz.FromContext(ctx); ok && claims != nil && claims.Subject != "" {
+	if claims, ok := sdkauthz.FromContext(ctx); ok && claims != nil && claims.Subject != "" {
 		return "sub:" + claims.Subject
 	}
 	return "ip:" + peerIP(ctx)

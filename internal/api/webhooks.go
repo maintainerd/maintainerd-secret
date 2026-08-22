@@ -7,7 +7,7 @@ import (
 
 	"github.com/maintainerd/secret/internal/audit"
 	"github.com/maintainerd/secret/internal/platform/apperror"
-	"github.com/maintainerd/secret/internal/platform/authz"
+	"github.com/maintainerd/secret/internal/platform/permissions"
 	"github.com/maintainerd/secret/internal/store"
 )
 
@@ -28,7 +28,7 @@ func (s *Service) CreateWebhookEndpoint(ctx context.Context, c Caller, in Create
 		return nil, err
 	}
 	resourceMRN := c.mrn(in.Project, store.ResourceWebhook)
-	if err := s.guard(ctx, c, authz.PermManageRotation, store.ActionWebhookCreate, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermManageRotation, store.ActionWebhookCreate, resourceMRN); err != nil {
 		return nil, err
 	}
 	endpoint, err := s.store.CreateWebhookEndpoint(ctx, store.CreateWebhookEndpointInput{
@@ -62,7 +62,7 @@ func (s *Service) ListWebhookEndpoints(ctx context.Context, c Caller, in ListWeb
 	}
 	page, limit := in.Pagination.resolved()
 	resourceMRN := c.mrn(in.Project, store.ResourceWebhook)
-	if err := s.guard(ctx, c, authz.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
 		return nil, 0, err
 	}
 	endpoints, total, err := s.store.ListWebhookEndpoints(ctx, c.TenantUUID, in.Project, page, limit)
@@ -93,7 +93,7 @@ func (s *Service) UpdateWebhookEndpoint(ctx context.Context, c Caller, in Update
 		return nil, apperror.NewValidation("endpoint_uuid must be a valid UUID")
 	}
 	resourceMRN := c.mrn(in.Project, store.WebhookResourcePath(endpointUUID))
-	if err := s.guard(ctx, c, authz.PermManageRotation, store.ActionWebhookUpdate, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermManageRotation, store.ActionWebhookUpdate, resourceMRN); err != nil {
 		return nil, err
 	}
 	endpoint, err := s.store.UpdateWebhookEndpoint(ctx, store.UpdateWebhookEndpointInput{
@@ -130,7 +130,7 @@ func (s *Service) DeleteWebhookEndpoint(ctx context.Context, c Caller, in Webhoo
 		return apperror.NewValidation("endpoint_uuid must be a valid UUID")
 	}
 	resourceMRN := c.mrn(in.Project, store.WebhookResourcePath(endpointUUID))
-	if err := s.guard(ctx, c, authz.PermManageRotation, store.ActionWebhookDelete, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermManageRotation, store.ActionWebhookDelete, resourceMRN); err != nil {
 		return err
 	}
 	if err := s.store.DeleteWebhookEndpoint(ctx, c.TenantUUID, endpointUUID); err != nil {
@@ -151,7 +151,7 @@ func (s *Service) ListWebhookDeliveries(ctx context.Context, c Caller, in ListWe
 	}
 	page, limit := in.Pagination.resolved()
 	resourceMRN := c.mrn(in.Project, store.WebhookResourcePath(endpointUUID))
-	if err := s.guard(ctx, c, authz.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
 		return nil, 0, err
 	}
 	deliveries, total, err := s.store.ListWebhookDeliveries(ctx, c.TenantUUID, endpointUUID, page, limit)
@@ -181,7 +181,7 @@ func (s *Service) ListAuditEvents(ctx context.Context, c Caller, in ListAuditEve
 	}
 	page, limit := in.Pagination.resolved()
 	resourceMRN := c.mrn("", store.ResourceAudit)
-	if err := s.guard(ctx, c, authz.PermReadAudit, store.ActionAuditRead, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermReadAudit, store.ActionAuditRead, resourceMRN); err != nil {
 		return nil, 0, err
 	}
 	entries, total, err := s.store.ListAuditEvents(ctx, c.TenantUUID, page, limit)

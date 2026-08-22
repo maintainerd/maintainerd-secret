@@ -11,13 +11,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/maintainerd/secret/internal/platform/authz"
+	sdkauthz "github.com/maintainerd/sdk/authz"
 )
 
 func probeRouter(t *testing.T, opts Options) http.Handler {
 	t.Helper()
-	return NewServer(nil, nil, authz.Guard{
-		Mode:   authz.ModeUnavailable,
+	return NewServer(nil, nil, sdkauthz.Guard{
+		Mode:   sdkauthz.ModeUnavailable,
 		Reason: "AUTH_JWKS_URL not set",
 	}, opts).Router()
 }

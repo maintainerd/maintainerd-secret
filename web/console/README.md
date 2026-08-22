@@ -153,13 +153,12 @@ verifies it against Auth's JWKS, issuer and audience.
 
 ### Guard-open mode
 
-If `VITE_OAUTH_ISSUER_URL`, `VITE_OAUTH_TOKEN_URL` and `VITE_OAUTH_CLIENT_ID` are
-**all** absent, the console runs without a bearer token and shows a permanent,
-non-dismissible banner plus a "Guard open" chip in the brand bar. That matches a
-service running with `APP_ENV=development` and no
-`AUTH_JWKS_URL`/`AUTH_ISSUER`/`AUTH_AUDIENCE`, whose guard serves every caller as
-a blanket-granted principal. It is the local-dev posture and must never be pointed
-at a production vault.
+If the issuer, the token URL and the client id are **all** absent, the console
+runs without a bearer token and shows a permanent, non-dismissible banner plus a
+"Guard open" chip in the brand bar. That matches a service running with
+`APP_ENV=development` and no `AUTH_JWKS_URL`/`AUTH_ISSUER`/`AUTH_AUDIENCE`, whose
+guard serves every caller as a blanket-granted principal. It is the local-dev
+posture and must never be pointed at a production vault.
 
 A *partial* identity configuration is treated as none, deliberately: it would
 otherwise send the operator to an authorize endpoint whose code can never be
@@ -167,13 +166,27 @@ exchanged.
 
 ### The OAuth client it expects
 
-Register a client in maintainerd-auth with:
+In **standalone** mode (`MAINTAINERD_MODE=standalone`, the service's default) you
+create this client BY HAND in maintainerd-auth's console — it is step 4 of the
+standalone runbook in the [service README](../../README.md). In **core** mode
+maintainerd-core creates it from a template.
+
+Either way it is the **frontend SPA client**, and it must have:
 
 - grant type `authorization_code`, PKCE **required** (`S256`), **public** (no secret)
 - redirect URI `https://<console-host>/auth/callback`
 - post-logout redirect URI `https://<console-host>`
 - scopes `openid profile email`
 - an audience matching the service's `AUTH_AUDIENCE`
+
+Its client id is `SECRET_CONSOLE_CLIENT_ID`. **The service validates that variable
+at boot** (in standalone mode, outside development) and this console signs in with
+it, so there is exactly one value to set and no way for the two halves to disagree
+about it.
+
+Do not confuse it with `SECRET_CLIENT_ID`/`SECRET_CLIENT_SECRET`, which are the
+service's own **backend m2m** client. That secret must never appear in
+`config.js`, a `.env` consumed by Vite, or anything else served to a browser.
 
 The permissions a signed-in user actually has come from their grants in Auth
 (`secret:ReadMetadata`, `secret:GetSecret`, `secret:PutSecret`, …), not from what
@@ -183,20 +196,51 @@ this console requests.
 
 ## Environment
 
-Every variable can be set at **build** time (`.env`, `import.meta.env`) or at
-**run** time (`window.__ENV__`, written by `public/config.js`), so one built image
-can target several deployments. None of them is a secret.
+Every setting can be supplied at **build** time (`.env`, `import.meta.env`) or at
+**run** time (`window.__ENV__`, written by `public/config.js`), so **one built
+image targets any operator without a rebuild**. None of them is a secret — this
+is a public OAuth client and `config.js` is served to every browser.
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `VITE_SECRET_API_BASE_URL` | `/api/v1` | Where secret's REST API lives. Same-origin by default. |
-| `VITE_OAUTH_ISSUER_URL` | — | Hosted identity origin; `/authorize` and `/end-session` hang off it. |
-| `VITE_OAUTH_TOKEN_URL` | — | Absolute URL of the OAuth token endpoint on Auth's public API. |
-| `VITE_OAUTH_CLIENT_ID` | — | This console's public client id. |
-| `VITE_OAUTH_AUDIENCE` | — | The resource-API audience secret enforces. |
-| `VITE_OAUTH_SCOPE` | — | Extra scopes beyond `openid profile email`. |
+Each setting has two accepted names. The **runtime** name is the SERVICE's own
+variable name, so a standalone operator sets the value once and both halves read
+it; the **build-time** `VITE_` name is what a local `.env` uses. Runtime wins when
+both are present.
+
+| Runtime (`window.__ENV__`) | Build time (`.env`) | Default | Purpose |
+|---|---|---|---|
+| `SECRET_API_BASE_URL` | `VITE_SECRET_API_BASE_URL` | `/api/v1` | Where secret's REST API lives. Same-origin by default, which keeps the bearer token off a cross-origin preflight. |
+| `AUTH_ISSUER` | `VITE_OAUTH_ISSUER_URL` | — | Hosted identity origin; `/authorize` and `/end-session` hang off it. Same value the service enforces as `iss`. |
+| `SECRET_CONSOLE_TOKEN_URL` | `VITE_OAUTH_TOKEN_URL` | — | Absolute URL of the OAuth token endpoint on Auth's public API. |
+| `SECRET_CONSOLE_CLIENT_ID` | `VITE_OAUTH_CLIENT_ID` | — | This console's **public SPA client id**. The service validates this same variable at boot in standalone mode. |
+| `AUTH_AUDIENCE` | `VITE_OAUTH_AUDIENCE` | — | The resource-API audience secret enforces. The token must be minted FOR secret or its verifier rejects it. |
+| `SECRET_CONSOLE_SCOPE` | `VITE_OAUTH_SCOPE` | — | Extra scopes beyond `openid profile email`. |
 
 Copy `.env.example` to `.env` to set them locally.
+
+### Rendering `config.js` for a deployment
+
+The built SPA loads `/config.js` before the app bundle (`index.html`). Render it
+from the environment wherever the files are served — an init container, a
+ConfigMap, an entrypoint on the static host:
+
+```sh
+cat > "$CONSOLE_DIR/config.js" <<EOF
+window.__ENV__ = {
+  SECRET_API_BASE_URL: "${SECRET_API_BASE_URL:-}",
+  AUTH_ISSUER: "${AUTH_ISSUER:-}",
+  SECRET_CONSOLE_TOKEN_URL: "${SECRET_CONSOLE_TOKEN_URL:-}",
+  SECRET_CONSOLE_CLIENT_ID: "${SECRET_CONSOLE_CLIENT_ID:-}",
+  AUTH_AUDIENCE: "${AUTH_AUDIENCE:-}",
+  SECRET_CONSOLE_SCOPE: "${SECRET_CONSOLE_SCOPE:-}"
+};
+EOF
+```
+
+**Never put `SECRET_CLIENT_SECRET` (or any backend credential) in this file.** It
+is downloaded by every visitor. The service's production image deliberately keeps
+`/srv/console` root-owned and read-only to the service user, so the vault process
+cannot rewrite the UI it ships — which is also why the image does not render this
+file itself.
 
 ---
 

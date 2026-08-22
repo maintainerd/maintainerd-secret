@@ -12,6 +12,13 @@ import (
 )
 
 // setRequiredEnv sets the minimum a successful Init needs.
+//
+// It runs at APP_ENV=production in the DEFAULT run mode (standalone), which is
+// what makes it the honest baseline: standalone is what an operator gets when
+// they set no mode at all, and it requires a complete identity configuration.
+// Every variable below is genuinely required in that combination — see
+// TestStandaloneRequiresItsIdentityConfiguration, which removes them one at a
+// time and asserts the boot error names the one it removed.
 func setRequiredEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("DB_HOST", "localhost")
@@ -22,6 +29,31 @@ func setRequiredEnv(t *testing.T) {
 	t.Setenv("SECRET_ROOT_KEY", strings.Repeat("ab", 32))
 	t.Setenv("SETUP_BOOTSTRAP_TOKEN", "bootstrap-token")
 	t.Setenv("APP_ENV", "production")
+	setStandaloneEnv(t)
+}
+
+// setStandaloneEnv sets the identity configuration standalone mode requires: the
+// three inbound-token checks, this service's own backend client, and the
+// console's public SPA client.
+func setStandaloneEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("MAINTAINERD_MODE", "")
+	t.Setenv("AUTH_JWKS_URL", "https://auth.example/.well-known/jwks.json")
+	t.Setenv("AUTH_ISSUER", "https://auth.example/")
+	t.Setenv("AUTH_AUDIENCE", "maintainerd-secret")
+	t.Setenv("SECRET_CLIENT_ID", "secret-backend")
+	t.Setenv("SECRET_CLIENT_SECRET", "secret-backend-secret")
+	t.Setenv("SECRET_CLIENT_PRIVATE_KEY_FILE", "")
+	t.Setenv("SECRET_CONSOLE_CLIENT_ID", "secret-console")
+}
+
+// clearAuthEnv blanks the three inbound-token variables, for the tests that are
+// about their absence.
+func clearAuthEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("AUTH_JWKS_URL", "")
+	t.Setenv("AUTH_ISSUER", "")
+	t.Setenv("AUTH_AUDIENCE", "")
 }
 
 func TestInitDefaults(t *testing.T) {
@@ -228,6 +260,7 @@ func TestAuthVariablesAreAllOrNothing(t *testing.T) {
 	for i, partial := range partials {
 		t.Run(fmt.Sprintf("case-%d", i), func(t *testing.T) {
 			setRequiredEnv(t)
+			clearAuthEnv(t)
 			for k, v := range partial {
 				t.Setenv(k, v)
 			}
@@ -249,15 +282,143 @@ func TestCompleteAuthConfigurationIsAccepted(t *testing.T) {
 	assert.Equal(t, "maintainerd-secret", AuthAudience)
 }
 
-// TestNoAuthConfigurationIsPermittedAndDisablesTheAPI. Booting is allowed so an
-// unprovisioned instance can still be reached on its setup surface; the guard, not
-// config, is what refuses the API.
-func TestNoAuthConfigurationIsPermitted(t *testing.T) {
+// TestNoAuthConfigurationIsPermittedInCoreMode. In core mode booting without auth
+// is the NORMAL pre-provisioning state: core has not driven the setup RPC yet, so
+// the instance must come up and be reachable on its setup surface. The guard, not
+// config, is what refuses the API in the meantime.
+func TestNoAuthConfigurationIsPermittedInCoreMode(t *testing.T) {
 	setRequiredEnv(t)
+	clearAuthEnv(t)
+	t.Setenv("MAINTAINERD_MODE", "core")
 	require.NoError(t, Init())
+	assert.Equal(t, ModeCore, Mode)
+	assert.False(t, IsStandalone())
 	assert.Empty(t, AuthJWKSURL)
 	assert.Empty(t, AuthIssuer)
 	assert.Empty(t, AuthAudience)
+}
+
+// ---------------------------------------------------------------------------
+// Run modes
+// ---------------------------------------------------------------------------
+
+// TestModeDefaultsToStandalone is the requirement, not a convenience: a developer
+// who never adopts core must get a working auth+secret deployment by doing
+// nothing, which means standalone has to be what an unset variable produces.
+func TestModeDefaultsToStandalone(t *testing.T) {
+	setRequiredEnv(t)
+	require.NoError(t, Init())
+	assert.Equal(t, ModeStandalone, Mode)
+	assert.True(t, IsStandalone())
+	assert.Contains(t, DescribeMode(), "standalone")
+}
+
+func TestModeIsValidated(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("MAINTAINERD_MODE", "attached")
+	err := Init()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "MAINTAINERD_MODE")
+	assert.Contains(t, err.Error(), "standalone, core")
+
+	t.Run("case and whitespace are tolerated", func(t *testing.T) {
+		setRequiredEnv(t)
+		t.Setenv("MAINTAINERD_MODE", "  CORE ")
+		require.NoError(t, Init())
+		assert.Equal(t, ModeCore, Mode)
+	})
+}
+
+// TestStandaloneRequiresItsIdentityConfiguration is the "not a silent degrade"
+// requirement. Each variable is removed on its own and the boot error must name
+// exactly the one that went missing — an operator who forgot the console client
+// id should not have to guess which of six things is wrong.
+func TestStandaloneRequiresItsIdentityConfiguration(t *testing.T) {
+	cases := map[string]string{
+		"SECRET_CLIENT_ID":         "SECRET_CLIENT_ID",
+		"SECRET_CLIENT_SECRET":     "SECRET_CLIENT_SECRET or SECRET_CLIENT_PRIVATE_KEY_FILE",
+		"SECRET_CONSOLE_CLIENT_ID": "SECRET_CONSOLE_CLIENT_ID",
+	}
+	for missing, named := range cases {
+		t.Run("missing "+missing, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv(missing, "")
+			err := Init()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), named)
+			assert.Contains(t, err.Error(), "maintainerd-auth's console",
+				"the error has to say where to create the thing that is missing")
+			assert.Contains(t, err.Error(), "MAINTAINERD_MODE=core",
+				"and it has to say what the other mode is, for an operator who set the wrong one")
+		})
+	}
+
+	// The three inbound-token variables are refused one rung EARLIER, by the
+	// all-or-nothing check, which is the more specific message: a JWKS URL with no
+	// issuer or audience check is dangerous in a way a merely absent one is not.
+	// Their absence as a SET is what the standalone rule catches.
+	t.Run("all three auth variables absent", func(t *testing.T) {
+		setRequiredEnv(t)
+		clearAuthEnv(t)
+		err := Init()
+		require.Error(t, err)
+		for _, name := range []string{"AUTH_ISSUER", "AUTH_JWKS_URL", "AUTH_AUDIENCE"} {
+			assert.Contains(t, err.Error(), name)
+		}
+		assert.Contains(t, err.Error(), "maintainerd-auth's console")
+	})
+}
+
+// TestStandaloneAcceptsAPrivateKeyInsteadOfASecret: private_key_jwt is the
+// stronger client authentication and must not be a second-class configuration.
+func TestStandaloneAcceptsAPrivateKeyInsteadOfASecret(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("SECRET_CLIENT_SECRET", "")
+	t.Setenv("SECRET_CLIENT_PRIVATE_KEY_FILE", "/run/secrets/secret-client.pem")
+	require.NoError(t, Init())
+	assert.Equal(t, "/run/secrets/secret-client.pem", ClientPrivateKeyFile)
+	assert.Empty(t, ClientSecret)
+}
+
+// TestBothClientCredentialsAreRefused. Holding two is not extra safety, it is an
+// ambiguity: the process uses one while the operator maintains the other.
+func TestBothClientCredentialsAreRefused(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("SECRET_CLIENT_SECRET", "shared-secret")
+	t.Setenv("SECRET_CLIENT_PRIVATE_KEY_FILE", "/run/secrets/secret-client.pem")
+	err := Init()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not both")
+}
+
+// TestStandaloneDegradesInDevelopment. On a laptop with no Auth running, the
+// dev-open guard and its loud banner are the point of the ladder; refusing to
+// boot there would make the reduced-safety development path unusable.
+func TestStandaloneDegradesInDevelopment(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("APP_ENV", "development")
+	t.Setenv("SETUP_BOOTSTRAP_TOKEN", "")
+	clearAuthEnv(t)
+	t.Setenv("SECRET_CLIENT_ID", "")
+	t.Setenv("SECRET_CLIENT_SECRET", "")
+	t.Setenv("SECRET_CONSOLE_CLIENT_ID", "")
+
+	require.NoError(t, Init())
+	assert.True(t, IsDevelopment())
+	assert.Equal(t, ModeStandalone, Mode)
+}
+
+// TestCoreModeIgnoresTheStandaloneCredentials: they are core's to provision, so
+// their absence is not this process's error to raise.
+func TestCoreModeIgnoresTheStandaloneCredentials(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("MAINTAINERD_MODE", "core")
+	t.Setenv("SECRET_CLIENT_ID", "")
+	t.Setenv("SECRET_CLIENT_SECRET", "")
+	t.Setenv("SECRET_CONSOLE_CLIENT_ID", "")
+	require.NoError(t, Init())
+	assert.Equal(t, ModeCore, Mode)
+	assert.Contains(t, DescribeMode(), "core")
 }
 
 func TestRotationAndWebhookDefaults(t *testing.T) {

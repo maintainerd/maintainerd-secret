@@ -26,6 +26,42 @@ import (
 // ephemeral root key, an open setup window) is permitted.
 const EnvDevelopment = crypto.EnvDevelopment
 
+// The two worlds this service can run in — MAINTAINERD_MODE.
+//
+// THEY ARE NOT DEGREES OF THE SAME THING. They differ in WHO CREATES THIS
+// SERVICE'S IDENTITY IN AUTH, and therefore in what has to be in the environment
+// before the process can enforce anything.
+//
+//	ModeStandalone (the DEFAULT)
+//	  There is no maintainerd-core anywhere. An operator already runs
+//	  maintainerd-auth and, in Auth's own console, creates by hand: the secret
+//	  SERVICE PRINCIPAL, its RESOURCE API and permissions, a BACKEND M2M CLIENT
+//	  for this service, and a FRONTEND SPA CLIENT for its console. They then hand
+//	  those credentials to this process as environment variables — issuer, JWKS
+//	  URL, audience, SECRET_CLIENT_ID plus a secret or a private key, and
+//	  SECRET_CONSOLE_CLIENT_ID. Nothing about core is involved or required, and
+//	  this is a first-class supported way to run the service rather than a
+//	  fallback. The REST setup wizard is the bootstrap path.
+//
+//	ModeCore
+//	  maintainerd-core provisions all of the above through its setup gRPC surface
+//	  and its templates, and records itself as this instance's controller. The
+//	  REST setup wizard refuses, because two open first-run paths is a race whose
+//	  winner owns the vault.
+//
+// IN NEITHER MODE DOES THIS SERVICE MANAGE AUTHENTICATION. Auth mints tokens and
+// owns principals, roles and grants; this service only ENFORCES the permissions a
+// token carries. The mode decides how it learns which Auth to trust, not whether
+// it trusts one.
+const (
+	ModeStandalone = "standalone"
+	ModeCore       = "core"
+)
+
+// KnownModes is the accepted MAINTAINERD_MODE set, in the order they are listed
+// in an error message.
+func KnownModes() []string { return []string{ModeStandalone, ModeCore} }
+
 // Populated once by Init and read-only thereafter. Tests use t.Setenv and call
 // Init again.
 var (
@@ -34,6 +70,59 @@ var (
 	LogLevel string // LOG_LEVEL; debug|info|warn|error. Default "info".
 	GRPCAddr string // GRPC_PORT; default ":9092".
 	HTTPAddr string // HTTP_PORT; default ":8092".
+
+	// --- run mode ----------------------------------------------------------
+
+	// Mode (MAINTAINERD_MODE) is standalone or core. DEFAULT: standalone —
+	// see the ModeStandalone/ModeCore doc comment above for the full contrast.
+	// The default is deliberate: a developer who has never adopted core must be
+	// able to run auth + secret and nothing else, and the way to make that a
+	// first-class path rather than a documented workaround is to make it what
+	// happens when nobody sets the variable.
+	Mode string
+
+	// --- standalone credentials --------------------------------------------
+	//
+	// These are the backend M2M client an operator creates BY HAND in Auth's
+	// console for this service, plus the SPA client they create for its console.
+	// They are required in standalone mode outside development; in core mode they
+	// are unused, because core provisions the equivalent through its templates.
+	//
+	// They are validated as a SET (see initRunMode), and the failure message names
+	// exactly what to set. A secret store that boots with half its identity
+	// configured is a secret store that fails on its first outbound call, at a
+	// moment nobody is watching the log.
+
+	// ClientID (SECRET_CLIENT_ID) is this service's own client id in Auth — the
+	// backend, confidential, machine-to-machine client. It is what this service
+	// presents when it needs a token OF ITS OWN (for example to call another
+	// maintainerd service); it is NOT what verifies inbound tokens, which is
+	// AuthJWKSURL/AuthIssuer/AuthAudience.
+	ClientID string
+
+	// ClientSecret (SECRET_CLIENT_SECRET) is that client's secret. NEVER LOG THIS
+	// VALUE. Exactly one of it or ClientPrivateKeyFile is required.
+	ClientSecret string
+
+	// ClientPrivateKeyFile (SECRET_CLIENT_PRIVATE_KEY_FILE) is the path to a
+	// private key for private_key_jwt client authentication — the stronger
+	// alternative to a shared secret, because the credential never leaves the
+	// host. Exactly one of it or ClientSecret is required.
+	ClientPrivateKeyFile string
+
+	// ConsoleClientID (SECRET_CONSOLE_CLIENT_ID) is the PUBLIC SPA client id the
+	// console signs in with (authorization code + PKCE, no client secret). It is
+	// not a credential — it is published in the browser by design — but it is
+	// required, because a console pointed at a client id that does not exist sends
+	// the operator to an authorize endpoint that answers with an error they cannot
+	// act on.
+	//
+	// The service itself never USES this value: the console reads it from its own
+	// runtime config (web/console/public/config.js). It is required and logged
+	// here so that "the console cannot log in" is caught at boot, by the process
+	// that already knows the rest of the identity wiring, rather than by an
+	// operator reading a browser console.
+	ConsoleClientID string
 
 	// --- http server timeouts ----------------------------------------------
 	//
@@ -361,9 +450,10 @@ func Init() error {
 			"config: AUTH_JWKS_URL, AUTH_ISSUER and AUTH_AUDIENCE must be set together or not at all; " +
 				"a JWKS URL without an issuer and audience check accepts tokens minted for other services")
 	}
-	if authSet := boolCount(AuthJWKSURL != "", AuthIssuer != "", AuthAudience != ""); authSet == 0 && !IsDevelopment() {
-		slog.Warn("config: no auth configuration — the API will answer 503 and gRPC will serve health only",
-			"missing", "AUTH_JWKS_URL, AUTH_ISSUER, AUTH_AUDIENCE")
+	// The run mode is resolved AFTER the auth variables, because what it requires is
+	// expressed in terms of them.
+	if err = initRunMode(); err != nil {
+		return err
 	}
 
 	if ReferenceMaxDepth, err = positiveInt("SECRET_REFERENCE_MAX_DEPTH", 8); err != nil {
@@ -411,6 +501,113 @@ func Init() error {
 	DefaultEnvironment = kitconfig.GetEnv("SECRET_DEFAULT_ENVIRONMENT", "default")
 
 	return nil
+}
+
+// initRunMode reads MAINTAINERD_MODE and validates what that mode requires.
+//
+// THE WHOLE POINT IS THAT STANDALONE IS NOT A DEGRADED MODE. An operator running
+// auth + secret with no core at all has done real work by hand in Auth's console
+// — created the service principal, its resource API and permissions, a backend
+// M2M client and a frontend SPA client — and every one of those produces a value
+// this process needs. Missing one is a MISTAKE, not a configuration choice, so
+// outside development it is a boot error that names exactly what to set rather
+// than a service that starts and answers 503 to everything until somebody reads
+// the guard banner.
+//
+// In DEVELOPMENT the same absence degrades to the dev-open guard with its loud
+// banner, unchanged: a laptop instance with no Auth running is the case the
+// dev-open ladder exists for.
+//
+// In CORE MODE none of it is required here, because core provisions all of it
+// through its setup gRPC surface and then supplies the values; the pre-core
+// window is exactly the state ModeUnavailable was designed to hold, and it is
+// warned about rather than refused.
+func initRunMode() error {
+	Mode = strings.ToLower(strings.TrimSpace(kitconfig.GetEnv("MAINTAINERD_MODE", ModeStandalone)))
+	if !slices.Contains(KnownModes(), Mode) {
+		return fmt.Errorf("config: MAINTAINERD_MODE %q is not one of %s",
+			Mode, strings.Join(KnownModes(), ", "))
+	}
+
+	ClientID = strings.TrimSpace(kitconfig.GetEnv("SECRET_CLIENT_ID", ""))
+	ClientSecret = kitconfig.GetEnv("SECRET_CLIENT_SECRET", "")
+	ClientPrivateKeyFile = strings.TrimSpace(kitconfig.GetEnv("SECRET_CLIENT_PRIVATE_KEY_FILE", ""))
+	ConsoleClientID = strings.TrimSpace(kitconfig.GetEnv("SECRET_CONSOLE_CLIENT_ID", ""))
+
+	// Two client credentials is not "extra safety", it is an ambiguity: the two
+	// authenticate this service to Auth in different ways, and a process that holds
+	// both will use one of them while the operator maintains the other.
+	if ClientSecret != "" && ClientPrivateKeyFile != "" {
+		return fmt.Errorf("config: set SECRET_CLIENT_SECRET or SECRET_CLIENT_PRIVATE_KEY_FILE, not both — " +
+			"they are two ways to authenticate the same client and only one is used")
+	}
+
+	if Mode == ModeCore {
+		if AuthJWKSURL == "" {
+			slog.Warn("config: MAINTAINERD_MODE=core and no auth configuration yet — "+
+				"the API answers 503 and gRPC serves health only until core provisions this instance",
+				"missing", "AUTH_JWKS_URL, AUTH_ISSUER, AUTH_AUDIENCE")
+		}
+		return nil
+	}
+
+	// --- standalone ---------------------------------------------------------
+	missing := standaloneMissing()
+	if len(missing) == 0 {
+		return nil
+	}
+	if IsDevelopment() {
+		slog.Warn("config: MAINTAINERD_MODE=standalone with an incomplete identity configuration — "+
+			"permitted in "+EnvDevelopment+" only; the guard will open in development mode",
+			"missing", strings.Join(missing, ", "))
+		return nil
+	}
+	return fmt.Errorf(
+		"config: MAINTAINERD_MODE=%s requires %s. Create them in maintainerd-auth's console "+
+			"(the secret service principal, its resource API and permissions, a backend m2m client "+
+			"and a frontend SPA client for the console), then set them here. "+
+			"Set MAINTAINERD_MODE=%s if maintainerd-core provisions this instance instead",
+		ModeStandalone, strings.Join(missing, ", "), ModeCore)
+}
+
+// standaloneMissing lists the variables standalone mode needs and does not have,
+// in the order an operator would set them. Naming every one at once matters: a
+// message that reports them one boot at a time turns a five-minute setup into
+// five restarts.
+func standaloneMissing() []string {
+	var missing []string
+	if AuthIssuer == "" {
+		missing = append(missing, "AUTH_ISSUER")
+	}
+	if AuthJWKSURL == "" {
+		missing = append(missing, "AUTH_JWKS_URL")
+	}
+	if AuthAudience == "" {
+		missing = append(missing, "AUTH_AUDIENCE")
+	}
+	if ClientID == "" {
+		missing = append(missing, "SECRET_CLIENT_ID")
+	}
+	if ClientSecret == "" && ClientPrivateKeyFile == "" {
+		missing = append(missing, "SECRET_CLIENT_SECRET or SECRET_CLIENT_PRIVATE_KEY_FILE")
+	}
+	if ConsoleClientID == "" {
+		missing = append(missing, "SECRET_CONSOLE_CLIENT_ID")
+	}
+	return missing
+}
+
+// IsStandalone reports whether this instance owns its own identity wiring.
+func IsStandalone() bool { return Mode == ModeStandalone }
+
+// DescribeMode renders the run mode for a boot log line.
+func DescribeMode() string {
+	switch Mode {
+	case ModeCore:
+		return ModeCore + " (maintainerd-core provisions this instance through the gRPC SetupService)"
+	default:
+		return ModeStandalone + " (an operator provisions this instance; auth is configured by environment)"
+	}
 }
 
 // initServerTimeouts reads the HTTP server and shutdown bounds.

@@ -13,9 +13,19 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	sdkauthz "github.com/maintainerd/sdk/authz"
 	secretv1 "github.com/maintainerd/secret/gen/maintainerd/secret/v1"
-	"github.com/maintainerd/secret/internal/platform/authz"
+	"github.com/maintainerd/secret/internal/platform/permissions"
 )
+
+// These tests pin the gRPC surface's BEHAVIOUR, not its implementation. The
+// decision path now lives in github.com/maintainerd/sdk/authz; what remains this
+// service's responsibility — and what these assert — is that the permissions.Map
+// driving it describes this service's RPCs correctly and completely.
+
+// ---------------------------------------------------------------------------
+// The allowlist is complete
+// ---------------------------------------------------------------------------
 
 // TestEveryRegisteredRPCHasAPermissionMapping is the anti-drift test that makes the
 // allowlist meaningful.
@@ -24,14 +34,20 @@ import (
 // denied to every caller, which ships as a 403 nobody can explain. Enumerating the
 // generated service descriptor means adding an RPC to the proto without deciding its
 // permission fails HERE, in CI, rather than in production.
+//
+// The exhaustive version — every REST route AND every RPC on every registered
+// service, against the Map and the exemption set — is in permissions_audit_test.go.
+// This one stays because it is the fastest signal for the surface an RPC author is
+// actually editing.
 func TestEveryRegisteredRPCHasAPermissionMapping(t *testing.T) {
-	for _, m := range secretv1.SecretService_ServiceDesc.Methods {
-		full := secretService + m.MethodName
-		if selfGuardedMethods[full] {
-			continue // Ping and the legacy Setup carry their own gate — see the map's doc.
+	m := permissions.Map()
+	for _, method := range secretv1.SecretService_ServiceDesc.Methods {
+		full := secretService + method.MethodName
+		if m.IsExempt(sdkauthz.Surface{FullMethod: full}) {
+			continue // Ping and the legacy Setup carry their own gate — see permissions.Map.
 		}
-		_, mapped := methodPermissions[full]
-		assert.True(t, mapped, "RPC %s has no permission mapping", m.MethodName)
+		_, mapped := m.Methods[full]
+		assert.True(t, mapped, "RPC %s has no permission mapping", method.MethodName)
 	}
 }
 
@@ -39,10 +55,10 @@ func TestEveryRegisteredRPCHasAPermissionMapping(t *testing.T) {
 // exists is dead weight that makes the map harder to audit.
 func TestNoStaleMappings(t *testing.T) {
 	live := map[string]bool{}
-	for _, m := range secretv1.SecretService_ServiceDesc.Methods {
-		live[secretService+m.MethodName] = true
+	for _, method := range secretv1.SecretService_ServiceDesc.Methods {
+		live[secretService+method.MethodName] = true
 	}
-	for mapped := range methodPermissions {
+	for mapped := range permissions.Map().Methods {
 		assert.True(t, live[mapped], "%s is mapped but not registered", mapped)
 	}
 }
@@ -50,18 +66,27 @@ func TestNoStaleMappings(t *testing.T) {
 // TestRevealAndMetadataRPCsCarryDifferentPermissions is the contract's distinct-grant
 // requirement, checked on the gRPC surface.
 func TestRevealAndMetadataRPCsCarryDifferentPermissions(t *testing.T) {
-	assert.Equal(t, authz.PermGetSecret, methodPermissions[secretService+"GetSecret"])
-	assert.Equal(t, authz.PermReadMetadata, methodPermissions[secretService+"DescribeSecret"])
-	assert.Equal(t, authz.PermGetSecret, methodPermissions[secretService+"Get"],
+	m := permissions.Map().Methods
+	assert.Equal(t, permissions.PermGetSecret, m[secretService+"GetSecret"])
+	assert.Equal(t, permissions.PermReadMetadata, m[secretService+"DescribeSecret"])
+	assert.Equal(t, permissions.PermGetSecret, m[secretService+"Get"],
 		"the legacy flat Get is a reveal and carries the reveal permission")
 }
 
-// TestSelfGuardedMethodsAreExactlyTheTwoDocumented. Anything on that list is a method
-// no token protects, so the list must not grow by accident.
-func TestSelfGuardedMethodsAreExactlyTheTwoDocumented(t *testing.T) {
-	assert.Len(t, selfGuardedMethods, 2)
-	assert.True(t, selfGuardedMethods[secretService+"Ping"])
-	assert.True(t, selfGuardedMethods[secretService+"Setup"])
+// TestSelfGuardedRPCsAreExactlyTheDocumentedSet. Every entry is a method no token
+// protects, so the list must not grow by accident. It is matched EXACTLY rather than
+// by service prefix, which is what makes a NEW SetupService RPC fail closed instead
+// of silently inheriting the exemption its neighbours have.
+func TestSelfGuardedRPCsAreExactlyTheDocumentedSet(t *testing.T) {
+	assert.ElementsMatch(t, []string{
+		healthServicePrefix + "Check",
+		healthServicePrefix + "Watch",
+		secretService + "Ping",
+		secretService + "Setup",
+		setupServicePrefix + "GetSetupStatus",
+		setupServicePrefix + "Setup",
+		setupServicePrefix + "CompleteSetup",
+	}, permissions.Map().ExemptMethods)
 }
 
 func TestMappedMethodsIsSorted(t *testing.T) {
@@ -93,10 +118,13 @@ func ctxWithToken(token string) context.Context {
 		metadata.Pairs("authorization", "Bearer "+token))
 }
 
-func enforcedGuard(claims *authz.Claims) authz.Guard {
-	return authz.Guard{
-		Mode: authz.ModeEnforced,
-		Verify: func(_ context.Context, token string) (*authz.Claims, error) {
+// guardWith builds the guard the bootstrap builds, with a stub verifier.
+func guardWith(mode sdkauthz.Mode, claims *sdkauthz.Claims) sdkauthz.Guard {
+	return sdkauthz.Guard{
+		Mode:        mode,
+		Permissions: permissions.Map(),
+		Service:     permissions.ServiceName,
+		Verify: func(_ context.Context, token string) (*sdkauthz.Claims, error) {
 			if token != "good" {
 				return nil, errors.New("bad token")
 			}
@@ -105,31 +133,43 @@ func enforcedGuard(claims *authz.Claims) authz.Guard {
 	}
 }
 
+func enforcedGuard(claims *sdkauthz.Claims) sdkauthz.Guard {
+	return guardWith(sdkauthz.ModeEnforced, claims)
+}
+
 func TestHealthIsTheOnlyUnauthenticatedSurface(t *testing.T) {
 	h, reached := handlerReached()
 	interceptor := AuthUnaryInterceptor(enforcedGuard(nil))
 
-	_, err := interceptor(context.Background(), nil, info("/grpc.health.v1.Health/Check"), h)
+	_, err := interceptor(context.Background(), nil, info(healthServicePrefix+"Check"), h)
 	require.NoError(t, err)
 	assert.True(t, *reached)
 }
 
+// TestReflectionIsDevelopmentOnly. Reflection is neither mapped nor exempt, so under
+// enforcement the allowlist denies it, and under ModeDevOpen the guard admits every
+// caller before it consults the map. Same posture as the hand-rolled interceptor had,
+// reached through the shared ladder instead of a special case.
 func TestReflectionIsDevelopmentOnly(t *testing.T) {
 	h, _ := handlerReached()
+	const reflectionMethod = "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo"
 
-	_, err := AuthUnaryInterceptor(enforcedGuard(nil))(
-		context.Background(), nil, info("/grpc.reflection.v1.ServerReflection/ServerReflectionInfo"), h)
+	_, err := AuthUnaryInterceptor(enforcedGuard(&sdkauthz.Claims{
+		Grants: []sdkauthz.Grant{{Action: permissions.PermAdmin}},
+	}))(ctxWithToken("good"), nil, info(reflectionMethod), h)
 	require.Error(t, err)
 	assert.Equal(t, codes.PermissionDenied, status.Code(err))
 
-	_, err = AuthUnaryInterceptor(authz.Guard{Mode: authz.ModeDevOpen})(
-		context.Background(), nil, info("/grpc.reflection.v1.ServerReflection/ServerReflectionInfo"), h)
+	_, err = AuthUnaryInterceptor(guardWith(sdkauthz.ModeDevOpen, nil))(
+		context.Background(), nil, info(reflectionMethod), h)
 	require.NoError(t, err)
+
+	assert.True(t, strings.HasPrefix(reflectionMethod, reflectionServicePrefix))
 }
 
 func TestMissingAndInvalidTokensAreUnauthenticated(t *testing.T) {
 	h, reached := handlerReached()
-	interceptor := AuthUnaryInterceptor(enforcedGuard(&authz.Claims{}))
+	interceptor := AuthUnaryInterceptor(enforcedGuard(&sdkauthz.Claims{}))
 
 	_, err := interceptor(context.Background(), nil, info(secretService+"GetSecret"), h)
 	require.Error(t, err)
@@ -145,8 +185,8 @@ func TestMissingAndInvalidTokensAreUnauthenticated(t *testing.T) {
 
 func TestUnmappedMethodIsDenied(t *testing.T) {
 	h, reached := handlerReached()
-	interceptor := AuthUnaryInterceptor(enforcedGuard(&authz.Claims{
-		Grants: []authz.Grant{{Action: authz.PermAdmin}},
+	interceptor := AuthUnaryInterceptor(enforcedGuard(&sdkauthz.Claims{
+		Grants: []sdkauthz.Grant{{Action: permissions.PermAdmin}},
 	}))
 	_, err := interceptor(ctxWithToken("good"), nil, info(secretService+"BrandNewRPC"), h)
 	require.Error(t, err)
@@ -156,7 +196,7 @@ func TestUnmappedMethodIsDenied(t *testing.T) {
 }
 
 func TestBaselinePermissionIsEnforced(t *testing.T) {
-	metadataOnly := &authz.Claims{Grants: []authz.Grant{{Action: authz.PermReadMetadata}}}
+	metadataOnly := &sdkauthz.Claims{Grants: []sdkauthz.Grant{{Action: permissions.PermReadMetadata}}}
 	interceptor := AuthUnaryInterceptor(enforcedGuard(metadataOnly))
 
 	h, reached := handlerReached()
@@ -168,14 +208,32 @@ func TestBaselinePermissionIsEnforced(t *testing.T) {
 	_, err = interceptor(ctxWithToken("good"), nil, info(secretService+"GetSecret"), h)
 	require.Error(t, err)
 	assert.Equal(t, codes.PermissionDenied, status.Code(err))
-	assert.Contains(t, err.Error(), authz.PermGetSecret)
+	assert.Contains(t, err.Error(), permissions.PermGetSecret)
 	assert.False(t, *reached)
+}
+
+// TestAdminIsBlanketOnTheWire. secret:Admin is this service's vocabulary, not the
+// SDK's, so it only covers other actions because the guard copies Map.BlanketActions
+// onto every principal it verifies. If that wiring is ever dropped, an
+// administrator's token silently stops authorizing anything.
+func TestAdminIsBlanketOnTheWire(t *testing.T) {
+	adminOnly := &sdkauthz.Claims{Grants: []sdkauthz.Grant{{Action: permissions.PermAdmin}}}
+	h, reached := handlerReached()
+
+	_, err := AuthUnaryInterceptor(enforcedGuard(adminOnly))(
+		ctxWithToken("good"), nil, info(secretService+"GetSecret"), h)
+	require.NoError(t, err)
+	assert.True(t, *reached)
 }
 
 // TestModeUnavailableServesHealthOnly: outside development a missing auth
 // configuration disables the API rather than quietly serving it open.
 func TestModeUnavailableServesHealthOnly(t *testing.T) {
-	guard := authz.Guard{Mode: authz.ModeUnavailable, Reason: "AUTH_ISSUER not set"}
+	guard := sdkauthz.Guard{
+		Mode:        sdkauthz.ModeUnavailable,
+		Reason:      "AUTH_ISSUER not set",
+		Permissions: permissions.Map(),
+	}
 	interceptor := AuthUnaryInterceptor(guard)
 
 	h, _ := handlerReached()
@@ -185,35 +243,91 @@ func TestModeUnavailableServesHealthOnly(t *testing.T) {
 	assert.Contains(t, err.Error(), "AUTH_ISSUER not set")
 
 	h, reached := handlerReached()
-	_, err = interceptor(context.Background(), nil, info("/grpc.health.v1.Health/Check"), h)
+	_, err = interceptor(context.Background(), nil, info(healthServicePrefix+"Check"), h)
 	require.NoError(t, err)
 	assert.True(t, *reached, "health stays reachable so an orchestrator can still probe")
 }
 
 // TestSetupServiceIsSelfGuarded: the controlled setup surface must work before Auth
-// exists, so the interceptor lets it through and the handler checks the setup token.
+// exists, so the guard lets it through and the handler checks the setup token.
 func TestSetupServiceIsSelfGuarded(t *testing.T) {
+	for _, method := range []string{"GetSetupStatus", "Setup", "CompleteSetup"} {
+		h, reached := handlerReached()
+		interceptor := AuthUnaryInterceptor(enforcedGuard(nil))
+		_, err := interceptor(context.Background(), nil, info(setupServicePrefix+method), h)
+		require.NoError(t, err, method)
+		assert.True(t, *reached, method)
+	}
+}
+
+// TestANewSetupServiceRPCWouldFailClosed. The exemption is an exact method list, not
+// the service prefix, so a fourth SetupService RPC is denied until somebody decides
+// what gates it. The previous implementation exempted the whole prefix.
+func TestANewSetupServiceRPCWouldFailClosed(t *testing.T) {
 	h, reached := handlerReached()
-	interceptor := AuthUnaryInterceptor(enforcedGuard(nil))
-	_, err := interceptor(context.Background(), nil,
-		info("/maintainerd.secret.v1.SetupService/GetSetupStatus"), h)
-	require.NoError(t, err)
-	assert.True(t, *reached)
+	_, err := AuthUnaryInterceptor(enforcedGuard(&sdkauthz.Claims{
+		Grants: []sdkauthz.Grant{{Action: permissions.PermAdmin}},
+	}))(ctxWithToken("good"), nil, info(setupServicePrefix+"ResetEverything"), h)
+	require.Error(t, err)
+	assert.Equal(t, codes.PermissionDenied, status.Code(err))
+	assert.False(t, *reached)
 }
 
 func TestDevOpenAttachesBlanketClaims(t *testing.T) {
-	var seen *authz.Claims
+	var seen *sdkauthz.Claims
 	h := grpc.UnaryHandler(func(ctx context.Context, _ any) (any, error) {
-		c, ok := authz.FromContext(ctx)
+		c, ok := sdkauthz.FromContext(ctx)
 		require.True(t, ok)
 		seen = c
 		return "ok", nil
 	})
-	_, err := AuthUnaryInterceptor(authz.Guard{Mode: authz.ModeDevOpen})(
+	_, err := AuthUnaryInterceptor(guardWith(sdkauthz.ModeDevOpen, nil))(
 		context.Background(), nil, info(secretService+"GetSecret"), h)
 	require.NoError(t, err)
 	require.NotNil(t, seen)
 	assert.Equal(t, "development-open", seen.Subject)
+}
+
+// ---------------------------------------------------------------------------
+// Streaming
+// ---------------------------------------------------------------------------
+
+// fakeStream is the minimum grpc.ServerStream a StreamServerInterceptor touches.
+type fakeStream struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (s *fakeStream) Context() context.Context { return s.ctx }
+
+// TestStreamingRPCsAreGuardedToo is the regression test for a hole that was invisible
+// because nothing exercised it: the server used to install ONLY a
+// UnaryServerInterceptor, so any server-streaming or bidi RPC added to
+// maintainerd.secret.v1 would have shipped with no token check, no permission check
+// and no allowlist at all. grpc-go dispatches the two through separate chains and
+// silently applies neither to the other.
+func TestStreamingRPCsAreGuardedToo(t *testing.T) {
+	reached := false
+	handler := func(any, grpc.ServerStream) error { reached = true; return nil }
+	stream := &fakeStream{ctx: context.Background()}
+
+	interceptor := AuthStreamInterceptor(enforcedGuard(&sdkauthz.Claims{}))
+
+	err := interceptor(nil, stream, &grpc.StreamServerInfo{
+		FullMethod: secretService + "WatchSecrets",
+	}, handler)
+	require.Error(t, err)
+	assert.Equal(t, codes.Unauthenticated, status.Code(err))
+	assert.False(t, reached, "an unauthenticated stream must never reach the handler")
+
+	t.Run("the streaming health probe stays exempt", func(t *testing.T) {
+		reached = false
+		err := interceptor(nil, stream, &grpc.StreamServerInfo{
+			FullMethod: healthServicePrefix + "Watch",
+		}, handler)
+		require.NoError(t, err)
+		assert.True(t, reached)
+	})
 }
 
 func TestMetadataHelpers(t *testing.T) {

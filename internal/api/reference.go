@@ -8,7 +8,7 @@ import (
 	"github.com/maintainerd/secret/internal/audit"
 	"github.com/maintainerd/secret/internal/crypto"
 	"github.com/maintainerd/secret/internal/platform/apperror"
-	"github.com/maintainerd/secret/internal/platform/authz"
+	"github.com/maintainerd/secret/internal/platform/permissions"
 	"github.com/maintainerd/secret/internal/store"
 )
 
@@ -135,7 +135,7 @@ func (s *Service) resolveOneReference(ctx context.Context, c Caller, addressText
 	// THE HOP PERMISSION CHECK. See the file comment: this is what keeps a reference
 	// from being an escalation path. It is the same grant a direct reveal needs, on
 	// the target's own MRN.
-	if err := s.guard(ctx, c, authz.PermGetSecret, store.ActionReferenceResolve, targetMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermGetSecret, store.ActionReferenceResolve, targetMRN); err != nil {
 		return "", nil, err
 	}
 

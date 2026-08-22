@@ -24,11 +24,11 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	sdkauthz "github.com/maintainerd/sdk/authz"
 	secretv1 "github.com/maintainerd/secret/gen/maintainerd/secret/v1"
 	"github.com/maintainerd/secret/internal/api"
 	"github.com/maintainerd/secret/internal/audit"
 	"github.com/maintainerd/secret/internal/platform/apperror"
-	"github.com/maintainerd/secret/internal/platform/authz"
 	"github.com/maintainerd/secret/internal/setup"
 	"github.com/maintainerd/secret/internal/store"
 )
@@ -68,7 +68,7 @@ func New(svc *api.Service, setupSvc *setup.Service, bootstrapToken string, devMo
 
 // caller resolves the RPC's authenticated principal into an api.Caller.
 func (s *Service) caller(ctx context.Context) (api.Caller, error) {
-	claims, ok := authz.FromContext(ctx)
+	claims, ok := sdkauthz.FromContext(ctx)
 	if !ok || claims == nil {
 		return api.Caller{}, status.Error(codes.Unauthenticated, "unauthenticated")
 	}
@@ -88,7 +88,7 @@ func (s *Service) caller(ctx context.Context) (api.Caller, error) {
 // tenant. The flat namespace has always meant one scope; letting a token's tenant
 // claim redirect it would silently change which secrets an existing consumer reads.
 func (s *Service) legacyCaller(ctx context.Context) (api.Caller, error) {
-	claims, ok := authz.FromContext(ctx)
+	claims, ok := sdkauthz.FromContext(ctx)
 	if !ok || claims == nil {
 		return api.Caller{}, status.Error(codes.Unauthenticated, "unauthenticated")
 	}

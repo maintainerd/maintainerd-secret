@@ -13,8 +13,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/maintainerd/secret/internal/platform/authz"
+	sdkauthz "github.com/maintainerd/sdk/authz"
 	mw "github.com/maintainerd/secret/internal/platform/middleware"
+	"github.com/maintainerd/secret/internal/platform/permissions"
 )
 
 // ---------------------------------------------------------------------------
@@ -73,7 +74,7 @@ func callN(t *testing.T, interceptor grpc.UnaryServerInterceptor, ctx context.Co
 }
 
 func principalCtx(subject string) context.Context {
-	return authz.NewContext(context.Background(), &authz.Claims{Subject: subject})
+	return sdkauthz.NewContext(context.Background(), &sdkauthz.Claims{Subject: subject})
 }
 
 func TestGRPCRateLimitMetersTheRevealSurface(t *testing.T) {
@@ -167,18 +168,18 @@ func TestEveryRevealRPCIsMetered(t *testing.T) {
 	}
 }
 
-// TestEveryMutatingRPCIsMetered walks the interceptor's own permission map and requires
+// TestEveryMutatingRPCIsMetered walks the service's own permission map and requires
 // that every method carrying a write-shaped permission also carries a write budget.
-// Deriving the expectation from methodPermissions rather than a second hand-written
+// Deriving the expectation from permissions.Map rather than a second hand-written
 // list is what keeps this honest when an RPC is added.
 func TestEveryMutatingRPCIsMetered(t *testing.T) {
 	mutatingPermissions := map[string]bool{
-		authz.PermPutSecret:         true,
-		authz.PermDeleteSecret:      true,
-		authz.PermRotateSecret:      true,
-		authz.PermManageProject:     true,
-		authz.PermManageEnvironment: true,
-		authz.PermManageFolder:      true,
+		permissions.PermPutSecret:         true,
+		permissions.PermDeleteSecret:      true,
+		permissions.PermRotateSecret:      true,
+		permissions.PermManageProject:     true,
+		permissions.PermManageEnvironment: true,
+		permissions.PermManageFolder:      true,
 	}
 	// The read RPCs that legitimately carry a management permission because their
 	// SEGMENT does, not because they mutate anything.
@@ -191,7 +192,7 @@ func TestEveryMutatingRPCIsMetered(t *testing.T) {
 		secretService + "List":                  true,
 	}
 
-	for method, permission := range methodPermissions {
+	for method, permission := range permissions.Map().Methods {
 		if !mutatingPermissions[permission] || readsUnderAManagementPermission[method] {
 			continue
 		}

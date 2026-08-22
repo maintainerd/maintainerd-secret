@@ -8,7 +8,7 @@ import (
 
 	"github.com/maintainerd/secret/internal/audit"
 	"github.com/maintainerd/secret/internal/platform/apperror"
-	"github.com/maintainerd/secret/internal/platform/authz"
+	"github.com/maintainerd/secret/internal/platform/permissions"
 	"github.com/maintainerd/secret/internal/store"
 )
 
@@ -82,7 +82,7 @@ func (s *Service) Reveal(ctx context.Context, c Caller, addr SecretAddress, vers
 	}
 	ref := resolved.addr.ref(c)
 	resourceMRN := resolved.mrn
-	if err := s.guard(ctx, c, authz.PermGetSecret, store.ActionReveal, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermGetSecret, store.ActionReveal, resourceMRN); err != nil {
 		return nil, err
 	}
 
@@ -171,7 +171,7 @@ func (s *Service) DescribeSecret(ctx context.Context, c Caller, addr SecretAddre
 		return nil, err
 	}
 	resourceMRN := resolved.mrn
-	if err := s.guard(ctx, c, authz.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
 		return nil, err
 	}
 	meta, err := s.store.DescribeSecret(ctx, resolved.addr.ref(c))
@@ -226,7 +226,7 @@ func (s *Service) ListSecrets(ctx context.Context, c Caller, in ListSecretsInput
 		return nil, 0, apperror.NewValidation(err.Error())
 	}
 	resourceMRN := c.mrn(names.Project, store.FolderResourcePath(names.Environment, prefix))
-	if err := s.guard(ctx, c, authz.PermListSecrets, store.ActionList, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermListSecrets, store.ActionList, resourceMRN); err != nil {
 		return nil, 0, err
 	}
 	metas, total, err := s.store.ListSecrets(ctx, store.ListSecretsInput{
@@ -265,7 +265,7 @@ func (s *Service) ListVersions(ctx context.Context, c Caller, in ListVersionsInp
 	if err != nil {
 		return nil, 0, err
 	}
-	if err := s.guard(ctx, c, authz.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
 		return nil, 0, err
 	}
 	versions, total, err := s.store.ListVersions(ctx, ref, page, limit)
@@ -324,7 +324,7 @@ func (s *Service) PutSecret(ctx context.Context, c Caller, in PutSecretInput) (*
 	if err != nil {
 		return nil, err
 	}
-	if err := s.guard(ctx, c, authz.PermPutSecret, store.ActionWrite, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermPutSecret, store.ActionWrite, resourceMRN); err != nil {
 		return nil, err
 	}
 
@@ -388,7 +388,7 @@ func (s *Service) UpdateSecretMeta(ctx context.Context, c Caller, in UpdateSecre
 	if err != nil {
 		return nil, err
 	}
-	if err := s.guard(ctx, c, authz.PermPutSecret, store.ActionMetadataUpdate, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermPutSecret, store.ActionMetadataUpdate, resourceMRN); err != nil {
 		return nil, err
 	}
 	meta, err := s.store.UpdateSecretMeta(ctx, store.UpdateSecretMetaInput{
@@ -431,10 +431,10 @@ func (s *Service) Rollback(ctx context.Context, c Caller, addr SecretAddress, ve
 	if err != nil {
 		return nil, err
 	}
-	if err := s.guard(ctx, c, authz.PermPutSecret, store.ActionRollback, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermPutSecret, store.ActionRollback, resourceMRN); err != nil {
 		return nil, err
 	}
-	if err := s.guard(ctx, c, authz.PermGetSecret, store.ActionRollback, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermGetSecret, store.ActionRollback, resourceMRN); err != nil {
 		return nil, err
 	}
 	result, err := s.store.RollbackSecret(ctx, ref, version)
@@ -472,7 +472,7 @@ func (s *Service) DeleteSecret(ctx context.Context, c Caller, addr SecretAddress
 	if err != nil {
 		return nil, err
 	}
-	if err := s.guard(ctx, c, authz.PermDeleteSecret, store.ActionDelete, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermDeleteSecret, store.ActionDelete, resourceMRN); err != nil {
 		return nil, err
 	}
 	deleted, err := s.store.DeleteSecret(ctx, ref, window)
@@ -504,7 +504,7 @@ func (s *Service) ListDeletedSecrets(ctx context.Context, c Caller, in ListDelet
 		return nil, err
 	}
 	resourceMRN := c.mrn(names.Project, store.EnvironmentResourcePath(names.Environment))
-	if err := s.guard(ctx, c, authz.PermListSecrets, store.ActionList, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermListSecrets, store.ActionList, resourceMRN); err != nil {
 		return nil, err
 	}
 	out, err := s.store.ListDeletedSecrets(ctx, c.TenantUUID, in.Project, in.Environment, page, limit)
@@ -544,7 +544,7 @@ func (s *Service) RestoreSecret(ctx context.Context, c Caller, in SecretUUIDInpu
 	// path-scoped delete grant does not carry a restore, which must be granted at
 	// tenant scope or wider.
 	resourceMRN := c.mrn("", store.ResourceProject)
-	if err := s.guard(ctx, c, authz.PermDeleteSecret, store.ActionRestore, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermDeleteSecret, store.ActionRestore, resourceMRN); err != nil {
 		return nil, err
 	}
 	meta, err := s.store.RestoreSecret(ctx, c.TenantUUID, secretUUID)
@@ -574,7 +574,7 @@ func (s *Service) DestroySecret(ctx context.Context, c Caller, in SecretUUIDInpu
 		return apperror.NewValidation("secret_uuid must be a valid UUID")
 	}
 	resourceMRN := c.mrn("", store.ResourceProject)
-	if err := s.guard(ctx, c, authz.PermDeleteSecret, store.ActionDestroy, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermDeleteSecret, store.ActionDestroy, resourceMRN); err != nil {
 		return err
 	}
 	if err := s.store.DestroySecret(ctx, c.TenantUUID, secretUUID); err != nil {

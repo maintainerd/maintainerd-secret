@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/maintainerd/secret/internal/platform/authz"
+	sdkauthz "github.com/maintainerd/sdk/authz"
 )
 
 // clock is an injectable time source, so the limiter's window behaviour is tested
@@ -179,7 +179,7 @@ func TestRateLimitKeysOnThePrincipalNotTheAddress(t *testing.T) {
 	as := func(subject string) int {
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/secrets/reveal", nil)
 		req.RemoteAddr = "203.0.113.7:5000" // the same NAT for both
-		req = req.WithContext(authz.NewContext(req.Context(), &authz.Claims{Subject: subject}))
+		req = req.WithContext(sdkauthz.NewContext(req.Context(), &sdkauthz.Claims{Subject: subject}))
 		w := httptest.NewRecorder()
 		handler.ServeHTTP(w, req)
 		return w.Code

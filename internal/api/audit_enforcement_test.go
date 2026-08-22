@@ -8,9 +8,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	sdkauthz "github.com/maintainerd/sdk/authz"
 	"github.com/maintainerd/secret/internal/audit"
 	"github.com/maintainerd/secret/internal/platform/apperror"
-	"github.com/maintainerd/secret/internal/platform/authz"
+	"github.com/maintainerd/secret/internal/platform/permissions"
 	"github.com/maintainerd/secret/internal/store"
 )
 
@@ -101,7 +102,7 @@ func TestDeniedRevealIsAudited(t *testing.T) {
 	fx.seed("prod", "/db", "PASSWORD", "prod-password")
 
 	// Metadata only: this caller may describe every secret and read none.
-	metadataOnly := fx.caller(authz.Grant{Action: authz.PermReadMetadata})
+	metadataOnly := fx.caller(sdkauthz.Grant{Action: permissions.PermReadMetadata})
 
 	_, err := fx.api.Reveal(context.Background(), metadataOnly, addr("prod", "/db", "PASSWORD"), 0)
 	require.Error(t, err)
@@ -111,7 +112,7 @@ func TestDeniedRevealIsAudited(t *testing.T) {
 	for _, row := range fx.repo.auditRows() {
 		if row.Action == store.ActionReveal && row.Outcome == store.OutcomeDenied {
 			denied++
-			assert.Contains(t, row.Reason, authz.PermGetSecret)
+			assert.Contains(t, row.Reason, permissions.PermGetSecret)
 		}
 	}
 	assert.Equal(t, 1, denied, "a denied reveal writes a denial row")
@@ -122,7 +123,7 @@ func TestDeniedRevealIsAudited(t *testing.T) {
 func TestReadMetadataIsNotReveal(t *testing.T) {
 	fx := newFixture(t)
 	fx.seed("prod", "/db", "PASSWORD", "prod-password")
-	metadataOnly := fx.caller(authz.Grant{Action: authz.PermReadMetadata})
+	metadataOnly := fx.caller(sdkauthz.Grant{Action: permissions.PermReadMetadata})
 
 	meta, err := fx.api.DescribeSecret(context.Background(), metadataOnly, addr("prod", "/db", "PASSWORD"))
 	require.NoError(t, err, "ReadMetadata is enough to describe")
@@ -140,8 +141,8 @@ func TestGrantScopedToOneEnvironmentDoesNotReachAnother(t *testing.T) {
 	fx.seed("dev", "/db", "PASSWORD", "dev-password")
 	fx.seed("prod", "/db", "PASSWORD", "prod-password")
 
-	devOnly := fx.caller(authz.Grant{
-		Action:   authz.PermGetSecret,
+	devOnly := fx.caller(sdkauthz.Grant{
+		Action:   permissions.PermGetSecret,
 		Resource: "mrn:secret:acme:billing-app:secret/dev/*",
 	})
 
@@ -222,8 +223,8 @@ func TestBatchGetIsPerItemAuthorized(t *testing.T) {
 	fx.seed("dev", "/", "OK", "dev-value")
 	fx.seed("prod", "/", "NOPE", "prod-value")
 
-	devOnly := fx.caller(authz.Grant{
-		Action:   authz.PermGetSecret,
+	devOnly := fx.caller(sdkauthz.Grant{
+		Action:   permissions.PermGetSecret,
 		Resource: "mrn:secret:acme:billing-app:secret/dev/*",
 	})
 	results, err := fx.api.BatchGet(context.Background(), devOnly, []BatchGetItem{

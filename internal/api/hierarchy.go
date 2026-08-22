@@ -5,7 +5,7 @@ import (
 
 	"github.com/maintainerd/secret/internal/audit"
 	"github.com/maintainerd/secret/internal/platform/apperror"
-	"github.com/maintainerd/secret/internal/platform/authz"
+	"github.com/maintainerd/secret/internal/platform/permissions"
 	"github.com/maintainerd/secret/internal/store"
 )
 
@@ -34,7 +34,7 @@ func (s *Service) CreateProject(ctx context.Context, c Caller, in CreateProjectI
 		return nil, err
 	}
 	resourceMRN := c.mrn(in.Slug, store.ResourceProject)
-	if err := s.guard(ctx, c, authz.PermManageProject, store.ActionProjectCreate, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermManageProject, store.ActionProjectCreate, resourceMRN); err != nil {
 		return nil, err
 	}
 	project, err := s.store.CreateProject(ctx, store.CreateProjectInput{
@@ -67,7 +67,7 @@ func (s *Service) ListProjects(ctx context.Context, c Caller, in ListProjectsInp
 	}
 	page, limit := in.Pagination.resolved()
 	resourceMRN := c.mrn("", store.ResourceProject)
-	if err := s.guard(ctx, c, authz.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
 		return nil, 0, err
 	}
 	projects, total, err := s.store.ListProjects(ctx, c.TenantUUID, page, limit)
@@ -91,7 +91,7 @@ func (s *Service) GetProject(ctx context.Context, c Caller, slug string) (*store
 		return nil, err
 	}
 	resourceMRN := c.mrn(slug, store.ResourceProject)
-	if err := s.guard(ctx, c, authz.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
 		return nil, err
 	}
 	project, err := s.store.GetProject(ctx, c.TenantUUID, slug)
@@ -113,7 +113,7 @@ func (s *Service) UpdateProject(ctx context.Context, c Caller, in UpdateProjectI
 		return nil, err
 	}
 	resourceMRN := c.mrn(in.Slug, store.ResourceProject)
-	if err := s.guard(ctx, c, authz.PermManageProject, store.ActionProjectUpdate, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermManageProject, store.ActionProjectUpdate, resourceMRN); err != nil {
 		return nil, err
 	}
 	project, err := s.store.UpdateProject(ctx, store.UpdateProjectInput{
@@ -141,7 +141,7 @@ func (s *Service) DeleteProject(ctx context.Context, c Caller, slug string) erro
 		return err
 	}
 	resourceMRN := c.mrn(slug, store.ResourceProject)
-	if err := s.guard(ctx, c, authz.PermManageProject, store.ActionProjectDelete, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermManageProject, store.ActionProjectDelete, resourceMRN); err != nil {
 		return err
 	}
 	project, err := s.store.GetProject(ctx, c.TenantUUID, slug)
@@ -176,7 +176,7 @@ func (s *Service) CreateEnvironment(ctx context.Context, c Caller, in CreateEnvi
 		return nil, err
 	}
 	resourceMRN := c.mrn(in.Project, store.EnvironmentResourcePath(in.Slug))
-	if err := s.guard(ctx, c, authz.PermManageEnvironment, store.ActionEnvironmentCreate, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermManageEnvironment, store.ActionEnvironmentCreate, resourceMRN); err != nil {
 		return nil, err
 	}
 	env, err := s.store.CreateEnvironment(ctx, store.CreateEnvironmentInput{
@@ -203,7 +203,7 @@ func (s *Service) ListEnvironments(ctx context.Context, c Caller, project string
 		return nil, err
 	}
 	resourceMRN := c.mrn(project, store.ResourceProject)
-	if err := s.guard(ctx, c, authz.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
 		return nil, err
 	}
 	envs, err := s.store.ListEnvironments(ctx, c.TenantUUID, project)
@@ -227,7 +227,7 @@ func (s *Service) GetEnvironment(ctx context.Context, c Caller, project, slug st
 		return nil, err
 	}
 	resourceMRN := c.mrn(project, store.EnvironmentResourcePath(slug))
-	if err := s.guard(ctx, c, authz.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
 		return nil, err
 	}
 	env, err := s.store.GetEnvironment(ctx, c.TenantUUID, project, slug)
@@ -247,7 +247,7 @@ func (s *Service) UpdateEnvironment(ctx context.Context, c Caller, in UpdateEnvi
 		return nil, err
 	}
 	resourceMRN := c.mrn(in.Project, store.EnvironmentResourcePath(in.Slug))
-	if err := s.guard(ctx, c, authz.PermManageEnvironment, store.ActionEnvironmentUpdate, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermManageEnvironment, store.ActionEnvironmentUpdate, resourceMRN); err != nil {
 		return nil, err
 	}
 	env, err := s.store.UpdateEnvironment(ctx, store.UpdateEnvironmentInput{
@@ -275,7 +275,7 @@ func (s *Service) DeleteEnvironment(ctx context.Context, c Caller, project, slug
 		return err
 	}
 	resourceMRN := c.mrn(project, store.EnvironmentResourcePath(slug))
-	if err := s.guard(ctx, c, authz.PermManageEnvironment, store.ActionEnvironmentDelete, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermManageEnvironment, store.ActionEnvironmentDelete, resourceMRN); err != nil {
 		return err
 	}
 	if err := s.store.DeleteEnvironment(ctx, c.TenantUUID, project, slug); err != nil {
@@ -300,7 +300,7 @@ func (s *Service) CreateFolder(ctx context.Context, c Caller, in CreateFolderInp
 		return nil, apperror.NewValidation(err.Error())
 	}
 	resourceMRN := c.mrn(in.Project, store.FolderResourcePath(in.Environment, normalized))
-	if err := s.guard(ctx, c, authz.PermManageFolder, store.ActionFolderCreate, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermManageFolder, store.ActionFolderCreate, resourceMRN); err != nil {
 		return nil, err
 	}
 	folder, err := s.store.CreateFolder(ctx, c.TenantUUID, in.Project, in.Environment, normalized)
@@ -324,7 +324,7 @@ func (s *Service) ListFolders(ctx context.Context, c Caller, in ListFoldersInput
 		return nil, apperror.NewValidation(err.Error())
 	}
 	resourceMRN := c.mrn(in.Project, store.FolderResourcePath(in.Environment, normalized))
-	if err := s.guard(ctx, c, authz.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
 		return nil, err
 	}
 	folders, err := s.store.ListFolders(ctx, c.TenantUUID, in.Project, in.Environment, normalized)
@@ -364,10 +364,10 @@ func (s *Service) MoveFolder(ctx context.Context, c Caller, in MoveFolderInput) 
 	}
 	fromMRN := c.mrn(in.Project, store.FolderResourcePath(in.Environment, fromPath))
 	toMRN := c.mrn(in.Project, store.FolderResourcePath(in.Environment, toPath))
-	if err := s.guard(ctx, c, authz.PermManageFolder, store.ActionFolderMove, fromMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermManageFolder, store.ActionFolderMove, fromMRN); err != nil {
 		return nil, err
 	}
-	if err := s.guard(ctx, c, authz.PermManageFolder, store.ActionFolderMove, toMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermManageFolder, store.ActionFolderMove, toMRN); err != nil {
 		return nil, err
 	}
 	folder, err := s.store.MoveFolder(ctx, c.TenantUUID, in.Project, in.Environment, fromPath, toPath)
@@ -400,10 +400,10 @@ func (s *Service) DeleteFolder(ctx context.Context, c Caller, in DeleteFolderInp
 		return 0, apperror.NewValidation(err.Error())
 	}
 	resourceMRN := c.mrn(in.Project, store.FolderResourcePath(in.Environment, normalized))
-	if err := s.guard(ctx, c, authz.PermManageFolder, store.ActionFolderDelete, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermManageFolder, store.ActionFolderDelete, resourceMRN); err != nil {
 		return 0, err
 	}
-	if err := s.guard(ctx, c, authz.PermDeleteSecret, store.ActionFolderDelete, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermDeleteSecret, store.ActionFolderDelete, resourceMRN); err != nil {
 		return 0, err
 	}
 	deleted, err := s.store.DeleteFolder(ctx, c.TenantUUID, in.Project, in.Environment, normalized, in.RecoveryWindow)

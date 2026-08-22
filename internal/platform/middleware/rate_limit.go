@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/maintainerd/secret/internal/platform/authz"
+	sdkauthz "github.com/maintainerd/sdk/authz"
 	"github.com/maintainerd/secret/internal/platform/response"
 )
 
@@ -170,7 +170,7 @@ type KeyFunc func(*http.Request) string
 // there, so an IP-keyed reveal budget would either be too small for the honest ones or
 // too large for the compromised one. The IP fallback covers the pre-auth window.
 func ByPrincipal(r *http.Request) string {
-	if claims, ok := authz.FromContext(r.Context()); ok && claims != nil && claims.Subject != "" {
+	if claims, ok := sdkauthz.FromContext(r.Context()); ok && claims != nil && claims.Subject != "" {
 		return "sub:" + claims.Subject
 	}
 	return "ip:" + PeerIP(r)

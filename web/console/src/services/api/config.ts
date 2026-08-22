@@ -21,8 +21,30 @@ function runtimeEnv(key: string): string | undefined {
   return value && value.trim() !== '' ? value : undefined
 }
 
-function setting(key: string): string {
-  return (runtimeEnv(key) ?? (import.meta.env[key] as string | undefined) ?? '').trim()
+/**
+ * Reads one setting, trying each key in order and taking the first that is set,
+ * runtime before build time.
+ *
+ * TWO SPELLINGS ON PURPOSE. The first key is the name maintainerd-secret's own
+ * process uses for the same fact — `SECRET_CONSOLE_CLIENT_ID`, `AUTH_ISSUER`,
+ * `AUTH_AUDIENCE` — and the later ones are the `VITE_*` build-time names. An
+ * operator following the standalone runbook creates a console SPA client in
+ * Auth and is handed one client id; they then set `SECRET_CONSOLE_CLIENT_ID`
+ * once, for the service (which validates it at boot) and for the console
+ * (which signs in with it). A console whose variable were spelled differently
+ * from the service's would be an invitation to set one and not the other, and
+ * the symptom of that — an authorize request for a client id that does not
+ * exist — surfaces in a browser, far from the operator reading the runbook.
+ *
+ * The `VITE_*` names keep working, unchanged, because they are what a local
+ * `.env` and every existing deployment already use.
+ */
+function setting(...keys: string[]): string {
+  for (const key of keys) {
+    const value = runtimeEnv(key) ?? (import.meta.env[key] as string | undefined)
+    if (value && value.trim() !== '') return value.trim()
+  }
+  return ''
 }
 
 function trimSlash(value: string): string {
@@ -39,7 +61,7 @@ function trimSlash(value: string): string {
  */
 const getBaseUrl = (): string => {
   if (import.meta.env.DEV) return '/api/v1'
-  return setting('VITE_SECRET_API_BASE_URL') || '/api/v1'
+  return setting('SECRET_API_BASE_URL', 'VITE_SECRET_API_BASE_URL') || '/api/v1'
 }
 
 /**
@@ -69,16 +91,19 @@ export interface IdentityConfig {
 }
 
 function readIdentityConfig(): IdentityConfig | null {
-  const issuerUrl = trimSlash(setting('VITE_OAUTH_ISSUER_URL'))
-  const clientId = setting('VITE_OAUTH_CLIENT_ID')
-  const tokenUrl = setting('VITE_OAUTH_TOKEN_URL')
+  // Each line lists the SERVICE's spelling first and the build-time VITE_ name
+  // second — see `setting`. The issuer is Auth's hosted identity origin, which is
+  // the same value the service enforces as AUTH_ISSUER.
+  const issuerUrl = trimSlash(setting('AUTH_ISSUER', 'VITE_OAUTH_ISSUER_URL'))
+  const clientId = setting('SECRET_CONSOLE_CLIENT_ID', 'VITE_OAUTH_CLIENT_ID')
+  const tokenUrl = setting('SECRET_CONSOLE_TOKEN_URL', 'VITE_OAUTH_TOKEN_URL')
   if (!issuerUrl || !clientId || !tokenUrl) return null
   return {
     issuerUrl,
     tokenUrl,
     clientId,
-    audience: setting('VITE_OAUTH_AUDIENCE'),
-    extraScope: setting('VITE_OAUTH_SCOPE'),
+    audience: setting('AUTH_AUDIENCE', 'VITE_OAUTH_AUDIENCE'),
+    extraScope: setting('SECRET_CONSOLE_SCOPE', 'VITE_OAUTH_SCOPE'),
   }
 }
 

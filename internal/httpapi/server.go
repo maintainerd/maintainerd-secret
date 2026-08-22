@@ -34,11 +34,12 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
 
+	sdkauthz "github.com/maintainerd/sdk/authz"
 	"github.com/maintainerd/secret/internal/api"
 	"github.com/maintainerd/secret/internal/audit"
 	"github.com/maintainerd/secret/internal/platform/apperror"
-	"github.com/maintainerd/secret/internal/platform/authz"
 	mw "github.com/maintainerd/secret/internal/platform/middleware"
+	"github.com/maintainerd/secret/internal/platform/permissions"
 	"github.com/maintainerd/secret/internal/platform/response"
 	"github.com/maintainerd/secret/internal/setup"
 )
@@ -120,14 +121,30 @@ func (o Options) withDefaults() Options {
 type Server struct {
 	api     *api.Service
 	setup   *setup.Service
-	guard   authz.Guard
+	guard   sdkauthz.Guard
 	opts    Options
 	limiter *mw.Limiter
 }
 
 // NewServer builds the REST server.
-func NewServer(svc *api.Service, setupSvc *setup.Service, guard authz.Guard, opts Options) *Server {
+//
+// THE PERMISSION TABLE AND THE ERROR WRITER ARE WIRED ONTO THE GUARD HERE, so a
+// Server is correctly guarded however it was constructed — including by a test
+// that hands in a bare authz.Guard{Mode: …}. Both are idempotent restatements of
+// what the bootstrap already resolved.
+//
+// The error writer matters for the API's contract. The SDK's default denial body
+// is a compact {"error","code"} object, which is right for a library that cannot
+// know its consumer's envelope — but every other failure this API produces is a
+// response.Envelope ({"success":false,"error":…,"code":…}), and a client that has
+// to parse one shape for a 403 from the guard and another for a 403 from a
+// handler will get one of them wrong. authz.Guard is a value type, so this
+// mutates this Server's copy and never the caller's.
+func NewServer(svc *api.Service, setupSvc *setup.Service, guard sdkauthz.Guard, opts Options) *Server {
 	resolved := opts.withDefaults()
+	guard.Service = permissions.ServiceName
+	guard.Permissions = permissions.Map()
+	guard.WriteError = response.ErrorWithCode
 	s := &Server{api: svc, setup: setupSvc, guard: guard, opts: resolved}
 	if resolved.RateLimit.Enabled {
 		s.limiter = mw.NewLimiter(resolved.RateLimit.Window)
@@ -177,7 +194,12 @@ func (s *Server) Router() http.Handler {
 
 	r.Route("/api/v1", func(v1 chi.Router) {
 		v1.Use(mw.Timeout(s.opts.RequestTimeout))
-		v1.Use(s.guard.Middleware)
+		// The SDK guard — the same decision path the gRPC interceptors run, over the
+		// same permissions.Map. It is mounted on the /api/v1 group (rather than at the
+		// root) so the probes above are outside it by construction as well as by the
+		// Map's exemption list, and it places the verified Principal in the request
+		// context for the handlers' MRN-level operation checks.
+		v1.Use(s.guard.HTTPMiddleware())
 
 		v1.Route("/setup", func(g chi.Router) {
 			// The setup surface carries its OWN rate limit, keyed by client IP,
@@ -282,7 +304,7 @@ func (s *Server) rateLimit(class string, limit int, key mw.KeyFunc) func(http.Ha
 // unauthenticated caller — reported as 401 anyway, because failing closed on a bug in
 // the guard chain is the only safe direction.
 func (s *Server) caller(w http.ResponseWriter, r *http.Request) (api.Caller, bool) {
-	claims, ok := authz.FromContext(r.Context())
+	claims, ok := sdkauthz.FromContext(r.Context())
 	if !ok || claims == nil {
 		response.Error(w, http.StatusUnauthorized, "unauthenticated")
 		return api.Caller{}, false

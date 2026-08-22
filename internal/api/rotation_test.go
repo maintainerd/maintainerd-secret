@@ -8,8 +8,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	sdkauthz "github.com/maintainerd/sdk/authz"
 	"github.com/maintainerd/secret/internal/platform/apperror"
-	"github.com/maintainerd/secret/internal/platform/authz"
+	"github.com/maintainerd/secret/internal/platform/permissions"
 	"github.com/maintainerd/secret/internal/rotation"
 	"github.com/maintainerd/secret/internal/store"
 )
@@ -23,7 +24,7 @@ func TestRotateSecretWritesANewVersionWithoutReturningIt(t *testing.T) {
 	fx := newFixture(t)
 	fx.seed("prod", "/db", "PASSWORD", "original")
 
-	rotatorOnly := fx.caller(authz.Grant{Action: authz.PermRotateSecret})
+	rotatorOnly := fx.caller(sdkauthz.Grant{Action: permissions.PermRotateSecret})
 	result, err := fx.api.RotateSecret(context.Background(), rotatorOnly, RotateSecretInput{
 		Address: addr("prod", "/db", "PASSWORD"),
 	})
@@ -48,7 +49,7 @@ func TestRotateRequiresItsOwnGrant(t *testing.T) {
 	fx := newFixture(t)
 	fx.seed("prod", "/db", "PASSWORD", "original")
 
-	writerOnly := fx.caller(authz.Grant{Action: authz.PermPutSecret})
+	writerOnly := fx.caller(sdkauthz.Grant{Action: permissions.PermPutSecret})
 	_, err := fx.api.RotateSecret(context.Background(), writerOnly, RotateSecretInput{
 		Address: addr("prod", "/db", "PASSWORD"),
 	})
@@ -119,7 +120,7 @@ func TestRollbackRequiresRevealAsWellAsWrite(t *testing.T) {
 	fx.seed("prod", "/db", "PASSWORD", "v1")
 	fx.seed("prod", "/db", "PASSWORD", "v2")
 
-	writerOnly := fx.caller(authz.Grant{Action: authz.PermPutSecret})
+	writerOnly := fx.caller(sdkauthz.Grant{Action: permissions.PermPutSecret})
 	_, err := fx.api.Rollback(context.Background(), writerOnly, addr("prod", "/db", "PASSWORD"), 1)
 	require.Error(t, err)
 	assert.True(t, apperror.IsForbidden(err))

@@ -1,6 +1,9 @@
 package httpapi
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,8 +12,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/maintainerd/secret/internal/platform/authz"
+	sdkauthz "github.com/maintainerd/sdk/authz"
 	mw "github.com/maintainerd/secret/internal/platform/middleware"
+	"github.com/maintainerd/secret/internal/platform/permissions"
 )
 
 // These tests drive the ROUTER, not the handlers: they assert that every documented
@@ -22,8 +26,8 @@ import (
 // unconfigured production instance answers 503 on the whole API rather than serving it
 // open.
 func unavailableRouter() http.Handler {
-	return NewServer(nil, nil, authz.Guard{
-		Mode:   authz.ModeUnavailable,
+	return NewServer(nil, nil, sdkauthz.Guard{
+		Mode:   sdkauthz.ModeUnavailable,
 		Reason: "AUTH_JWKS_URL not set",
 	}, Options{}).Router()
 }
@@ -123,6 +127,150 @@ func TestTheGuardRunsBeforeRouting(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, do(t, router, http.MethodGet, "/nope").Code)
 }
 
+// ---------------------------------------------------------------------------
+// The guard's denials wear this API's envelope
+// ---------------------------------------------------------------------------
+
+// TestGuardDenialsUseTheServiceEnvelope.
+//
+// The guard is the SDK's, and the SDK's default denial body is a compact
+// {"error","code"} object — right for a library that cannot know its consumer's
+// contract, wrong here. Every other failure this API produces is a
+// response.Envelope, and a client that has to parse one shape for a 403 from the
+// guard and another for a 403 from a handler will get one of them wrong. This
+// pins the wiring in httpapi.NewServer that makes them the same.
+func TestGuardDenialsUseTheServiceEnvelope(t *testing.T) {
+	// ModeUnavailable — the fail-closed startup posture.
+	w := do(t, unavailableRouter(), http.MethodGet, "/api/v1/secrets")
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+
+	var body struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
+		Code    string `json:"code"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.False(t, body.Success, "the envelope's success flag must be present and false")
+	assert.Equal(t, "auth_unavailable", body.Code)
+	assert.Contains(t, body.Error, "AUTH_JWKS_URL not set",
+		"the reason names the variable, so an operator is not left guessing")
+	assert.Contains(t, body.Error, "disabled outside development")
+}
+
+// TestUnauthenticatedDenialsUseTheServiceEnvelope covers the other two denial
+// kinds an enforcing instance produces: no token, and a token without the
+// permission.
+func TestUnauthenticatedDenialsUseTheServiceEnvelope(t *testing.T) {
+	metadataOnly := &sdkauthz.Claims{
+		Subject: "svc-a",
+		Grants:  []sdkauthz.Grant{{Action: permissions.PermReadMetadata}},
+	}
+	router := NewServer(nil, nil, sdkauthz.Guard{
+		Mode: sdkauthz.ModeEnforced,
+		Verify: func(_ context.Context, token string) (*sdkauthz.Claims, error) {
+			if token != "good" {
+				return nil, errors.New("bad token")
+			}
+			return metadataOnly, nil
+		},
+	}, Options{}).Router()
+
+	decodeBody := func(w *httptest.ResponseRecorder) (bool, string, string) {
+		t.Helper()
+		var body struct {
+			Success bool   `json:"success"`
+			Error   string `json:"error"`
+			Code    string `json:"code"`
+		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+		return body.Success, body.Error, body.Code
+	}
+
+	t.Run("no bearer token", func(t *testing.T) {
+		w := do(t, router, http.MethodGet, "/api/v1/secrets")
+		require.Equal(t, http.StatusUnauthorized, w.Code)
+		success, message, code := decodeBody(w)
+		assert.False(t, success)
+		assert.Equal(t, "missing_token", code)
+		assert.Equal(t, "missing bearer token", message)
+	})
+
+	t.Run("a forged token never says which check failed", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/secrets", nil)
+		req.Header.Set("Authorization", "Bearer forged")
+		router.ServeHTTP(w, req)
+
+		require.Equal(t, http.StatusUnauthorized, w.Code)
+		success, message, code := decodeBody(w)
+		assert.False(t, success)
+		assert.Equal(t, "invalid_token", code)
+		assert.Equal(t, "invalid token", message)
+		assert.NotContains(t, w.Body.String(), "bad token",
+			"which check a forged token failed is oracle material")
+	})
+
+	t.Run("a valid token without the permission", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/projects", strings.NewReader("{}"))
+		req.Header.Set("Authorization", "Bearer good")
+		router.ServeHTTP(w, req)
+
+		require.Equal(t, http.StatusForbidden, w.Code)
+		success, message, code := decodeBody(w)
+		assert.False(t, success)
+		assert.Equal(t, "insufficient_permission", code)
+		assert.Contains(t, message, permissions.PermManageProject)
+	})
+
+	t.Run("an unmapped route is denied even to a valid token", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/debug/dump", nil)
+		req.Header.Set("Authorization", "Bearer good")
+		router.ServeHTTP(w, req)
+
+		require.Equal(t, http.StatusForbidden, w.Code)
+		_, _, code := decodeBody(w)
+		assert.Equal(t, "no_permission_mapping", code,
+			"the Map is an allowlist: an unmapped surface fails closed")
+	})
+}
+
+// TestDevOpenAttachesABlanketPrincipal.
+//
+// A development-open instance has no way to tell one caller from another, so it
+// attributes every request to a named blanket principal — and the NAME is the
+// point: "development-open" in an audit row on a real deployment is a sentence
+// that reads as wrong. Attaching no principal at all would be worse: the audit
+// trail would record an empty actor for every write.
+func TestDevOpenAttachesABlanketPrincipal(t *testing.T) {
+	var seen *sdkauthz.Claims
+	server := NewServer(nil, nil, sdkauthz.Guard{Mode: sdkauthz.ModeDevOpen}, Options{})
+
+	handler := server.guard.HTTPMiddleware()(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		claims, ok := sdkauthz.FromContext(r.Context())
+		require.True(t, ok, "dev-open must still place a principal, or audit rows lose their actor")
+		seen = claims
+	}))
+
+	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/v1/secrets", nil))
+
+	require.NotNil(t, seen)
+	assert.Equal(t, "development-open", seen.Subject)
+	assert.True(t, seen.HasAction(permissions.PermGetSecret),
+		"a dev-open caller is treated as blanket-granted — which is exactly what the boot banner shouts about")
+}
+
+// TestTheSetupWizardStaysReachableWhileAuthIsUnavailable. Provisioning is what
+// makes tokens mintable at all, so the one surface that must survive
+// ModeUnavailable is the self-guarded first-run wizard. A 503 here would leave a
+// fresh install with no way to become configured.
+func TestTheSetupWizardStaysReachableWhileAuthIsUnavailable(t *testing.T) {
+	w := do(t, unavailableRouter(), http.MethodGet, "/api/v1/setup/status")
+	assert.NotEqual(t, http.StatusServiceUnavailable, w.Code,
+		"the setup surface is exempt from the guard by construction")
+}
+
 // TestDecodeRejectsUnknownFields is a correctness feature: a caller that misspells
 // "keep_versions" would otherwise get a silent default, which for retention means a
 // version history quietly shorter than asked for.
@@ -148,8 +296,8 @@ func TestDecodeRejectsUnknownFields(t *testing.T) {
 // guard, on a route the guard is refusing, because the setup surface is reachable
 // before any token exists and the body arrives before any check can run.
 func TestTheBodyCapIsWiredIntoTheRouter(t *testing.T) {
-	router := NewServer(nil, nil, authz.Guard{
-		Mode:   authz.ModeUnavailable,
+	router := NewServer(nil, nil, sdkauthz.Guard{
+		Mode:   sdkauthz.ModeUnavailable,
 		Reason: "AUTH_JWKS_URL not set",
 	}, Options{MaxBodyBytes: 64}).Router()
 
@@ -168,7 +316,7 @@ func TestTheBodyCapIsWiredIntoTheRouter(t *testing.T) {
 func TestTheConfiguredCapIsTheOneEnforced(t *testing.T) {
 	body := strings.Repeat("a", 8192)
 
-	server := NewServer(nil, nil, authz.Guard{Mode: authz.ModeDevOpen}, Options{MaxBodyBytes: 16384})
+	server := NewServer(nil, nil, sdkauthz.Guard{Mode: sdkauthz.ModeDevOpen}, Options{MaxBodyBytes: 16384})
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
 	w := httptest.NewRecorder()
 

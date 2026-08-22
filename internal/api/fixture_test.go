@@ -16,9 +16,10 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/require"
 
+	sdkauthz "github.com/maintainerd/sdk/authz"
 	"github.com/maintainerd/secret/internal/audit"
 	"github.com/maintainerd/secret/internal/crypto"
-	"github.com/maintainerd/secret/internal/platform/authz"
+	"github.com/maintainerd/secret/internal/platform/permissions"
 	"github.com/maintainerd/secret/internal/storage"
 	"github.com/maintainerd/secret/internal/store"
 )
@@ -613,9 +614,20 @@ func newFixture(t *testing.T) *fixture {
 }
 
 // caller builds a Caller with the given grants.
-func (fx *fixture) caller(grants ...authz.Grant) Caller {
+//
+// BlanketActions is set from permissions.BlanketActions() exactly as the guard
+// sets it on a real request. Leaving it nil would give this fixture a principal
+// for which secret:Admin covers nothing — a test double that is more restrictive
+// than production, which is the direction that produces false confidence.
+func (fx *fixture) caller(grants ...sdkauthz.Grant) Caller {
 	return Caller{
-		Claims:     &authz.Claims{Subject: "user-1", Kind: authz.ActorKindUser, Tenant: "acme", Grants: grants},
+		Claims: &sdkauthz.Claims{
+			Subject:        "user-1",
+			Kind:           sdkauthz.ActorKindUser,
+			Tenant:         "acme",
+			Grants:         grants,
+			BlanketActions: permissions.BlanketActions(),
+		},
 		Actor:      audit.Actor{Subject: "user-1", Kind: store.ActorKindUser, IP: "203.0.113.7", RequestID: "req-1"},
 		TenantUUID: fx.tenant.UUID,
 		TenantName: fx.tenant.Name,
@@ -624,7 +636,7 @@ func (fx *fixture) caller(grants ...authz.Grant) Caller {
 
 // admin is a caller with a blanket grant, for arranging test state.
 func (fx *fixture) admin() Caller {
-	return fx.caller(authz.Grant{Action: authz.PermAdmin})
+	return fx.caller(sdkauthz.Grant{Action: permissions.PermAdmin})
 }
 
 // addr builds an address in the fixture's project.

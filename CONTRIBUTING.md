@@ -64,7 +64,9 @@ Migrations are **create-only** while the schema is pre-release: edit the origina
 
 ## Security-sensitive changes
 
-This is a vault. Changes to `internal/crypto`, `internal/platform/authz`, `internal/store` or anything touching key material, audit records or the guard get extra scrutiny — explain the threat model in the PR description. Never add a code path that can log, marshal or return a plaintext value or a DEK.
+This is a vault. Changes to `internal/crypto`, `internal/platform/permissions`, `internal/store` or anything touching key material, audit records or the guard get extra scrutiny — explain the threat model in the PR description. Never add a code path that can log, marshal or return a plaintext value or a DEK.
+
+Enforcement itself lives in the SDK (`github.com/maintainerd/sdk/authz`), shared with every other maintainerd service; this repo owns only the permission vocabulary and the surface table in `internal/platform/permissions`. **Adding a route or an RPC means deciding its permission there.** The table is an allowlist, so an unmapped surface is denied to every caller, and the gap-audit test (`internal/platform/permissions/audit_test.go`) walks the live chi router and the live gRPC service descriptors and fails until you have. An **exemption** — a surface served with no permission check at all — additionally needs a written justification in that test file, and reviewers should treat one as the highest-scrutiny change in this repo.
 
 ## Getting help
 

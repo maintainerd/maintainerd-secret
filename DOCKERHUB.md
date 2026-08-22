@@ -67,12 +67,22 @@ Schema migrations are embedded and applied in-process on boot.
 | `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` / `DB_NAME` | PostgreSQL connection. Never logged. |
 | `SECRET_ROOT_KEY` | The 32-byte AES-256 root key (KEK) as hex or base64. Required outside development. |
 | `SETUP_BOOTSTRAP_TOKEN` | Gates the one-time `Setup`. Required outside development. |
-| `AUTH_JWKS_URL` / `AUTH_ISSUER` / `AUTH_AUDIENCE` | maintainerd-auth token verification. **All three together, or none** — a partial set is a boot error. With none set, the API is disabled outside development. |
+| `AUTH_JWKS_URL` / `AUTH_ISSUER` / `AUTH_AUDIENCE` | maintainerd-auth token verification. **All three together, or none** — a partial set is a boot error. |
+| `SECRET_CLIENT_ID` + `SECRET_CLIENT_SECRET` *(or `SECRET_CLIENT_PRIVATE_KEY_FILE`)* | This service's own backend m2m client in Auth. **Required in `MAINTAINERD_MODE=standalone`** (the default). Setting both credentials is a boot error. Never logged. |
+| `SECRET_CONSOLE_CLIENT_ID` | The console's public SPA client id in Auth. **Required in standalone.** Not a credential — the console publishes it — but a console pointed at a client id that does not exist cannot sign anyone in. |
+
+> In **standalone** mode outside `APP_ENV=development`, missing any of the seven
+> identity variables above is a **boot error naming exactly what to set**, all at
+> once. In `MAINTAINERD_MODE=core` none of them are required here — maintainerd-core
+> provisions them — and booting before it has done so is normal; the API answers 503
+> until it does. See the [repository README](https://github.com/maintainerd/maintainerd-secret#run-modes)
+> for the step-by-step standalone runbook.
 
 ### Common options
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `MAINTAINERD_MODE` | `standalone` | `standalone` (you create this service's identity in Auth by hand) or `core` (maintainerd-core provisions it). In `core` the REST setup wizard refuses; the gRPC `SetupService` is the bootstrap path. |
 | `APP_ENV` | `development` | Any other value fails closed: no ephemeral key, no open setup window, no gRPC reflection. |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error`. |
 | `HTTP_PORT` | `8092` | REST API. |

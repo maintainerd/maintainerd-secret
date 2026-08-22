@@ -7,7 +7,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/maintainerd/secret/internal/platform/authz"
+	sdkauthz "github.com/maintainerd/sdk/authz"
+	"github.com/maintainerd/secret/internal/platform/permissions"
 	"github.com/maintainerd/secret/internal/platform/response"
 	"github.com/maintainerd/secret/internal/setup"
 	"github.com/maintainerd/secret/internal/store"
@@ -63,7 +64,7 @@ func (s *Server) setupCallerIsPrivileged(r *http.Request) bool {
 	// The guard has already run on this route only in development (where it attaches
 	// DevClaims) or when a caller happened to send a bearer token; the setup segment
 	// is exempt from enforcement, so claims may legitimately be absent.
-	if claims, ok := authz.FromContext(r.Context()); ok && claims.HasAction(authz.PermAdmin) {
+	if claims, ok := sdkauthz.FromContext(r.Context()); ok && claims.HasAction(permissions.PermAdmin) {
 		return true
 	}
 	return false

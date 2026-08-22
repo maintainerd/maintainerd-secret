@@ -28,9 +28,9 @@ import (
 
 	"github.com/google/uuid"
 
+	sdkauthz "github.com/maintainerd/sdk/authz"
 	"github.com/maintainerd/secret/internal/audit"
 	"github.com/maintainerd/secret/internal/platform/apperror"
-	"github.com/maintainerd/secret/internal/platform/authz"
 	"github.com/maintainerd/secret/internal/store"
 )
 
@@ -111,7 +111,7 @@ func (s *Service) Store() *store.Service { return s.store }
 // service needs: the grants to check, the identity to record, and the tenant the
 // request is scoped to.
 type Caller struct {
-	Claims *authz.Claims
+	Claims *sdkauthz.Claims
 	Actor  audit.Actor
 	// TenantUUID and TenantName are the resolved tenant. Both are carried because
 	// the query layer scopes on the UUID and the MRN is built from the name.
@@ -141,7 +141,7 @@ func (c Caller) mrn(project, resourcePath string) string {
 // then decides whether you may touch it. That is why a caller may ask for any tenant
 // slug — asking is free, and the answer for a tenant you hold no grant in is a
 // denial (audited) rather than a data leak.
-func (s *Service) ResolveCaller(ctx context.Context, claims *authz.Claims, actor audit.Actor, tenantHint string) (Caller, error) {
+func (s *Service) ResolveCaller(ctx context.Context, claims *sdkauthz.Claims, actor audit.Actor, tenantHint string) (Caller, error) {
 	name := tenantHint
 	if name == "" && claims != nil {
 		name = claims.Tenant

@@ -8,9 +8,10 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	sdkauthz "github.com/maintainerd/sdk/authz"
 	secretv1 "github.com/maintainerd/secret/gen/maintainerd/secret/v1"
 	"github.com/maintainerd/secret/internal/audit"
-	"github.com/maintainerd/secret/internal/platform/authz"
+	"github.com/maintainerd/secret/internal/platform/permissions"
 	"github.com/maintainerd/secret/internal/setup"
 	"github.com/maintainerd/secret/internal/store"
 )
@@ -77,7 +78,7 @@ func (s *SetupServer) privileged(ctx context.Context) bool {
 	// The setup surface is exempt from the interceptor's bearer requirement, so
 	// claims are usually absent here; they are present in development (DevClaims) or
 	// when a caller happened to send a token that another path verified.
-	if claims, ok := authz.FromContext(ctx); ok && claims.HasAction(authz.PermAdmin) {
+	if claims, ok := sdkauthz.FromContext(ctx); ok && claims.HasAction(permissions.PermAdmin) {
 		return true
 	}
 	return false

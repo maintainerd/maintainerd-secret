@@ -7,8 +7,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	sdkauthz "github.com/maintainerd/sdk/authz"
 	"github.com/maintainerd/secret/internal/platform/apperror"
-	"github.com/maintainerd/secret/internal/platform/authz"
+	"github.com/maintainerd/secret/internal/platform/permissions"
 	"github.com/maintainerd/secret/internal/store"
 )
 
@@ -57,8 +58,8 @@ func TestReferenceRequiresRevealOnEveryHop(t *testing.T) {
 	fx.seed("prod", "/db", "PASSWORD", "prod-only-value")
 	fx.seedReference("dev", "/", "SNEAKY", "${billing-app/prod/db/PASSWORD}")
 
-	devOnly := fx.caller(authz.Grant{
-		Action:   authz.PermGetSecret,
+	devOnly := fx.caller(sdkauthz.Grant{
+		Action:   permissions.PermGetSecret,
 		Resource: "mrn:secret:acme:billing-app:secret/dev/*",
 	})
 
@@ -215,8 +216,8 @@ func TestImportedReadIsAuthorizedAgainstTheSourceMRN(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	prodOnly := fx.caller(authz.Grant{
-		Action:   authz.PermGetSecret,
+	prodOnly := fx.caller(sdkauthz.Grant{
+		Action:   permissions.PermGetSecret,
 		Resource: "mrn:secret:acme:billing-app:secret/prod/*",
 	})
 	_, err = fx.api.Reveal(context.Background(), prodOnly, addr("prod", "/", "SHARED"), 0)
@@ -230,8 +231,8 @@ func TestImportedReadIsAuthorizedAgainstTheSourceMRN(t *testing.T) {
 func TestImportCreationRequiresRevealOnTheSource(t *testing.T) {
 	fx := newFixture(t)
 	folderManager := fx.caller(
-		authz.Grant{Action: authz.PermManageFolder},
-		authz.Grant{Action: authz.PermGetSecret, Resource: "mrn:secret:acme:billing-app:secret/prod/*"},
+		sdkauthz.Grant{Action: permissions.PermManageFolder},
+		sdkauthz.Grant{Action: permissions.PermGetSecret, Resource: "mrn:secret:acme:billing-app:secret/prod/*"},
 	)
 	_, err := fx.api.CreateImport(context.Background(), folderManager, CreateImportInput{
 		Project: "billing-app", Environment: "prod", FolderPath: "/",

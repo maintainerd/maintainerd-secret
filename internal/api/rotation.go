@@ -8,7 +8,7 @@ import (
 	"github.com/maintainerd/secret/internal/audit"
 	"github.com/maintainerd/secret/internal/crypto"
 	"github.com/maintainerd/secret/internal/platform/apperror"
-	"github.com/maintainerd/secret/internal/platform/authz"
+	"github.com/maintainerd/secret/internal/platform/permissions"
 	"github.com/maintainerd/secret/internal/rotation"
 	"github.com/maintainerd/secret/internal/store"
 )
@@ -60,7 +60,7 @@ func (s *Service) RotateSecret(ctx context.Context, c Caller, in RotateSecretInp
 	if err != nil {
 		return nil, err
 	}
-	if err := s.guard(ctx, c, authz.PermRotateSecret, store.ActionRotate, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermRotateSecret, store.ActionRotate, resourceMRN); err != nil {
 		return nil, err
 	}
 	// Validate again on the local copy: the DTO rule proved the spec is usable, and
@@ -123,7 +123,7 @@ func (s *Service) SetRotationPolicy(ctx context.Context, c Caller, addr SecretAd
 	if err != nil {
 		return nil, err
 	}
-	if err := s.guard(ctx, c, authz.PermManageRotation, store.ActionRotationPolicySet, resourceMRN); err != nil {
+	if err := s.guard(ctx, c, permissions.PermManageRotation, store.ActionRotationPolicySet, resourceMRN); err != nil {
 		return nil, err
 	}
 	meta, err := s.store.SetRotationPolicy(ctx, ref, policy)

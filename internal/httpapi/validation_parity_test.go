@@ -15,13 +15,14 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	sdkauthz "github.com/maintainerd/sdk/authz"
 	secretv1 "github.com/maintainerd/secret/gen/maintainerd/secret/v1"
 	"github.com/maintainerd/secret/internal/api"
 	"github.com/maintainerd/secret/internal/audit"
 	"github.com/maintainerd/secret/internal/crypto"
 	"github.com/maintainerd/secret/internal/grpcserver"
 	"github.com/maintainerd/secret/internal/httpapi"
-	"github.com/maintainerd/secret/internal/platform/authz"
+	"github.com/maintainerd/secret/internal/platform/permissions"
 	"github.com/maintainerd/secret/internal/storage"
 	"github.com/maintainerd/secret/internal/store"
 )
@@ -113,7 +114,7 @@ func newParityHarness(t *testing.T) parityHarness {
 	// ModeDevOpen attaches DevClaims (a blanket grant) so the surface guard lets the
 	// request through to the handler. That is exactly what this test wants: an
 	// authorization refusal would mask the validation refusal it is asserting.
-	guard := authz.Guard{Mode: authz.ModeDevOpen, Reason: "parity test"}
+	guard := sdkauthz.Guard{Mode: sdkauthz.ModeDevOpen, Reason: "parity test"}
 
 	return parityHarness{
 		rest: httpapi.NewServer(svc, nil, guard, httpapi.Options{}).Router(),
@@ -142,8 +143,13 @@ func (h parityHarness) callREST(t *testing.T, method, target string, body any) (
 // grpcCtx carries the claims the interceptor would have attached in dev-open mode. The
 // service methods are called directly rather than over a socket, because the property
 // under test is the handler's, not the wire's.
+//
+// The principal comes from the guard itself (Guard.DevPrincipal) rather than being
+// hand-built, so it carries the same blanket grant AND the same BlanketActions the
+// real dev-open path attaches.
 func grpcCtx() context.Context {
-	return authz.NewContext(context.Background(), authz.DevClaims())
+	guard := sdkauthz.Guard{Mode: sdkauthz.ModeDevOpen, Permissions: permissions.Map()}
+	return sdkauthz.NewContext(context.Background(), guard.DevPrincipal())
 }
 
 // ---------------------------------------------------------------------------

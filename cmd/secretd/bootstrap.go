@@ -16,17 +16,18 @@ import (
 
 	"github.com/maintainerd/kit/server"
 
+	sdkauthz "github.com/maintainerd/sdk/authz"
 	secretv1 "github.com/maintainerd/secret/gen/maintainerd/secret/v1"
 	"github.com/maintainerd/secret/internal/api"
 	"github.com/maintainerd/secret/internal/audit"
 	"github.com/maintainerd/secret/internal/crypto"
 	"github.com/maintainerd/secret/internal/grpcserver"
 	"github.com/maintainerd/secret/internal/httpapi"
-	"github.com/maintainerd/secret/internal/platform/authz"
 	"github.com/maintainerd/secret/internal/platform/config"
 	"github.com/maintainerd/secret/internal/platform/database"
 	"github.com/maintainerd/secret/internal/platform/logging"
 	mw "github.com/maintainerd/secret/internal/platform/middleware"
+	"github.com/maintainerd/secret/internal/platform/permissions"
 	"github.com/maintainerd/secret/internal/rotator"
 	"github.com/maintainerd/secret/internal/setup"
 	"github.com/maintainerd/secret/internal/store"
@@ -74,10 +75,12 @@ func run(parent context.Context) error {
 
 	slog.Info("starting maintainerd-secret",
 		"app_env", config.AppEnv,
+		"mode", config.DescribeMode(),
 		"grpc_port", config.GRPCAddr,
 		"http_port", config.HTTPAddr,
 		"root_key_provider", config.RootKeyProvider,
 	)
+	logRunMode()
 
 	rootKey, err := crypto.NewRootKeyProvider(crypto.ProviderConfig{
 		Provider: config.RootKeyProvider,
@@ -132,15 +135,20 @@ func run(parent context.Context) error {
 	// The auth posture is resolved BEFORE any surface is built, and its banner is
 	// printed immediately, so the last thing in the boot log before the service
 	// starts answering is what is or is not guarding it.
-	guard, err := authz.Resolve(ctx, authz.Config{
-		JWKSURL:     config.AuthJWKSURL,
-		Issuer:      config.AuthIssuer,
-		Audience:    config.AuthAudience,
-		Development: config.IsDevelopment(),
-	})
+	guard, err := sdkauthz.Resolve(ctx, sdkauthz.Config{
+		JWKSURL:         config.AuthJWKSURL,
+		Issuer:          config.AuthIssuer,
+		Audience:        config.AuthAudience,
+		Development:     config.IsDevelopment(),
+		Service:         permissions.ServiceName,
+		DevOpenWarnings: permissions.DevOpenWarnings(),
+	}, permissions.Map())
 	if err != nil {
 		return fmt.Errorf("resolve authorization: %w", err)
 	}
+	// The denial body follows this API's envelope on the REST surface; httpapi wires
+	// that onto its own copy of the guard (see httpapi.NewServer). gRPC denials are
+	// statuses and need no writer.
 	guard.LogBanner()
 
 	auditor, err := audit.New(svc)
@@ -175,7 +183,11 @@ func run(parent context.Context) error {
 		DefaultTenant:       config.DefaultTenant,
 		DefaultProject:      config.DefaultProject,
 		DefaultEnvironment:  config.DefaultEnvironment,
-		DeclaredPermissions: authz.DeclaredPermissions(),
+		DeclaredPermissions: permissions.DeclaredPermissions(),
+		// In core mode the REST wizard is shut from the first boot: the operator has
+		// declared that a controller owns first-run, and two open paths is a race
+		// whose winner owns the vault.
+		CoreAttached: config.Mode == config.ModeCore,
 	})
 	if err != nil {
 		return err
@@ -214,15 +226,27 @@ func run(parent context.Context) error {
 	// the limiter; auth next, because the limiter keys on the verified principal; the
 	// limiter last, so an unauthenticated caller is refused before it can consume
 	// anyone's budget.
-	gs := grpc.NewServer(grpc.ChainUnaryInterceptor(
-		grpcserver.RecoveryUnaryInterceptor(),
-		grpcserver.AuthUnaryInterceptor(guard),
-		grpcserver.RateLimitUnaryInterceptor(limiter, grpcserver.RateLimitOptions{
-			Reveal: config.RateLimitReveal,
-			Write:  config.RateLimitWrite,
-			Setup:  config.RateLimitSetup,
-		}),
-	))
+	//
+	// THE STREAM INTERCEPTOR IS NOT OPTIONAL. grpc-go dispatches unary and streaming
+	// calls through different chains, so a server that installs only the unary one
+	// leaves every server-streaming and bidi RPC unguarded — no token, no permission,
+	// no allowlist. maintainerd.secret.v1 has no streaming RPC today, which is exactly
+	// why that hole was invisible; wiring it now means the first one added arrives
+	// guarded instead of open.
+	gs := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(
+			grpcserver.RecoveryUnaryInterceptor(),
+			grpcserver.AuthUnaryInterceptor(guard),
+			grpcserver.RateLimitUnaryInterceptor(limiter, grpcserver.RateLimitOptions{
+				Reveal: config.RateLimitReveal,
+				Write:  config.RateLimitWrite,
+				Setup:  config.RateLimitSetup,
+			}),
+		),
+		grpc.ChainStreamInterceptor(
+			grpcserver.AuthStreamInterceptor(guard),
+		),
+	)
 	secretv1.RegisterSecretServiceServer(gs, secretAPI)
 	secretv1.RegisterSetupServiceServer(gs, setupAPI)
 	healthpb.RegisterHealthServer(gs, health.NewServer())
@@ -279,6 +303,54 @@ func run(parent context.Context) error {
 	)
 }
 
+// logRunMode states, at boot, which world this instance is running in and — in
+// standalone — exactly which Auth it will accept tokens from.
+//
+// The issuer and audience are the two values that decide whether a token minted
+// by the operator's Auth is accepted by this process, and they are the two an
+// operator most often gets subtly wrong (a trailing slash on the issuer, the
+// resource API's name instead of its identifier). Printing them where the reader
+// is already looking turns "every call is 401" from an afternoon into a glance.
+// Neither is a secret: both appear in every token this service verifies. The
+// client SECRET and the private key path are never logged; the two client IDs are
+// public identifiers and are.
+func logRunMode() {
+	if config.Mode == config.ModeCore {
+		slog.Info("run mode: core-attached",
+			"detail", "maintainerd-core provisions this instance through the gRPC SetupService; "+
+				"the REST setup wizard refuses")
+		return
+	}
+	slog.Info("run mode: standalone",
+		"detail", "this instance owns its own identity wiring; the REST setup wizard is the bootstrap path",
+		"auth_issuer", orNotSet(config.AuthIssuer),
+		"auth_audience", orNotSet(config.AuthAudience),
+		"auth_jwks_url", orNotSet(config.AuthJWKSURL),
+		"client_id", orNotSet(config.ClientID),
+		"client_auth", clientAuthMethod(),
+		"console_client_id", orNotSet(config.ConsoleClientID))
+}
+
+func orNotSet(v string) string {
+	if v == "" {
+		return "(not set)"
+	}
+	return v
+}
+
+// clientAuthMethod names HOW this service authenticates itself to Auth, without
+// disclosing the credential either way.
+func clientAuthMethod() string {
+	switch {
+	case config.ClientPrivateKeyFile != "":
+		return "private_key_jwt"
+	case config.ClientSecret != "":
+		return "client_secret"
+	default:
+		return "(not set)"
+	}
+}
+
 // readinessChecks are the dependencies /readyz gates on.
 //
 // TWO CHECKS, AND BOTH FAIL CLOSED:
@@ -294,7 +366,7 @@ func run(parent context.Context) error {
 //	          cannot authorize a reveal. ModeDevOpen is reported ready because a
 //	          development instance is deliberately open and has already announced that
 //	          at boot in the loudest terms the log allows.
-func readinessChecks(pool *pgxpool.Pool, guard authz.Guard) []httpapi.ReadinessCheck {
+func readinessChecks(pool *pgxpool.Pool, guard sdkauthz.Guard) []httpapi.ReadinessCheck {
 	return []httpapi.ReadinessCheck{
 		{
 			Name: "database",
@@ -305,7 +377,7 @@ func readinessChecks(pool *pgxpool.Pool, guard authz.Guard) []httpapi.ReadinessC
 		{
 			Name: "auth",
 			Probe: func(context.Context) error {
-				if guard.Mode == authz.ModeUnavailable {
+				if guard.Mode == sdkauthz.ModeUnavailable {
 					return fmt.Errorf("authorization is unavailable: %s", guard.Reason)
 				}
 				return nil
