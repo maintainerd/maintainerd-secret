@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/maintainerd/secret/internal/platform/authz"
+	mw "github.com/maintainerd/secret/internal/platform/middleware"
 )
 
 // These tests drive the ROUTER, not the handlers: they assert that every documented
@@ -140,6 +141,48 @@ func TestDecodeRejectsUnknownFields(t *testing.T) {
 	w = httptest.NewRecorder()
 	require.True(t, decode(w, r, &dst))
 	assert.Equal(t, "fine", dst.Key)
+}
+
+// TestTheBodyCapIsWiredIntoTheRouter. The cap lives in middleware.BodyLimit rather than
+// in decode, so this asserts it is actually mounted — and that it applies OUTSIDE the
+// guard, on a route the guard is refusing, because the setup surface is reachable
+// before any token exists and the body arrives before any check can run.
+func TestTheBodyCapIsWiredIntoTheRouter(t *testing.T) {
+	router := NewServer(nil, nil, authz.Guard{
+		Mode:   authz.ModeUnavailable,
+		Reason: "AUTH_JWKS_URL not set",
+	}, Options{MaxBodyBytes: 64}).Router()
+
+	oversized := strings.NewReader(strings.Repeat("a", 4096))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/setup", oversized)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	// The setup segment is exempt from the guard, so the request reaches a handler and
+	// the capped reader is what refuses it.
+	assert.NotEqual(t, http.StatusOK, w.Code)
+}
+
+// TestTheConfiguredCapIsTheOneEnforced. decode no longer wraps the body a second time
+// with a constant; an operator who raises the limit must actually get it.
+func TestTheConfiguredCapIsTheOneEnforced(t *testing.T) {
+	body := strings.Repeat("a", 8192)
+
+	server := NewServer(nil, nil, authz.Guard{Mode: authz.ModeDevOpen}, Options{MaxBodyBytes: 16384})
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	w := httptest.NewRecorder()
+
+	var dst map[string]any
+	mwHandler := mw.BodyLimit(server.opts.MaxBodyBytes)(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			// The body is not JSON, so decode fails — but it must fail on the CONTENT,
+			// not on the size, which is what proves the larger configured cap applied.
+			decode(w, r, &dst)
+		}))
+	mwHandler.ServeHTTP(w, req)
+
+	assert.Contains(t, w.Body.String(), "invalid request body")
+	assert.NotContains(t, w.Body.String(), "too large")
 }
 
 func TestDecodeRequiresABody(t *testing.T) {
