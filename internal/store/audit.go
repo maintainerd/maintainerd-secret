@@ -64,7 +64,71 @@ const (
 	ActionSetupStatusRead   = "setup.status"
 	ActionRotationPolicySet = "rotation.policy"
 	ActionRotationScheduled = "rotation.scheduled"
+
+	// Dynamic secrets. ActionDynamicIssue is the row that matters most in this group:
+	// it is the moment a live database account came into existence on somebody's
+	// request, and it is the only record of WHO holds it — the password is never
+	// stored, so the audit trail plus the lease row are the whole picture.
+	ActionDynamicRoleCreate = "dynamic.role.create"
+	ActionDynamicRoleUpdate = "dynamic.role.update"
+	ActionDynamicRoleDelete = "dynamic.role.delete"
+	ActionDynamicIssue      = "dynamic.issue"
+	// ActionDynamicRevoke covers an explicit revoke and a reaper-driven one alike; the
+	// event's metadata carries which. They are ONE action because the question an
+	// incident review asks is "when did this account stop existing", and splitting it
+	// would mean asking it twice and joining the answers by hand.
+	ActionDynamicRevoke = "dynamic.revoke"
+
+	// Transit. Encrypt and Decrypt are DATA-PLANE actions and are audited
+	// individually, like a reveal — for a service whose promise is that the key never
+	// leaves, "who decrypted, and how much" is the same question as "who read the
+	// value". The rows carry metadata only: a byte count and a key version, never a
+	// plaintext and never a ciphertext.
+	ActionTransitKeyCreate = "transit.key.create"
+	ActionTransitKeyUpdate = "transit.key.update"
+	ActionTransitKeyDelete = "transit.key.delete"
+	ActionTransitKeyRotate = "transit.key.rotate"
+	ActionTransitEncrypt   = "transit.encrypt"
+	ActionTransitDecrypt   = "transit.decrypt"
+
+	// Leases on static secrets. ActionLeaseRefused is deliberately its OWN action
+	// rather than a denied-outcome row on ActionReveal: a refusal because an allowance
+	// ran out is a different event from a refusal because a principal holds no grant,
+	// and a review that could not tell them apart would read a consumer hitting its
+	// cap as an authorization attack.
+	ActionLeasePolicySet = "lease.policy"
+	ActionLeaseIssue     = "lease.issue"
+	ActionLeaseRevoke    = "lease.revoke"
+	ActionLeaseRefused   = "lease.refused"
 )
+
+// AuditActions is the closed set of actions this service records, in the order a
+// filter dropdown should list them.
+//
+// It exists so the API layer's audit-filter validation lists exactly what this
+// package can write, rather than a second copy that drifts. A filter that accepts an
+// action never recorded is not harmful, but it is a filter that silently answers "no
+// events" forever — which on an access trail reads as "nothing happened".
+func AuditActions() []string {
+	return []string{
+		ActionRead, ActionReveal, ActionWrite, ActionRotate, ActionDelete,
+		ActionRestore, ActionDestroy, ActionList, ActionRollback, ActionReferenceResolve,
+		ActionMetadataUpdate,
+		ActionProjectCreate, ActionProjectUpdate, ActionProjectDelete,
+		ActionEnvironmentCreate, ActionEnvironmentUpdate, ActionEnvironmentDelete,
+		ActionFolderCreate, ActionFolderMove, ActionFolderDelete,
+		ActionImportCreate, ActionImportUpdate, ActionImportDelete,
+		ActionWebhookCreate, ActionWebhookUpdate, ActionWebhookDelete, ActionWebhookDeliver,
+		ActionAuditRead, ActionRootKeyRotate,
+		ActionSetupProvision, ActionSetupComplete, ActionSetupStatusRead,
+		ActionRotationPolicySet, ActionRotationScheduled,
+		ActionDynamicRoleCreate, ActionDynamicRoleUpdate, ActionDynamicRoleDelete,
+		ActionDynamicIssue, ActionDynamicRevoke,
+		ActionTransitKeyCreate, ActionTransitKeyUpdate, ActionTransitKeyDelete,
+		ActionTransitKeyRotate, ActionTransitEncrypt, ActionTransitDecrypt,
+		ActionLeasePolicySet, ActionLeaseIssue, ActionLeaseRevoke, ActionLeaseRefused,
+	}
+}
 
 // Actor kinds.
 const (
@@ -80,6 +144,11 @@ const (
 	OutcomeDenied  = "denied"
 	OutcomeError   = "error"
 )
+
+// AuditOutcomes is the closed set, matching the audit_log CHECK constraint. Same
+// argument as AuditActions: the API's filter validation must not be able to accept a
+// value the column refuses.
+func AuditOutcomes() []string { return []string{OutcomeSuccess, OutcomeDenied, OutcomeError} }
 
 // AuditEvent is one row of the trail.
 //

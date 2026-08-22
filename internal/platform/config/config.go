@@ -12,6 +12,8 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -61,6 +63,21 @@ const (
 // KnownModes is the accepted MAINTAINERD_MODE set, in the order they are listed
 // in an error message.
 func KnownModes() []string { return []string{ModeStandalone, ModeCore} }
+
+// AppVersion is this build's version, stamped at LINK TIME:
+//
+//	go build -ldflags "-X github.com/maintainerd/secret/internal/platform/config.AppVersion=1.4.0"
+//
+// IT IS NOT READ FROM THE ENVIRONMENT, deliberately. A version an operator can set
+// is a version that can disagree with the binary, and the one job of this string is
+// to answer "what is actually running" — on the boot line, in the capability
+// endpoint, and in the console's footer. The release image passes its own tag (see
+// the Dockerfile), so the value the OCI label advertises and the value the service
+// reports are the same one.
+//
+// "dev" is the honest answer for a `go build` with no ldflags, which is every local
+// build and every test.
+var AppVersion = "dev"
 
 // Populated once by Init and read-only thereafter. Tests use t.Setenv and call
 // Init again.
@@ -159,6 +176,67 @@ var (
 	// period, so this must be shorter than that (Kubernetes defaults to 30s).
 	ShutdownTimeout time.Duration
 
+	// --- transport security ------------------------------------------------
+	//
+	// TWO LISTENERS, TWO DIFFERENT POSTURES, and the asymmetry is deliberate
+	// rather than an oversight:
+	//
+	//	gRPC  is the SERVICE-TO-SERVICE and CONTROL-PLANE surface. It carries
+	//	      SetupService, through which maintainerd-core provisions this vault.
+	//	      A peer on that socket is claiming to be another maintainerd service,
+	//	      and a bearer token only ASSERTS that — a verified client certificate
+	//	      DEMONSTRATES it. So this listener supports mutual TLS, and in
+	//	      core-attached mode outside development it REQUIRES it.
+	//	HTTP  is the REST API and the console's origin, and in every sanctioned
+	//	      deployment it sits behind a terminating proxy (nginx in the dev
+	//	      stack, an ingress in production). Direct TLS is therefore OPTIONAL —
+	//	      offered for the operator who serves it directly, not mandated for
+	//	      the majority who do not.
+	//
+	// Each group is ALL-OR-NOTHING. A partial set is a boot error, for the same
+	// reason a partial AUTH_* set is: half a TLS configuration looks configured
+	// and serves plaintext.
+
+	// GRPCTLSCertFile (SECRET_GRPC_CERT_FILE) and GRPCTLSKeyFile
+	// (SECRET_GRPC_KEY_FILE) are this service's server certificate and private
+	// key for the gRPC listener.
+	GRPCTLSCertFile string
+	GRPCTLSKeyFile  string
+
+	// GRPCClientCAFile (SECRET_GRPC_CA_FILE) is the CA that issues the client
+	// certificates this listener will accept. Its presence is what turns server
+	// TLS into MUTUAL TLS: with it, the listener is configured
+	// tls.RequireAndVerifyClientCert, so an unverified peer never reaches an
+	// interceptor.
+	GRPCClientCAFile string
+
+	// HTTPTLSCertFile (SECRET_TLS_CERT_FILE) and HTTPTLSKeyFile
+	// (SECRET_TLS_KEY_FILE) serve the REST surface over TLS directly, for a
+	// deployment with no terminating proxy in front of it. Optional; both or
+	// neither.
+	HTTPTLSCertFile string
+	HTTPTLSKeyFile  string
+
+	// --- multi-replica coordination ----------------------------------------
+
+	// LeaderElectionEnabled (SECRET_LEADER_ELECTION_ENABLED, default true) gates
+	// the background workers on a PostgreSQL advisory lock so exactly one replica
+	// runs them (see internal/leader).
+	//
+	// DEFAULT TRUE, because the failure it prevents is invisible. Two replicas
+	// both running the rotator rotate the same secret twice — two versions, two
+	// webhook fan-outs, and a consumer holding a value that is already
+	// superseded — and the service looks perfectly healthy while doing it. An
+	// operator should have to opt OUT of correctness, not in.
+	LeaderElectionEnabled bool
+
+	// RateLimitShared (SECRET_RATE_LIMIT_SHARED, default true) meters the rate
+	// limiter's budgets through PostgreSQL so they span the replica set instead
+	// of being per-process. Same reasoning as above: a per-process budget on N
+	// replicas is N times the configured ceiling, and the reveal ceiling is the
+	// exfiltration bound on a compromised token.
+	RateLimitShared bool
+
 	// --- database ----------------------------------------------------------
 	DBHost               string // DB_HOST (required)
 	DBPort               string // DB_PORT (required)
@@ -188,6 +266,49 @@ var (
 	// RootKeyFile (SECRET_ROOT_KEY_FILE) is the sealed key file for the "file"
 	// provider. The file must not be group- or world-readable.
 	RootKeyFile string
+
+	// --- root of trust: cloud KMS ------------------------------------------
+	//
+	// Only the variables belonging to the SELECTED provider are required, and the
+	// requirement is checked AT BOOT (initRootKeyKMS). That is the whole point of
+	// having them here: selecting aws_kms without a key id must be a refusal to
+	// start, not a failure on the first Wrap after the service is already serving.
+	// None of these values is a secret — a key ARN, a resource name and a vault URL
+	// are all safe to log, and the boot line prints them next to the kek_id so a
+	// fingerprint in root_keys can be traced back to a key in a cloud console.
+
+	// KMSTimeout (SECRET_KMS_TIMEOUT, default 10s) bounds ONE Wrap or Unwrap
+	// round-trip, for whichever cloud provider is selected. It exists because the
+	// root key sits on the read and write path of every secret: an unbounded KMS
+	// call would hold a request goroutine for as long as the network allowed.
+	KMSTimeout time.Duration
+
+	// KMSAWSKeyID (SECRET_KMS_AWS_KEY_ID) is the key ARN, key id, alias name
+	// ("alias/...") or alias ARN of a symmetric ENCRYPT_DECRYPT KMS key.
+	KMSAWSKeyID string
+	// KMSAWSRegion (SECRET_KMS_AWS_REGION) is the region the key lives in. It
+	// falls back to AWS_REGION and then AWS_DEFAULT_REGION, but it is REQUIRED one
+	// way or another rather than left to the SDK's resolution, because the region
+	// participates in the kek_id: an alias resolved ambiently on one host and
+	// explicitly on another would produce two ids for one key.
+	KMSAWSRegion string
+
+	// KMSGCPKeyName (SECRET_KMS_GCP_KEY_NAME) is the fully qualified CryptoKey
+	// resource name, projects/{p}/locations/{l}/keyRings/{r}/cryptoKeys/{k}.
+	// Validated for shape at boot, including a refusal of a
+	// /cryptoKeyVersions/... suffix — Encrypt accepts one and Decrypt does not, so
+	// a pinned version would wrap happily and fail every unwrap.
+	KMSGCPKeyName string
+
+	// KMSAzureVaultURL (SECRET_KMS_AZURE_VAULT_URL) is the vault base URL,
+	// https://{vault}.vault.azure.net/. Must be https.
+	KMSAzureVaultURL string
+	// KMSAzureKeyName (SECRET_KMS_AZURE_KEY_NAME) is the RSA key's name in that
+	// vault.
+	KMSAzureKeyName string
+	// KMSAzureKeyVersion (SECRET_KMS_AZURE_KEY_VERSION) optionally pins a key
+	// version. Empty — the normal choice — means the vault's current version.
+	KMSAzureKeyVersion string
 
 	// --- store policy ------------------------------------------------------
 
@@ -296,6 +417,60 @@ var (
 	// per-endpoint retry budget, for the same reason.
 	WebhookMaxAttempts int
 
+	// --- webhook re-drive --------------------------------------------------
+	//
+	// The bounds above govern the INLINE attempt sequence, which runs on the write
+	// path and is therefore measured in milliseconds. These govern the DURABLE loop
+	// that owns anything the inline attempt could not deliver (internal/webhook,
+	// redrive.go) — the reason a receiver that was redeploying still gets told.
+	//
+	// The two are separate budgets on purpose: an operator raising the inline retry
+	// count is buying write latency, and an operator raising the durable one is
+	// buying patience with a broken receiver. Neither number should move because of
+	// the other.
+
+	// WebhookRedriveEnabled (SECRET_WEBHOOK_REDRIVE_ENABLED, default true) runs the
+	// durable retry loop. Turning it off preserves the backlog — the rows keep their
+	// 'retrying' status — so delivery resumes when it is turned back on. With it off,
+	// a delivery that exhausts its inline attempts is recorded 'failed' and nothing
+	// retries it, which is the behaviour before re-drive existed.
+	WebhookRedriveEnabled bool
+	// WebhookRedriveInterval (SECRET_WEBHOOK_REDRIVE_INTERVAL, default 30s) is how
+	// often the worker looks for due deliveries. Much finer than the backoff schedule,
+	// so a delivery is picked up within a tick of becoming due.
+	WebhookRedriveInterval time.Duration
+	// WebhookRedriveBatch (SECRET_WEBHOOK_REDRIVE_BATCH, default 50) bounds one pass,
+	// so draining an hour's backlog does not become a self-inflicted flood.
+	WebhookRedriveBatch int
+	// WebhookRedriveMaxAttempts (SECRET_WEBHOOK_REDRIVE_MAX_ATTEMPTS, default 10) is
+	// the durable budget in WORKER attempts. Past it the delivery is marked
+	// permanently failed — the row an operator greps for — because retrying forever
+	// against an endpoint nobody owns is a queue that never drains.
+	WebhookRedriveMaxAttempts int
+	// WebhookRedriveBaseBackoff (SECRET_WEBHOOK_REDRIVE_BASE_BACKOFF, default 30s) is
+	// the first delay; it doubles each attempt up to WebhookRedriveMaxBackoff
+	// (SECRET_WEBHOOK_REDRIVE_MAX_BACKOFF, default 1h). On the defaults the schedule
+	// spans roughly four hours, which covers a long deploy or an expired certificate
+	// somebody has to be paged about.
+	WebhookRedriveBaseBackoff time.Duration
+	WebhookRedriveMaxBackoff  time.Duration
+
+	// --- console ------------------------------------------------------------
+
+	// ConsoleDir (CONSOLE_DIR) is the directory holding the console's built SPA.
+	// EMPTY DISABLES IT, which is the default and is what a development instance
+	// wants: the console runs under vite there, and this process serves only the API.
+	//
+	// The release image bakes the built SPA at /srv/console and sets this variable, so
+	// the image serves its own UI on the REST port with no nginx and no second
+	// container. Runtime directory rather than go:embed — see internal/httpapi
+	// (console.go) for why that choice, and for the traversal-safe resolver.
+	//
+	// A path that is set but does not contain a readable index.html is a BOOT ERROR.
+	// The alternative is a service that starts and answers 404 for every console
+	// route, which an operator diagnoses in a browser instead of in a log line.
+	ConsoleDir string
+
 	// --- request limits ----------------------------------------------------
 	//
 	// These are the server-side bounds on what one request may CONTAIN, as
@@ -325,11 +500,15 @@ var (
 
 	// --- rate limiting -----------------------------------------------------
 	//
-	// The limiter is IN-PROCESS (see internal/platform/middleware/rate_limit.go).
-	// This service has no Redis, so the counters are per-replica: with N
-	// replicas behind a load balancer the effective ceiling is N times the
-	// configured one. That is stated plainly rather than papered over — it is a
-	// brute-force and burst dampener, not a distributed quota.
+	// The budgets below are SHARED ACROSS REPLICAS by default, metered through
+	// PostgreSQL (see internal/platform/middleware/rate_limit.go for the
+	// reservation protocol and its trade-off). So each number is a fleet-wide
+	// ceiling, not a per-process one.
+	//
+	// Two configurations make them per-process again, and both say so at boot:
+	// SECRET_RATE_LIMIT_SHARED=false, and a database the shared store cannot
+	// reach — which degrades to per-replica metering rather than failing open or
+	// taking the service down with it.
 
 	// RateLimitEnabled (SECRET_RATE_LIMIT_ENABLED, default true) turns the
 	// limiter off. Off is a supported configuration for a deployment that meters
@@ -423,6 +602,9 @@ func Init() error {
 	if RootKeyProvider == crypto.ProviderFile && RootKeyFile == "" {
 		return fmt.Errorf("config: SECRET_ROOT_KEY_FILE is required when SECRET_ROOT_KEY_PROVIDER=file")
 	}
+	if err = initRootKeyKMS(); err != nil {
+		return err
+	}
 
 	if KeepVersions, err = positiveInt("SECRET_KEEP_VERSIONS", 10); err != nil {
 		return err
@@ -455,6 +637,11 @@ func Init() error {
 	if err = initRunMode(); err != nil {
 		return err
 	}
+	// Transport security is resolved AFTER the run mode, because whether the gRPC
+	// listener may serve in the clear depends on whether it is a control plane.
+	if err = initTransportSecurity(); err != nil {
+		return err
+	}
 
 	if ReferenceMaxDepth, err = positiveInt("SECRET_REFERENCE_MAX_DEPTH", 8); err != nil {
 		return err
@@ -481,10 +668,21 @@ func Init() error {
 	if WebhookMaxAttempts, err = positiveInt("SECRET_WEBHOOK_MAX_ATTEMPTS", 10); err != nil {
 		return err
 	}
+	if err = initWebhookRedrive(); err != nil {
+		return err
+	}
+	if err = initConsole(); err != nil {
+		return err
+	}
 	if err = initRequestLimits(); err != nil {
 		return err
 	}
 	if err = initRateLimits(); err != nil {
+		return err
+	}
+	// Coordination is resolved LAST of the groups it talks about: it warns on
+	// combinations of the rate-limit switches, so those must already be read.
+	if err = initCoordination(); err != nil {
 		return err
 	}
 
@@ -597,6 +795,142 @@ func standaloneMissing() []string {
 	return missing
 }
 
+// initRootKeyKMS reads the cloud-KMS settings and validates the ones the SELECTED
+// provider needs.
+//
+// THE VALIDATION IS THE POINT, not the reading. A cloud provider selected without its
+// key coordinates would otherwise fail on the first Wrap — which is to say, after the
+// process has started, passed its health check, joined the load balancer, and accepted
+// a write. That is the same class of deferred failure as the prototype's generated
+// root key: invisible until it is expensive. So a missing setting is a boot error, and
+// it names every missing variable at once rather than one per restart.
+//
+// Settings belonging to the OTHER providers are read and left alone. An operator
+// migrating from aws_kms to gcp_kms keeps both sets in place through the rewrap, and
+// validating the inactive one would make that impossible.
+func initRootKeyKMS() error {
+	var err error
+	if KMSTimeout, err = positiveDuration("SECRET_KMS_TIMEOUT", crypto.DefaultKMSTimeout); err != nil {
+		return err
+	}
+
+	KMSAWSKeyID = strings.TrimSpace(kitconfig.GetEnv("SECRET_KMS_AWS_KEY_ID", ""))
+	KMSAWSRegion = strings.TrimSpace(kitconfig.GetEnv("SECRET_KMS_AWS_REGION", ""))
+	// The AWS SDK's own variables are accepted as a fallback because a workload that
+	// already sets them for other AWS calls should not have to set a second name for
+	// the same fact.
+	for _, fallback := range []string{"AWS_REGION", "AWS_DEFAULT_REGION"} {
+		if KMSAWSRegion != "" {
+			break
+		}
+		KMSAWSRegion = strings.TrimSpace(kitconfig.GetEnv(fallback, ""))
+	}
+
+	KMSGCPKeyName = strings.TrimSpace(kitconfig.GetEnv("SECRET_KMS_GCP_KEY_NAME", ""))
+
+	KMSAzureVaultURL = strings.TrimSpace(kitconfig.GetEnv("SECRET_KMS_AZURE_VAULT_URL", ""))
+	KMSAzureKeyName = strings.TrimSpace(kitconfig.GetEnv("SECRET_KMS_AZURE_KEY_NAME", ""))
+	KMSAzureKeyVersion = strings.TrimSpace(kitconfig.GetEnv("SECRET_KMS_AZURE_KEY_VERSION", ""))
+
+	if missing := kmsMissing(); len(missing) > 0 {
+		return fmt.Errorf(
+			"config: SECRET_ROOT_KEY_PROVIDER=%s requires %s. "+
+				"Selecting a cloud root key without its coordinates would fail on the first write rather than at boot, so this is refused here",
+			RootKeyProvider, strings.Join(missing, ", "))
+	}
+
+	// Shape checks, only for the selected provider. Both catch a configuration that
+	// would authenticate, boot, and then misbehave — which is worse than one that
+	// does not start. The rules live in the crypto package so the validator and the
+	// factory cannot disagree about them.
+	switch RootKeyProvider {
+	case crypto.ProviderGCPKMS:
+		if err := crypto.ValidateGCPKeyName(KMSGCPKeyName); err != nil {
+			return fmt.Errorf("config: %w", err)
+		}
+	case crypto.ProviderAzureKV:
+		if err := crypto.ValidateAzureVaultURL(KMSAzureVaultURL); err != nil {
+			return fmt.Errorf("config: %w", err)
+		}
+	}
+	return nil
+}
+
+// kmsMissing lists the variables the selected cloud provider needs and does not have,
+// in the order an operator would set them. Empty for env and file, which have their
+// own checks above.
+func kmsMissing() []string {
+	var missing []string
+	switch RootKeyProvider {
+	case crypto.ProviderAWSKMS:
+		if KMSAWSKeyID == "" {
+			missing = append(missing, "SECRET_KMS_AWS_KEY_ID")
+		}
+		if KMSAWSRegion == "" {
+			missing = append(missing, "SECRET_KMS_AWS_REGION (or AWS_REGION)")
+		}
+	case crypto.ProviderGCPKMS:
+		if KMSGCPKeyName == "" {
+			missing = append(missing, "SECRET_KMS_GCP_KEY_NAME")
+		}
+	case crypto.ProviderAzureKV:
+		if KMSAzureVaultURL == "" {
+			missing = append(missing, "SECRET_KMS_AZURE_VAULT_URL")
+		}
+		if KMSAzureKeyName == "" {
+			missing = append(missing, "SECRET_KMS_AZURE_KEY_NAME")
+		}
+	}
+	return missing
+}
+
+// RootKeyProviderConfig assembles the validated configuration the crypto factory
+// needs, so the root of trust is built from ONE place and no call site has to know
+// which fields a given provider reads.
+//
+// It is a pure read of the package variables Init already validated — it does not
+// touch the environment, and it never returns an error, because everything that can
+// be wrong about this configuration was refused at boot.
+func RootKeyProviderConfig() crypto.ProviderConfig {
+	return crypto.ProviderConfig{
+		Provider: RootKeyProvider,
+		AppEnv:   AppEnv,
+		Key:      RootKey,
+		KeyFile:  RootKeyFile,
+		KMS: crypto.KMSConfig{
+			Timeout:         KMSTimeout,
+			AWSKeyID:        KMSAWSKeyID,
+			AWSRegion:       KMSAWSRegion,
+			GCPKeyName:      KMSGCPKeyName,
+			AzureVaultURL:   KMSAzureVaultURL,
+			AzureKeyName:    KMSAzureKeyName,
+			AzureKeyVersion: KMSAzureKeyVersion,
+		},
+	}
+}
+
+// DescribeRootKey renders the root of trust for a boot log line. Never includes key
+// material — for the cloud providers there is none to include, and for env and file
+// the value and the path are deliberately omitted.
+func DescribeRootKey() string {
+	switch RootKeyProvider {
+	case crypto.ProviderAWSKMS:
+		return fmt.Sprintf("%s (%s in %s)", crypto.ProviderAWSKMS, KMSAWSKeyID, KMSAWSRegion)
+	case crypto.ProviderGCPKMS:
+		return fmt.Sprintf("%s (%s)", crypto.ProviderGCPKMS, KMSGCPKeyName)
+	case crypto.ProviderAzureKV:
+		version := KMSAzureKeyVersion
+		if version == "" {
+			version = "current"
+		}
+		return fmt.Sprintf("%s (%s key %s, version %s)", crypto.ProviderAzureKV, KMSAzureVaultURL, KMSAzureKeyName, version)
+	case crypto.ProviderFile:
+		return crypto.ProviderFile
+	default:
+		return RootKeyProvider
+	}
+}
+
 // IsStandalone reports whether this instance owns its own identity wiring.
 func IsStandalone() bool { return Mode == ModeStandalone }
 
@@ -608,6 +942,189 @@ func DescribeMode() string {
 	default:
 		return ModeStandalone + " (an operator provisions this instance; auth is configured by environment)"
 	}
+}
+
+// initTransportSecurity reads the TLS material for both listeners and refuses the
+// combinations that cannot be served safely.
+//
+// THE RULE, AND WHY EACH BRANCH IS WHERE IT IS. This mirrors how maintainerd-auth
+// guards its own control plane (auth internal/server/grpc.go loadGRPCTLSConfig),
+// because the thing being protected is the same: a surface through which another
+// process provisions this one.
+//
+//	PARTIAL gRPC material (one or two of the three)
+//	  ALWAYS a boot error, in every environment including development. This is the
+//	  branch that matters most, because it is the one that looks configured. An
+//	  operator who set a cert and a key but no CA has built server TLS and believes
+//	  they have mutual TLS; an operator who set a CA but no cert has configured
+//	  nothing at all and believes they have configured everything. Neither should
+//	  discover it from a peer that got in.
+//
+//	NO gRPC material, MAINTAINERD_MODE=core, outside development
+//	  A boot error. In core mode this listener IS the control plane: SetupService is
+//	  how core provisions the vault's identity, and the caller's claim to be core is
+//	  the only thing standing between an arbitrary peer and ownership of the vault.
+//	  That claim must be proven by a certificate, not asserted by a token, and it is
+//	  never served in the clear. This is the "no silent plaintext downgrade" rule.
+//
+//	NO gRPC material, standalone, outside development
+//	  A loud WARNING, not an error. In standalone mode the gRPC listener is
+//	  service-to-service traffic between workloads the operator already runs on a
+//	  network they already control, commonly a mesh that provides mTLS below this
+//	  process. Refusing would break those deployments to protect them from a risk
+//	  they have already handled elsewhere — so it is stated at boot, every boot,
+//	  and left as the operator's call.
+//
+//	PARTIAL HTTP material
+//	  A boot error, same reasoning as the gRPC partial case. Absent material is
+//	  fine in any mode: the REST surface is behind a terminating proxy in every
+//	  sanctioned deployment.
+func initTransportSecurity() error {
+	GRPCTLSCertFile = strings.TrimSpace(kitconfig.GetEnv("SECRET_GRPC_CERT_FILE", ""))
+	GRPCTLSKeyFile = strings.TrimSpace(kitconfig.GetEnv("SECRET_GRPC_KEY_FILE", ""))
+	GRPCClientCAFile = strings.TrimSpace(kitconfig.GetEnv("SECRET_GRPC_CA_FILE", ""))
+
+	switch boolCount(GRPCTLSCertFile != "", GRPCTLSKeyFile != "", GRPCClientCAFile != "") {
+	case 3:
+		// Fully configured: mutual TLS, client certificate required and verified.
+	case 0:
+		if Mode == ModeCore && !IsDevelopment() {
+			return fmt.Errorf(
+				"config: MAINTAINERD_MODE=%s requires SECRET_GRPC_CERT_FILE, SECRET_GRPC_KEY_FILE and "+
+					"SECRET_GRPC_CA_FILE outside %s — in core mode the gRPC listener is the control plane "+
+					"through which this vault is provisioned, and it is never served in the clear. A bearer "+
+					"token asserts that the peer is core; a verified client certificate proves it",
+				ModeCore, EnvDevelopment)
+		}
+		if !IsDevelopment() {
+			slog.Warn("config: the gRPC listener has no TLS material — service-to-service traffic is PLAINTEXT",
+				"acceptable_only_if", "a service mesh or sidecar terminates mTLS in front of this process",
+				"to_enable", "SECRET_GRPC_CERT_FILE, SECRET_GRPC_KEY_FILE, SECRET_GRPC_CA_FILE")
+		}
+	default:
+		return fmt.Errorf(
+			"config: SECRET_GRPC_CERT_FILE, SECRET_GRPC_KEY_FILE and SECRET_GRPC_CA_FILE must be set " +
+				"together or not at all — a cert and key without a CA is server TLS that accepts any " +
+				"client, and a CA without a cert and key configures nothing while looking configured")
+	}
+
+	HTTPTLSCertFile = strings.TrimSpace(kitconfig.GetEnv("SECRET_TLS_CERT_FILE", ""))
+	HTTPTLSKeyFile = strings.TrimSpace(kitconfig.GetEnv("SECRET_TLS_KEY_FILE", ""))
+	if boolCount(HTTPTLSCertFile != "", HTTPTLSKeyFile != "") == 1 {
+		return fmt.Errorf(
+			"config: SECRET_TLS_CERT_FILE and SECRET_TLS_KEY_FILE must be set together or not at all; " +
+				"leave both unset to serve plain HTTP behind a terminating proxy")
+	}
+	return nil
+}
+
+// GRPCMutualTLSEnabled reports whether the gRPC listener will require and verify a
+// client certificate. All three files are present or none are (initTransportSecurity
+// refuses anything else), so one check answers it.
+func GRPCMutualTLSEnabled() bool {
+	return GRPCTLSCertFile != "" && GRPCTLSKeyFile != "" && GRPCClientCAFile != ""
+}
+
+// HTTPTLSEnabled reports whether the REST listener serves TLS directly.
+func HTTPTLSEnabled() bool { return HTTPTLSCertFile != "" && HTTPTLSKeyFile != "" }
+
+// initCoordination reads the two multi-replica switches.
+//
+// BOTH DEFAULT ON, and both warn rather than refuse when turned off. The reasoning is
+// the same for each: the correct behaviour must be what happens when nobody sets the
+// variable, because the failures these prevent are invisible in a healthy-looking
+// service — a secret rotated twice, or a reveal budget quietly multiplied by the
+// replica count. But turning either off is a legitimate choice for a single-replica
+// deployment or one that meters at its ingress, so it is a warning and not a wall.
+func initCoordination() error {
+	var err error
+	if LeaderElectionEnabled, err = boolEnv("SECRET_LEADER_ELECTION_ENABLED", true); err != nil {
+		return err
+	}
+	if RateLimitShared, err = boolEnv("SECRET_RATE_LIMIT_SHARED", true); err != nil {
+		return err
+	}
+	if !LeaderElectionEnabled {
+		slog.Warn("config: leader election is DISABLED — every replica runs the background workers",
+			"effect", "with more than one replica the same secret is rotated once per replica, "+
+				"each producing a version and a webhook fan-out",
+			"variable", "SECRET_LEADER_ELECTION_ENABLED")
+	}
+	if RateLimitShared && !RateLimitEnabled {
+		slog.Warn("config: SECRET_RATE_LIMIT_SHARED is set but rate limiting is off; it has no effect",
+			"variable", "SECRET_RATE_LIMIT_ENABLED")
+	}
+	if !RateLimitShared && RateLimitEnabled {
+		slog.Warn("config: the rate limit budget is PER-REPLICA — the shared counter is disabled",
+			"effect", "with N replicas a client that spreads its requests gets N times each configured budget",
+			"variable", "SECRET_RATE_LIMIT_SHARED")
+	}
+	return nil
+}
+
+// initWebhookRedrive reads the durable retry loop's bounds.
+//
+// The one CROSS-CHECK refuses a maximum backoff BELOW the base. That combination is
+// not merely odd, it silently flattens the schedule: every attempt would wait the cap,
+// so an exponential backoff an operator configured would behave as a fixed one. It is
+// the sort of mistake that only shows up as "why is this still retrying every thirty
+// seconds four hours later", so it is refused at boot with both numbers named.
+func initWebhookRedrive() error {
+	var err error
+	if WebhookRedriveEnabled, err = boolEnv("SECRET_WEBHOOK_REDRIVE_ENABLED", true); err != nil {
+		return err
+	}
+	if WebhookRedriveInterval, err = positiveDuration("SECRET_WEBHOOK_REDRIVE_INTERVAL", 30*time.Second); err != nil {
+		return err
+	}
+	if WebhookRedriveBatch, err = positiveInt("SECRET_WEBHOOK_REDRIVE_BATCH", 50); err != nil {
+		return err
+	}
+	if WebhookRedriveMaxAttempts, err = positiveInt("SECRET_WEBHOOK_REDRIVE_MAX_ATTEMPTS", 10); err != nil {
+		return err
+	}
+	if WebhookRedriveBaseBackoff, err = positiveDuration("SECRET_WEBHOOK_REDRIVE_BASE_BACKOFF", 30*time.Second); err != nil {
+		return err
+	}
+	if WebhookRedriveMaxBackoff, err = positiveDuration("SECRET_WEBHOOK_REDRIVE_MAX_BACKOFF", time.Hour); err != nil {
+		return err
+	}
+	if WebhookRedriveMaxBackoff < WebhookRedriveBaseBackoff {
+		return fmt.Errorf(
+			"config: SECRET_WEBHOOK_REDRIVE_MAX_BACKOFF (%s) must not be shorter than "+
+				"SECRET_WEBHOOK_REDRIVE_BASE_BACKOFF (%s); a cap below the first delay makes every "+
+				"retry wait the cap, which is a fixed backoff wearing an exponential one's name",
+			WebhookRedriveMaxBackoff, WebhookRedriveBaseBackoff)
+	}
+	if !WebhooksEnabled && WebhookRedriveEnabled {
+		slog.Warn("config: SECRET_WEBHOOK_REDRIVE_ENABLED is set but webhooks are off; the loop will not run",
+			"variable", "SECRET_WEBHOOKS_ENABLED")
+	}
+	return nil
+}
+
+// initConsole resolves CONSOLE_DIR and PROVES it is servable before the process
+// starts answering.
+//
+// The check is index.html specifically rather than "the directory exists", because
+// index.html is what every SPA deep link falls back to: a directory that exists but
+// has no shell produces a console whose every route is a 404, which is exactly the
+// failure this endpoint exists to prevent and the hardest one to read in a browser.
+// Failing at boot names the path.
+func initConsole() error {
+	ConsoleDir = strings.TrimSpace(kitconfig.GetEnv("CONSOLE_DIR", ""))
+	if ConsoleDir == "" {
+		return nil
+	}
+	index := filepath.Join(ConsoleDir, "index.html")
+	if _, err := os.Stat(index); err != nil {
+		return fmt.Errorf(
+			"config: CONSOLE_DIR is %q but %q is not readable (%v). Unset CONSOLE_DIR to disable "+
+				"serving the console from this process, or point it at the SPA's built output "+
+				"(the release image bakes it at /srv/console)",
+			ConsoleDir, index, err)
+	}
+	return nil
 }
 
 // initServerTimeouts reads the HTTP server and shutdown bounds.

@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+
+	"github.com/maintainerd/secret/internal/grpcserver"
 )
 
 // Serving and shutdown.
@@ -55,14 +57,42 @@ func serveHTTP(ctx context.Context, addr string, handler http.Handler, opts serv
 		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
 
+	// DIRECT TLS IS OPTIONAL ON THIS LISTENER, and that is a deployment fact rather
+	// than a relaxed standard. In every sanctioned deployment the REST surface sits
+	// behind a terminating proxy — nginx in the dev stack, an ingress in production —
+	// so mandating a certificate here would mean every operator generating one for a
+	// socket nothing external reaches. It is offered for the operator who serves the
+	// API directly, and when they do, it is served under the SAME version and cipher
+	// policy as the gRPC listener (grpcserver.BaseTLSConfig) rather than a second,
+	// drifting copy of it.
+	//
+	// HSTS is unaffected by this choice and already correct: SecurityHeaders emits it
+	// in production when the request arrived over TLS either directly (r.TLS != nil)
+	// or through a proxy that says so (X-Forwarded-Proto), so the terminating-proxy
+	// deployment is covered.
+	serveTLS := opts.TLSCertFile != "" && opts.TLSKeyFile != ""
+	if serveTLS {
+		srv.TLSConfig = grpcserver.BaseTLSConfig()
+	}
+
 	errCh := make(chan error, 1)
 	go func() {
 		slog.Info("http server listening", "addr", addr,
+			"tls", serveTLS,
 			"read_header_timeout", opts.ReadHeader.String(),
 			"read_timeout", opts.Read.String(),
 			"write_timeout", opts.Write.String(),
 			"idle_timeout", opts.Idle.String())
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		var err error
+		if serveTLS {
+			// The paths are passed here rather than pre-loaded into TLSConfig so a
+			// certificate error surfaces as this listener failing to start, naming
+			// the file, instead of as a handshake failure on the first request.
+			err = srv.ListenAndServeTLS(opts.TLSCertFile, opts.TLSKeyFile)
+		} else {
+			err = srv.ListenAndServe()
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
 	}()
@@ -131,4 +161,11 @@ type serverTimeouts struct {
 	Write      time.Duration
 	Idle       time.Duration
 	Shutdown   time.Duration
+
+	// TLSCertFile and TLSKeyFile serve this listener over TLS directly. Both empty
+	// means plain HTTP behind a terminating proxy, which is the common deployment.
+	// config refuses one without the other, so serveHTTP checks for both and never
+	// has to decide what half a configuration means.
+	TLSCertFile string
+	TLSKeyFile  string
 }

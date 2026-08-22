@@ -50,6 +50,22 @@ SELECT * FROM secrets WHERE tenant_id = $1 AND secret_uuid = $2 AND deleted_at I
 -- future column from joining a list response by accident. (The structural
 -- guarantee is stronger still: there is no ciphertext column on secrets to
 -- select. Both belts are worn.)
+--
+-- THE LATERAL JOIN SELECTS value_type AND NOTHING ELSE FROM secret_versions. That
+-- is the one column of the current version a listing needs, because it is what
+-- distinguishes a `reference` (a pointer of the form ${project/env/KEY}) from a
+-- literal credential — and without it a console has to issue one extra call PER ROW
+-- to find out. It is deliberately a narrow projection rather than `v.*`: this query
+-- is now the only place a listing touches the payload table at all, and the column
+-- list above is what makes "listing cannot leak a value" checkable by inspection.
+-- ciphertext, nonce, dek_wrapped and dek_nonce are not selected and must never be.
+--
+-- LEFT JOIN, not JOIN: a secret row can legitimately exist with no version (the
+-- window between CreateSecret and CreateSecretVersion, and any row whose
+-- current_version is still 0), and an inner join would make such a row vanish from
+-- its own listing. COALESCE to '' rather than letting the NULL through, because a
+-- NULL here would be a scan error on a listing rather than a missing badge in a UI —
+-- the column's absence must degrade, not fail.
 -- name: ListSecretMetaBySubtree :many
 SELECT
     s.secret_uuid,
@@ -66,9 +82,15 @@ SELECT
     s.rotated_at,
     s.expires_at,
     s.created_at,
-    s.updated_at
+    s.updated_at,
+    COALESCE(v.value_type, '')::varchar AS value_type
 FROM secrets s
 JOIN folders f ON f.folder_id = s.folder_id
+LEFT JOIN LATERAL (
+    SELECT sv.value_type FROM secret_versions sv
+    WHERE sv.secret_id = s.secret_id AND sv.version = s.current_version
+    LIMIT 1
+) v ON true
 WHERE s.tenant_id = sqlc.arg(tenant_id)
   AND s.environment_id = sqlc.arg(environment_id)
   AND (f.path = sqlc.arg(path) OR f.path LIKE sqlc.arg(path_pattern))
@@ -131,6 +153,26 @@ SET description     = sqlc.arg(description),
     expires_at      = sqlc.arg(expires_at),
     metadata        = sqlc.arg(metadata),
     updated_at      = now()
+WHERE tenant_id = sqlc.arg(tenant_id) AND secret_uuid = sqlc.arg(secret_uuid) AND deleted_at IS NULL
+RETURNING *;
+
+-- SetSecretLeasePolicy is a SEPARATE statement from UpdateSecretMeta, deliberately.
+--
+-- The lease policy decides whether a value can be read at all and how often; secret
+-- metadata is a description and some tags. Folding the two together would mean a
+-- routine description edit that omitted the lease fields silently removed the policy —
+-- the same argument that already keeps UpdateSecretMeta separate from PutSecret one
+-- level down. A caller clearing the policy has to say so by passing NULLs to THIS
+-- statement.
+--
+-- All three columns are set together because they are one policy: a TTL left beside a
+-- stale max_reads from a previous policy is not a state any caller asked for.
+-- name: SetSecretLeasePolicy :one
+UPDATE secrets
+SET lease_ttl_seconds     = sqlc.arg(lease_ttl_seconds),
+    lease_max_ttl_seconds = sqlc.arg(lease_max_ttl_seconds),
+    lease_max_reads       = sqlc.arg(lease_max_reads),
+    updated_at            = now()
 WHERE tenant_id = sqlc.arg(tenant_id) AND secret_uuid = sqlc.arg(secret_uuid) AND deleted_at IS NULL
 RETURNING *;
 

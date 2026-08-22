@@ -96,10 +96,12 @@ export function SecretDetailDialog({
   const meta = metaQuery.data
   const versions = useMemo(() => versionsQuery.data?.rows ?? [], [versionsQuery.data])
 
-  // The metadata type carries no value_type, so "is this a reference" is read
-  // from the CURRENT version's row — the only place the API exposes it.
-  const currentVersion = versions.find((version) => version.version === meta?.current_version)
-  const isReference = currentVersion?.value_type === VALUE_TYPE_REFERENCE
+  // "Is this a reference" comes from the METADATA now — `SecretMeta.value_type`
+  // is the current version's type, projected up by the service — so it is known
+  // as soon as the describe call lands and does not wait on the versions tab's
+  // query. It used to be read out of the fetched version list, which meant the
+  // badge appeared a beat late and could not be shown in the listing at all.
+  const isReference = meta?.value_type === VALUE_TYPE_REFERENCE
 
   const openReveal = (version?: number) => {
     setRevealVersion(version)

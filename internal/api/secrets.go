@@ -46,6 +46,14 @@ type Revealed struct {
 	// see what it actually read — a reference is an indirection, and "which secret
 	// did this value really come from" is not otherwise answerable.
 	ReferenceHops []string
+	// Lease is the read lease this reveal was served against, or nil when the secret
+	// carries no lease policy (which is almost every secret).
+	//
+	// It is RETURNED rather than kept internal because the caller is the only party
+	// that can act on it: a consumer that knows it has two reads left before its
+	// window resets can back off, whereas one that discovers the cap as a 403
+	// mid-incident cannot. The struct holds numbers and timestamps only.
+	Lease *store.SecretLease
 }
 
 // Reveal decrypts and returns a value. THIS IS THE PATH THE WHOLE SERVICE EXISTS TO
@@ -86,6 +94,16 @@ func (s *Service) Reveal(ctx context.Context, c Caller, addr SecretAddress, vers
 		return nil, err
 	}
 
+	// THE LEASE GATE, after the grant check and before anything is decrypted. It is a
+	// no-op for a secret with no lease policy, which is almost every secret; for one
+	// that has a policy it issues or consumes a lease and refuses a read past the
+	// allowance or past the secret's own expiry. See enforceReadLease for why a refusal
+	// is audited under its own action rather than as a denied reveal.
+	leaseDecision, err := s.enforceReadLease(ctx, c, ref, resourceMRN)
+	if err != nil {
+		return nil, err
+	}
+
 	var revealed *store.RevealedSecret
 	if version == 0 {
 		revealed, err = s.store.GetSecret(ctx, ref)
@@ -98,6 +116,9 @@ func (s *Service) Reveal(ctx context.Context, c Caller, addr SecretAddress, vers
 	}
 
 	out := &Revealed{Secret: revealed}
+	if leaseDecision != nil {
+		out.Lease = leaseDecision.Lease
+	}
 
 	// A reference is resolved BEFORE the audit row is written, so the row records
 	// what the caller actually obtained. Each hop writes its own row too (see
@@ -122,7 +143,7 @@ func (s *Service) Reveal(ctx context.Context, c Caller, addr SecretAddress, vers
 		ResourceMRN: resourceMRN,
 		SecretUUID:  &revealed.Meta.UUID,
 		Version:     int32Ptr(revealed.Version),
-		Metadata:    revealMetadata(revealed, out.ReferenceHops, resolved),
+		Metadata:    revealMetadata(revealed, out.ReferenceHops, resolved, out.Lease),
 	}); err != nil {
 		// The audit write failed. The value is destroyed rather than returned: a
 		// reveal nobody can prove happened is the one outcome this service must not
@@ -139,13 +160,25 @@ func (s *Service) Reveal(ctx context.Context, c Caller, addr SecretAddress, vers
 // imported_from is recorded when the value came from a scope import, because "the
 // caller asked staging for this key and received dev's value" is a fact an incident
 // review cannot reconstruct from the resource MRN alone.
-func revealMetadata(revealed *store.RevealedSecret, hops []string, resolved resolvedAddress) map[string]any {
+func revealMetadata(revealed *store.RevealedSecret, hops []string, resolved resolvedAddress, l *store.SecretLease) map[string]any {
 	meta := map[string]any{"value_type": revealed.ValueType}
 	if len(hops) > 0 {
 		meta["reference_hops"] = hops
 	}
 	if resolved.importedFrom != "" {
 		meta["imported_from"] = resolved.importedFrom
+	}
+	// The lease this read was served against, when the secret is lease-governed. It is
+	// recorded ON THE REVEAL ROW as well as on the lease-issue row, because the
+	// question an incident review asks is "how much of its allowance had this consumer
+	// spent when it read the value", and answering that from two separate rows means
+	// joining them by timestamp.
+	if l != nil {
+		meta["lease_uuid"] = l.UUID.String()
+		meta["lease_reads_used"] = l.ReadsUsed
+		if remaining, capped := l.Remaining(); capped {
+			meta["lease_reads_remaining"] = remaining
+		}
 	}
 	return meta
 }

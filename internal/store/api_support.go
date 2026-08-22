@@ -3,9 +3,11 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/maintainerd/secret/internal/platform/apperror"
 	"github.com/maintainerd/secret/internal/storage"
@@ -42,7 +44,29 @@ func (s *Service) DescribeSecret(ctx context.Context, ref SecretRef) (*SecretMet
 		return nil, mapReadError(err, "secret")
 	}
 	out := secretRowToMeta(row, addr.folder.Path, s.policy.KeepVersions)
+	out.ValueType = s.valueTypeFor(ctx, row.SecretID, row.CurrentVersion)
 	return &out, nil
+}
+
+// valueTypeFor reads the current version's declared type, or "" when there is none.
+//
+// IT NEVER FAILS THE READ. A metadata describe whose value_type lookup errored would
+// be a 500 on a call that already has every answer the caller asked for except a
+// display hint — so a missing or unreadable row degrades to an empty string, exactly
+// as the listing's COALESCE does. The one query it runs selects value_type alone and
+// reaches no payload column.
+func (s *Service) valueTypeFor(ctx context.Context, secretID int64, version int32) string {
+	if version < 1 {
+		return ""
+	}
+	valueType, err := s.repo.GetSecretVersionValueType(ctx, storage.GetSecretVersionValueTypeParams{
+		SecretID: secretID,
+		Version:  version,
+	})
+	if err != nil {
+		return ""
+	}
+	return valueType
 }
 
 // ---------------------------------------------------------------------------
@@ -251,23 +275,70 @@ type AuditEntry struct {
 	CreatedAt    time.Time      `json:"created_at"`
 }
 
-// ListAuditEvents pages a tenant's trail, newest first.
-func (s *Service) ListAuditEvents(ctx context.Context, tenantUUID uuid.UUID, page, limit int) ([]AuditEntry, int64, error) {
+// AuditFilter narrows an audit read. Every field is optional; the zero value is
+// "everything in this tenant, newest first".
+//
+// IT CANNOT WIDEN THE TENANT BOUNDARY. There is no tenant field here on purpose: the
+// tenant comes from the resolved caller and is a positional argument of the query, so
+// no combination of filters a caller can send reaches another tenant's trail.
+//
+// Action and Outcome are EXACT matches (they are closed sets a console renders as a
+// dropdown). ActorPrefix and ResourcePrefix are PREFIX matches, which is what an
+// operator actually types — part of a subject, or an MRN down to a project or an
+// environment. A prefix is a superset of an exact match (pass the whole subject and
+// you get exactly that subject), so nothing is lost by being the looser of the two,
+// and it is still one index scan.
+type AuditFilter struct {
+	Action         string
+	Outcome        string
+	ActorPrefix    string
+	ResourcePrefix string
+	// From and To are INCLUSIVE bounds on created_at. Nil means unbounded on that
+	// side, so a caller can ask "since Monday" without inventing an upper bound.
+	From *time.Time
+	To   *time.Time
+}
+
+// ListAuditEvents pages a tenant's trail, newest first, applying filter IN THE QUERY.
+//
+// THE FILTERS ARE NOT APPLIED IN GO, AND THAT IS THE WHOLE POINT. A caller that pages
+// the trail and then filters what it received answers "no matches" when it means "not
+// on this page" — and on an access trail those two answers are "nobody read that
+// credential" and "nobody read it in the last hundred rows", which is the difference
+// between closing an incident and missing one. The pagination caps are unchanged: the
+// filter narrows WHAT is counted and returned, never how much of it one response may
+// carry.
+func (s *Service) ListAuditEvents(ctx context.Context, tenantUUID uuid.UUID, filter AuditFilter, page, limit int) ([]AuditEntry, int64, error) {
 	tenant, err := s.repo.GetTenantByUUID(ctx, tenantUUID)
 	if err != nil {
 		return nil, 0, mapReadError(err, "tenant")
 	}
 	page, limit = normalizePage(page, limit)
 	tenantID := pgInt8(tenant.TenantID)
-	rows, err := s.repo.ListAuditEventsByTenant(ctx, storage.ListAuditEventsByTenantParams{
-		TenantID: tenantID,
-		Limit:    int32(limit),
-		Offset:   int32((page - 1) * limit),
+
+	rows, err := s.repo.ListAuditEventsFiltered(ctx, storage.ListAuditEventsFilteredParams{
+		TenantID:        tenantID,
+		Action:          pgTextOrNull(filter.Action),
+		Outcome:         pgTextOrNull(filter.Outcome),
+		ActorPattern:    pgTextOrNull(likePrefix(filter.ActorPrefix)),
+		ResourcePattern: pgTextOrNull(likePrefix(filter.ResourcePrefix)),
+		FromTime:        timestamptz(filter.From),
+		ToTime:          timestamptz(filter.To),
+		RowLimit:        int32(limit),
+		RowOffset:       int32((page - 1) * limit),
 	})
 	if err != nil {
 		return nil, 0, apperror.NewInternal("list audit events", err)
 	}
-	total, err := s.repo.CountAuditEventsByTenant(ctx, tenantID)
+	total, err := s.repo.CountAuditEventsFiltered(ctx, storage.CountAuditEventsFilteredParams{
+		TenantID:        tenantID,
+		Action:          pgTextOrNull(filter.Action),
+		Outcome:         pgTextOrNull(filter.Outcome),
+		ActorPattern:    pgTextOrNull(likePrefix(filter.ActorPrefix)),
+		ResourcePattern: pgTextOrNull(likePrefix(filter.ResourcePrefix)),
+		FromTime:        timestamptz(filter.From),
+		ToTime:          timestamptz(filter.To),
+	})
 	if err != nil {
 		return nil, 0, apperror.NewInternal("count audit events", err)
 	}
@@ -276,4 +347,36 @@ func (s *Service) ListAuditEvents(ctx context.Context, tenantUUID uuid.UUID, pag
 		out = append(out, toAuditEntry(r))
 	}
 	return out, total, nil
+}
+
+// likePrefix turns a literal prefix into a LIKE pattern that matches it and nothing
+// else, returning "" for an empty prefix so the caller can omit the predicate.
+//
+// THE ESCAPING IS THE POINT. Without it, an operator filtering for the MRN prefix
+// "mrn:secret:acme:app_one" would silently match "app-one" and "appXone" too, because
+// `_` is LIKE's single-character wildcard — and a filter that matches MORE rows than
+// asked for on an access trail is a review that draws the wrong conclusion. A `%`
+// typed into the box would match the whole trail. Backslash is escaped FIRST, or
+// escaping the wildcards would double-escape their new backslashes.
+//
+// The escape character is `\`, stated explicitly in the query's ESCAPE clause so the
+// pattern's meaning does not depend on a session setting.
+func likePrefix(prefix string) string {
+	if prefix == "" {
+		return ""
+	}
+	escaped := strings.ReplaceAll(prefix, `\`, `\\`)
+	escaped = strings.ReplaceAll(escaped, "%", `\%`)
+	escaped = strings.ReplaceAll(escaped, "_", `\_`)
+	return escaped + "%"
+}
+
+// pgTextOrNull maps an empty string to SQL NULL, which is how every optional filter
+// short-circuits its predicate to TRUE. An empty string as a VALUE would mean "match
+// rows whose action is the empty string" — a filter that returns nothing.
+func pgTextOrNull(v string) pgtype.Text {
+	if v == "" {
+		return pgtype.Text{}
+	}
+	return pgtype.Text{String: v, Valid: true}
 }

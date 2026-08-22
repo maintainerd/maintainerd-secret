@@ -127,6 +127,8 @@ export const API_CONFIG = {
  * logs and browser history, and a request body does not.
  */
 export const API_ENDPOINTS = {
+  /** Unauthenticated: what this instance can tell an anonymous caller about itself. */
+  CAPABILITIES: '/capabilities',
   SETUP: '/setup',
   SETUP_STATUS: '/setup/status',
   PROJECTS: '/projects',

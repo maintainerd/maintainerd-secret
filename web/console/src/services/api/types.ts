@@ -108,9 +108,15 @@ export interface SecretAddress {
 /**
  * Everything about a secret EXCEPT its value — what a list renders.
  *
- * Note there is no `value_type` here: the service's metadata type does not carry
- * one. Whether a secret is a reference is read from its current version (see
- * `VersionMeta.value_type` on `/secrets/versions`).
+ * `value_type` IS metadata and is carried here. It is the current version's
+ * declared type, projected up by the service (it lives on `secret_versions` in
+ * the schema), and it is the one field that distinguishes a `reference` — a
+ * POINTER of the form `${project/environment/KEY}` — from a literal credential.
+ * Before it existed the console had to fetch each row's version history to find
+ * out, one extra call per row, so the reference indicator only appeared in the
+ * detail dialog: the one place an operator has already stopped scanning the list.
+ *
+ * Empty string when the secret has no version yet.
  */
 export interface SecretMeta {
   secret_uuid: string
@@ -121,6 +127,8 @@ export interface SecretMeta {
   current_version: number
   keep_versions: number
   rotation_policy: RotationPolicy | Record<string, never>
+  /** `opaque`, `json` or `reference` — the CURRENT version's type. */
+  value_type: string
   mrn_resource_path: string
   mrn: string
   rotated_at?: string
@@ -334,6 +342,44 @@ export interface SetupStatus {
   environment?: string
   permissions?: string[]
   rest_wizard_open: boolean
+}
+
+// ---------------------------------------------------------------------------
+// Capabilities
+// ---------------------------------------------------------------------------
+
+/** The guard postures the service reports. */
+export type GuardMode = 'enforced' | 'dev-open' | 'unavailable'
+
+/**
+ * What `GET /capabilities` reports — UNAUTHENTICATED, because it answers the
+ * questions a client has to settle before it can hold a token.
+ *
+ * IT REPLACES AN INFERENCE. The console used to conclude "the guard must be
+ * dev-open" from the absence of identity settings in its OWN configuration,
+ * which is a guess about the server made from the client's config file — wrong
+ * in both directions. Now the server says.
+ *
+ * Nothing here is sensitive: the service name is a constant, the version is
+ * already public as an image tag, the guard mode is determinable in one
+ * unauthenticated request anyway, `setup_complete` is the same single bit
+ * `/setup/status` returns anonymously, and `auth` is present only when the guard
+ * is enforced and carries only values that appear in the clear in every token
+ * the service verifies.
+ */
+export interface Capabilities {
+  service: string
+  version: string
+  guard_mode: GuardMode | string
+  setup_complete: boolean
+  run_mode: 'standalone' | 'core' | string
+  /** Present only when `guard_mode` is `enforced`. */
+  auth?: {
+    issuer: string
+    audience: string
+  }
+  /** True when the service is serving this console itself. */
+  console: boolean
 }
 
 export interface SetupRequest {

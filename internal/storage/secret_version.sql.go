@@ -197,6 +197,31 @@ func (q *Queries) GetSecretVersion(ctx context.Context, arg GetSecretVersionPara
 	return i, err
 }
 
+const getSecretVersionValueType = `-- name: GetSecretVersionValueType :one
+SELECT value_type FROM secret_versions WHERE secret_id = $1 AND version = $2
+`
+
+type GetSecretVersionValueTypeParams struct {
+	SecretID int64 `json:"secret_id"`
+	Version  int32 `json:"version"`
+}
+
+// GetSecretVersionValueType answers "is this secret a reference or a literal?" for
+// ONE secret, which is what the single-secret metadata paths (describe, a metadata
+// edit, a restore) need to fill SecretMeta.ValueType. The listing gets the same
+// column from its own LATERAL join (secret.sql) so it never runs this per row.
+//
+// It selects value_type ALONE. A describe that fetched the version row and discarded
+// the payload would put ciphertext in a handler's locals for a metadata read, and
+// would make the "describe never reaches secret_versions' payload" property something
+// a reviewer has to trace rather than read.
+func (q *Queries) GetSecretVersionValueType(ctx context.Context, arg GetSecretVersionValueTypeParams) (string, error) {
+	row := q.db.QueryRow(ctx, getSecretVersionValueType, arg.SecretID, arg.Version)
+	var value_type string
+	err := row.Scan(&value_type)
+	return value_type, err
+}
+
 const listPrunableVersions = `-- name: ListPrunableVersions :many
 SELECT v.version_id, v.version FROM secret_versions v
 WHERE v.secret_id = $1

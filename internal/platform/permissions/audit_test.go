@@ -290,6 +290,26 @@ var justifiedExemptPaths = map[string]string{
 		"SETUP_BOOTSTRAP_TOKEN compared in constant time, rate-limited per client IP, " +
 		"and refused outright once an orchestrator owns the instance or " +
 		"MAINTAINERD_MODE=core declares one will.",
+	permissions.CapabilitiesPath: "the capability probe. It answers what a client must know BEFORE " +
+		"it can hold a token — is the guard enforced or dev-open, is this instance " +
+		"provisioned, and which issuer and audience a token must carry — so requiring a " +
+		"token to ask would be circular. It is exempt because it is UNAUTHENTICATABLE, " +
+		"not because it is convenient, and it replaces a console that INFERRED the " +
+		"server's posture from the absence of settings in its own config file (wrong in " +
+		"both directions: an enforced service renders as open and 401s, an open one sends " +
+		"the operator into an OAuth flow nobody is listening for).\n" +
+		"Every field is a constant, a bit already disclosed anonymously elsewhere, or a " +
+		"value that appears in the clear in every token this service verifies: service " +
+		"name (constant); version (already public as an image tag); guard mode " +
+		"(determinable in one unauthenticated request by reading whether a guarded route " +
+		"answers 401, 503 or 200); setup_complete (the same single bit /setup/status and " +
+		"SecretService/Ping already return anonymously); run mode (implied today by " +
+		"rest_wizard_open); and, ONLY when the guard is enforced, the issuer and " +
+		"audience. It has no write path and no side effect. Explicitly NOT disclosed: " +
+		"any client secret, the JWKS URL (routinely an internal address, and a client " +
+		"never needs it), the guard's Reason string, any tenant, project, permission " +
+		"list, hostname or file path. The one database-backed field is memoized " +
+		"in-process, so an anonymous flood cannot amplify into query load.",
 }
 
 // justifiedExemptMethods is the same for gRPC, matched EXACTLY. A prefix
@@ -512,9 +532,12 @@ func TestEveryExemptPathIsJustified(t *testing.T) {
 		"the justification list and the exemption list must be the same set")
 }
 
-// TestTheGuardedGroupHasNoUnexpectedExemptions. Exactly three HTTP paths are
-// served unguarded, and two of them are probes. If that count moves, somebody has
-// opened a door.
+// TestTheGuardedGroupHasNoUnexpectedExemptions. Exactly four HTTP surfaces are
+// served unguarded: two probes, the first-run wizard and the capability probe. Every
+// one of them is unauthenticatable by construction — it must answer before the caller
+// can hold a token — and none has a write path. If that set moves, somebody has
+// opened a door. The list is written out in full rather than counted so that a
+// SUBSTITUTION (one exemption traded for another) fails as loudly as an addition.
 func TestTheGuardedGroupHasNoUnexpectedExemptions(t *testing.T) {
 	var exempt []string
 	for _, r := range walkREST(t) {
@@ -526,9 +549,29 @@ func TestTheGuardedGroupHasNoUnexpectedExemptions(t *testing.T) {
 	assert.Equal(t, []string{
 		"GET /healthz",
 		"GET /readyz",
+		"GET /api/v1/capabilities",
 		"GET /api/v1/setup/status",
 		"POST /api/v1/setup/",
 	}, sortedLikeExpected(exempt), "the unguarded HTTP surface changed")
+}
+
+// TestNoExemptSurfaceCanMutate is the property that makes the exemption list safe to
+// grow: an unguarded route may DISCLOSE bounded facts, but it must never accept a
+// write. The setup wizard is the sole POST, and it carries its own bootstrap-token
+// gate plus a one-shot lock, so it is named explicitly rather than pattern-matched.
+func TestNoExemptSurfaceCanMutate(t *testing.T) {
+	const selfGuardedWriter = "POST /api/v1/setup/"
+	for _, r := range walkREST(t) {
+		if !permissions.Map().IsExempt(sdkauthz.Surface{Path: r.pattern, HTTPMethod: r.method}) {
+			continue
+		}
+		surface := r.method + " " + r.pattern
+		if surface == selfGuardedWriter {
+			continue
+		}
+		assert.Equal(t, http.MethodGet, r.method,
+			"exempt surface %q takes a non-GET method; an unguarded route must not mutate", surface)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -990,8 +1033,9 @@ func sortedLikeExpected(got []string) []string {
 	order := map[string]int{
 		"GET /healthz":             0,
 		"GET /readyz":              1,
-		"GET /api/v1/setup/status": 2,
-		"POST /api/v1/setup/":      3,
+		"GET /api/v1/capabilities": 2,
+		"GET /api/v1/setup/status": 3,
+		"POST /api/v1/setup/":      4,
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		oi, oki := order[out[i]]

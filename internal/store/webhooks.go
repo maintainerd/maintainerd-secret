@@ -451,13 +451,34 @@ func (s *Service) OpenWebhookDelivery(ctx context.Context, tenantUUID uuid.UUID,
 	return row.DeliveryID, row.DeliveryUuid, nil
 }
 
+// Delivery statuses. They are exported because two packages decide them — the
+// notifier's inline path and the re-drive worker — and a status one of them writes
+// and the other does not recognise would be a delivery that never gets picked up.
+//
+// WebhookDeliveryRetrying is the one that carries a schedule: the row has failed so
+// far and next_attempt_at says when the worker may try again. The other three are
+// terminal (pending is terminal only in the sense that nothing schedules it; it means
+// an attempt sequence is in flight or the process died holding it).
+const (
+	WebhookDeliveryPending  = "pending"
+	WebhookDeliverySuccess  = "success"
+	WebhookDeliveryRetrying = "retrying"
+	WebhookDeliveryFailed   = "failed"
+)
+
 // FinishWebhookDelivery records the outcome of a delivery attempt sequence.
-func (s *Service) FinishWebhookDelivery(ctx context.Context, deliveryID int64, attempts int32, status string, responseStatus *int32, failure string) error {
+//
+// nextAttempt hands the row to the RE-DRIVE WORKER and must be non-nil exactly when
+// status is WebhookDeliveryRetrying — the table's CHECK constraint refuses a schedule
+// on a terminal row, so getting it wrong is a loud error rather than a duplicate
+// delivery to a customer's endpoint.
+func (s *Service) FinishWebhookDelivery(ctx context.Context, deliveryID int64, attempts int32, status string, responseStatus *int32, failure string, nextAttempt *time.Time) error {
 	params := storage.FinishWebhookDeliveryParams{
-		AttemptCount: attempts,
-		Status:       status,
-		Error:        failure,
-		DeliveryID:   deliveryID,
+		AttemptCount:  attempts,
+		Status:        status,
+		Error:         failure,
+		NextAttemptAt: timestamptz(nextAttempt),
+		DeliveryID:    deliveryID,
 	}
 	if responseStatus != nil {
 		params.ResponseStatus = pgInt4(*responseStatus)
@@ -466,6 +487,164 @@ func (s *Service) FinishWebhookDelivery(ctx context.Context, deliveryID int64, a
 		return apperror.NewInternal("finish webhook delivery", err)
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Re-drive
+// ---------------------------------------------------------------------------
+
+// RedriveDelivery is one claimed delivery, with everything a retry needs and nothing
+// else. NOTE WHAT IS NOT HERE: no signing key. The key is fetched separately, per
+// attempt, through SignedWebhookEndpoint so that a batch of claimed rows is not a
+// batch of decrypted HMAC keys sitting in memory for the length of a pass.
+type RedriveDelivery struct {
+	ID   int64
+	UUID uuid.UUID
+	// EndpointID addresses the endpoint. A retry never takes an endpoint UUID from a
+	// caller — there is no caller — so this is the only handle it has.
+	EndpointID int64
+	TenantUUID uuid.UUID
+	EventType  string
+	// Payload is the EXACT body the first attempt signed and sent, replayed verbatim.
+	// Re-marshalling it would risk delivering something subtly different from what was
+	// announced, and the delivery log would no longer be a record of what was sent.
+	Payload []byte
+	// RedriveAttempts is how much of the durable budget this row has already spent.
+	RedriveAttempts int32
+	AttemptCount    int32
+	ResourceMRN     string
+}
+
+// ClaimDeliveriesForRedrive takes ownership of up to limit due deliveries.
+//
+// THE CLAIM IS THE CONCURRENCY CONTROL. It runs FOR UPDATE SKIP LOCKED and pushes
+// next_attempt_at forward by lease before returning, so two replicas ticking at the
+// same instant take disjoint batches and a replica that dies mid-attempt releases its
+// rows automatically when the lease expires. lease must therefore be comfortably
+// longer than one attempt's timeout.
+func (s *Service) ClaimDeliveriesForRedrive(ctx context.Context, limit int, lease time.Duration) ([]RedriveDelivery, error) {
+	if limit < 1 {
+		return nil, nil
+	}
+	leaseSeconds := int32(lease.Seconds())
+	if leaseSeconds < 1 {
+		leaseSeconds = 1
+	}
+	rows, err := s.repo.ClaimWebhookDeliveriesForRedrive(ctx, storage.ClaimWebhookDeliveriesForRedriveParams{
+		RowLimit:     int32(limit),
+		LeaseSeconds: leaseSeconds,
+	})
+	if err != nil {
+		return nil, apperror.NewInternal("claim webhook deliveries for re-drive", err)
+	}
+	out := make([]RedriveDelivery, 0, len(rows))
+	for _, r := range rows {
+		// The tenant UUID is resolved per row rather than joined into the claim: the
+		// claim is an UPDATE ... RETURNING and every extra joined column widens the
+		// row lock's projection for no gain. A tenant that has vanished under a
+		// claimed delivery leaves nothing to deliver, so the row is skipped and its
+		// lease lets the next pass see it again (and its endpoint lookup will fail,
+		// which is what finally abandons it).
+		tenant, terr := s.repo.GetTenantByID(ctx, r.TenantID)
+		if terr != nil {
+			continue
+		}
+		out = append(out, RedriveDelivery{
+			ID:              r.DeliveryID,
+			UUID:            r.DeliveryUuid,
+			EndpointID:      r.EndpointID,
+			TenantUUID:      tenant.TenantUuid,
+			EventType:       r.EventType,
+			Payload:         r.Payload,
+			RedriveAttempts: r.RedriveAttempts,
+			AttemptCount:    r.AttemptCount,
+			ResourceMRN:     r.ResourceMrn,
+		})
+	}
+	return out, nil
+}
+
+// SignedEndpointByID returns one endpoint with its signing key decrypted, for a retry.
+// The caller MUST Zero it.
+//
+// A DELETED ENDPOINT IS A NOT-FOUND, and that is how the worker learns to abandon a
+// delivery rather than retry it forever: an operator who removed an endpoint has said
+// they no longer want its notifications, including the backlog. A DISABLED endpoint
+// still resolves — disabling stops new events, it does not withdraw the
+// acknowledgement of one already announced.
+func (s *Service) SignedEndpointByID(ctx context.Context, endpointID int64) (*SignedWebhookEndpoint, error) {
+	row, err := s.repo.GetSignedWebhookEndpointByID(ctx, endpointID)
+	if err != nil {
+		return nil, mapReadError(err, "webhook endpoint")
+	}
+	provider, err := s.ring.Provider(row.KekID)
+	if err != nil {
+		// The key was wrapped under a root key this process was not given. That is a
+		// configuration gap, not a dead delivery: returning an error leaves the row
+		// scheduled so it succeeds once the operator supplies the key.
+		return nil, apperror.NewUnavailable("the webhook signing key is wrapped under a root key this process does not hold")
+	}
+	key, err := crypto.Open(provider, webhookIdentity(row.TenantUuid, row.EndpointUuid), crypto.Envelope{
+		Ciphertext: row.SecretCiphertext,
+		Nonce:      row.SecretNonce,
+		DEKWrapped: row.SecretDekWrapped,
+		DEKNonce:   row.SecretDekNonce,
+		KEKID:      row.KekID,
+	})
+	if err != nil {
+		return nil, apperror.NewInternal("open webhook signing key", err)
+	}
+	return &SignedWebhookEndpoint{
+		ID:             row.EndpointID,
+		UUID:           row.EndpointUuid,
+		URL:            row.Url,
+		Events:         decodeStringList(row.Events),
+		TimeoutSeconds: row.TimeoutSeconds,
+		MaxAttempts:    row.MaxAttempts,
+		SigningKey:     key,
+	}, nil
+}
+
+// RecordRedriveOutcome records one worker attempt: it advances both counters, sets the
+// status, and schedules or clears the next attempt.
+//
+// nextAttempt must be non-nil exactly when status is WebhookDeliveryRetrying, for the
+// reason FinishWebhookDelivery states.
+func (s *Service) RecordRedriveOutcome(ctx context.Context, deliveryID int64, status string, responseStatus *int32, failure string, nextAttempt *time.Time) error {
+	params := storage.RecordWebhookRedriveOutcomeParams{
+		Status:        status,
+		Error:         failure,
+		NextAttemptAt: timestamptz(nextAttempt),
+		DeliveryID:    deliveryID,
+	}
+	if responseStatus != nil {
+		params.ResponseStatus = pgInt4(*responseStatus)
+	}
+	if _, err := s.repo.RecordWebhookRedriveOutcome(ctx, params); err != nil {
+		return apperror.NewInternal("record webhook re-drive outcome", err)
+	}
+	return nil
+}
+
+// AbandonDelivery marks a delivery permanently failed without spending an attempt,
+// for when there is nothing left to attempt against (the endpoint is gone).
+func (s *Service) AbandonDelivery(ctx context.Context, deliveryID int64, reason string) error {
+	if _, err := s.repo.AbandonWebhookDelivery(ctx, storage.AbandonWebhookDeliveryParams{
+		Error:      reason,
+		DeliveryID: deliveryID,
+	}); err != nil {
+		return apperror.NewInternal("abandon webhook delivery", err)
+	}
+	return nil
+}
+
+// CountDeliveriesAwaitingRedrive is the backlog depth, for the worker's log line.
+func (s *Service) CountDeliveriesAwaitingRedrive(ctx context.Context) (int64, error) {
+	n, err := s.repo.CountWebhookDeliveriesAwaitingRedrive(ctx)
+	if err != nil {
+		return 0, apperror.NewInternal("count webhook deliveries awaiting re-drive", err)
+	}
+	return n, nil
 }
 
 // TouchWebhookEndpoint records that an endpoint was just notified.

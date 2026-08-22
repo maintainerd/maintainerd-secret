@@ -298,8 +298,15 @@ func (s *Service) getVersion(ctx context.Context, ref SecretRef, version int32) 
 		return nil, apperror.NewInternal("decrypt secret version", err)
 	}
 
+	meta := secretRowToMeta(row, addr.folder.Path, s.policy.KeepVersions)
+	// The version row is already in hand, so the metadata's value_type comes from it
+	// directly rather than through valueTypeFor's extra query. Note this is the type
+	// of the version being REVEALED, which for a pinned older version can legitimately
+	// differ from the current one — and reporting the version you asked about is the
+	// honest answer on a reveal.
+	meta.ValueType = versionRow.ValueType
 	return &RevealedSecret{
-		Meta:      secretRowToMeta(row, addr.folder.Path, s.policy.KeepVersions),
+		Meta:      meta,
 		Version:   versionRow.Version,
 		ValueType: versionRow.ValueType,
 		Value:     plaintext,
@@ -458,6 +465,7 @@ func (s *Service) UpdateSecretMeta(ctx context.Context, in UpdateSecretMetaInput
 		return nil, mapReadError(err, "secret")
 	}
 	out := secretRowToMeta(updated, addr.folder.Path, s.policy.KeepVersions)
+	out.ValueType = s.valueTypeFor(ctx, updated.SecretID, updated.CurrentVersion)
 	return &out, nil
 }
 
@@ -555,6 +563,7 @@ func (s *Service) RestoreSecret(ctx context.Context, tenantUUID, secretUUID uuid
 		return nil, mapReadError(err, "folder")
 	}
 	out := secretRowToMeta(restored, folder.Path, s.policy.KeepVersions)
+	out.ValueType = s.valueTypeFor(ctx, restored.SecretID, restored.CurrentVersion)
 	return &out, nil
 }
 

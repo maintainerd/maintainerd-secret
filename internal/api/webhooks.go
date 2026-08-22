@@ -169,12 +169,18 @@ func (s *Service) ListWebhookDeliveries(ctx context.Context, c Caller, in ListWe
 	return deliveries, total, nil
 }
 
-// ListAuditEvents pages the tenant's access trail, newest first.
+// ListAuditEvents pages and filters the tenant's access trail, newest first.
 //
 // READING THE TRAIL IS ITSELF AUDITED. That is not recursion for its own sake: the
 // first move of an attacker who has read a credential is to find out what the trail
 // says about it, so "who read the audit log" is a first-class signal. The row this
 // call writes is the one that catches that.
+//
+// THE FILTER IS RECORDED ON THAT ROW. "Somebody read the audit trail" and "somebody
+// searched the audit trail for every reveal of the production database password by one
+// subject" are different events, and the second is the one an incident review wants to
+// see. The filter contains no secret — it is a caller's own query terms — so recording
+// it costs nothing and answers what the reader was looking for.
 func (s *Service) ListAuditEvents(ctx context.Context, c Caller, in ListAuditEventsInput) ([]store.AuditEntry, int64, error) {
 	if err := validate(in); err != nil {
 		return nil, 0, err
@@ -184,15 +190,19 @@ func (s *Service) ListAuditEvents(ctx context.Context, c Caller, in ListAuditEve
 	if err := s.guard(ctx, c, permissions.PermReadAudit, store.ActionAuditRead, resourceMRN); err != nil {
 		return nil, 0, err
 	}
-	entries, total, err := s.store.ListAuditEvents(ctx, c.TenantUUID, page, limit)
+	entries, total, err := s.store.ListAuditEvents(ctx, c.TenantUUID, in.filter(), page, limit)
 	if err != nil {
 		s.recordFailure(ctx, c, store.ActionAuditRead, resourceMRN, err)
 		return nil, 0, err
 	}
+	metadata := map[string]any{"returned": len(entries), "total": total}
+	for key, value := range in.auditMetadata() {
+		metadata[key] = value
+	}
 	if err := s.recordSuccess(ctx, c, audit.Event{
 		Action:      store.ActionAuditRead,
 		ResourceMRN: resourceMRN,
-		Metadata:    map[string]any{"returned": len(entries), "total": total},
+		Metadata:    metadata,
 	}); err != nil {
 		return nil, 0, err
 	}

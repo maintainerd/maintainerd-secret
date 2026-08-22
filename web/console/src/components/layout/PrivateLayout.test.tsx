@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { cleanup, render, screen } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { PrivateLayout } from './PrivateLayout'
 import { AuthContext, type AuthContextValue } from '@/auth/authContext'
@@ -45,7 +45,11 @@ function auth(mode: AuthContextValue['mode']): AuthContextValue {
   return {
     mode,
     ready: true,
-    identity: mode === 'guard-open' ? null : null,
+    identity: null,
+    // Deliberately null. The shell must render each state from `mode` alone; if a
+    // banner or chip ever needed the raw capability payload to decide what to say,
+    // these tests would start passing for the wrong reason.
+    capabilities: null,
     signIn: vi.fn(),
     signOut: vi.fn(),
   }
@@ -104,18 +108,53 @@ describe('PrivateLayout', () => {
     renderShell('authenticated')
     expect(screen.getByText('Guarded')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /signed in/i })).toBeInTheDocument()
-    expect(screen.queryByText(/No identity is configured/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/development-open/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/no identity configured/)).not.toBeInTheDocument()
   })
 
   it('shows a permanent, non-dismissible banner in guard-open mode', () => {
     renderShell('guard-open')
 
-    const banner = screen.getByText(/No identity is configured/)
-    expect(banner).toBeInTheDocument()
+    expect(screen.getByText(/reports its guard is development-open/)).toBeInTheDocument()
     expect(screen.getByText('Guard open')).toBeInTheDocument()
     // No close/dismiss affordance anywhere in the banner.
     expect(
       screen.queryByRole('button', { name: /dismiss|close banner/i }),
     ).not.toBeInTheDocument()
+  })
+
+  it('shows a different banner when the service enforces and no identity is configured', () => {
+    renderShell('identity-missing')
+
+    expect(
+      screen.getByText(/enforces authentication and this console has no identity configured/),
+    ).toBeInTheDocument()
+    // It must name the settings to set, or the operator has nothing to act on.
+    expect(screen.getByText('SECRET_CONSOLE_CLIENT_ID')).toBeInTheDocument()
+    expect(
+      screen.queryByRole('button', { name: /dismiss|close banner/i }),
+    ).not.toBeInTheDocument()
+  })
+
+  // The regression that motivated splitting the two modes apart. They were one state,
+  // so the console could not distinguish "no token is needed" from "a token is needed
+  // and I cannot get one" — opposite situations where only one is safe. Asserting each
+  // banner separately would still pass if both rendered the same words, so this asserts
+  // the DISTINCTION directly, in both the banner and the chip.
+  it('never describes the two enforcement states the same way', () => {
+    renderShell('guard-open')
+    expect(screen.getByText('Guard open')).toBeInTheDocument()
+    expect(
+      screen.queryByText(/enforces authentication and this console has no identity configured/),
+    ).not.toBeInTheDocument()
+
+    cleanup()
+
+    renderShell('identity-missing')
+    // Not "Guarded": the service IS enforcing, so that would be true and misleading —
+    // the operator would read a reassuring chip while every request comes back 401.
+    expect(screen.getByText('No credentials')).toBeInTheDocument()
+    expect(screen.queryByText('Guarded')).not.toBeInTheDocument()
+    expect(screen.queryByText(/reports its guard is development-open/)).not.toBeInTheDocument()
   })
 })

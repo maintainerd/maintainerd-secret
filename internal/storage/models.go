@@ -31,6 +31,46 @@ type AuditLog struct {
 	CreatedAt    time.Time   `json:"created_at"`
 }
 
+type DynamicLease struct {
+	LeaseID        int64              `json:"lease_id"`
+	LeaseUuid      uuid.UUID          `json:"lease_uuid"`
+	RoleID         int64              `json:"role_id"`
+	TenantID       int64              `json:"tenant_id"`
+	DbRoleName     string             `json:"db_role_name"`
+	ResourceMrn    string             `json:"resource_mrn"`
+	Requester      string             `json:"requester"`
+	RequesterKind  string             `json:"requester_kind"`
+	IssuedAt       time.Time          `json:"issued_at"`
+	ExpiresAt      time.Time          `json:"expires_at"`
+	RevokedAt      pgtype.Timestamptz `json:"revoked_at"`
+	RevokeReason   string             `json:"revoke_reason"`
+	RevokeError    string             `json:"revoke_error"`
+	RevokeAttempts int32              `json:"revoke_attempts"`
+	Metadata       []byte             `json:"metadata"`
+	CreatedAt      time.Time          `json:"created_at"`
+	UpdatedAt      time.Time          `json:"updated_at"`
+}
+
+type DynamicRole struct {
+	RoleID            int64              `json:"role_id"`
+	RoleUuid          uuid.UUID          `json:"role_uuid"`
+	TenantID          int64              `json:"tenant_id"`
+	ProjectID         int64              `json:"project_id"`
+	Name              string             `json:"name"`
+	Description       string             `json:"description"`
+	DsnSecretRef      string             `json:"dsn_secret_ref"`
+	CreationSql       string             `json:"creation_sql"`
+	RevocationSql     string             `json:"revocation_sql"`
+	DefaultTtlSeconds int32              `json:"default_ttl_seconds"`
+	MaxTtlSeconds     int32              `json:"max_ttl_seconds"`
+	RoleNamePrefix    string             `json:"role_name_prefix"`
+	Status            string             `json:"status"`
+	Metadata          []byte             `json:"metadata"`
+	CreatedAt         time.Time          `json:"created_at"`
+	UpdatedAt         time.Time          `json:"updated_at"`
+	DeletedAt         pgtype.Timestamptz `json:"deleted_at"`
+}
+
 type Environment struct {
 	EnvironmentID   int64              `json:"environment_id"`
 	EnvironmentUuid uuid.UUID          `json:"environment_uuid"`
@@ -105,31 +145,53 @@ type ScopeImport struct {
 }
 
 type Secret struct {
-	SecretID        int64              `json:"secret_id"`
-	SecretUuid      uuid.UUID          `json:"secret_uuid"`
-	TenantID        int64              `json:"tenant_id"`
-	ProjectID       int64              `json:"project_id"`
-	EnvironmentID   int64              `json:"environment_id"`
-	FolderID        int64              `json:"folder_id"`
-	MrnService      string             `json:"mrn_service"`
-	MrnTenant       string             `json:"mrn_tenant"`
-	MrnProject      string             `json:"mrn_project"`
-	MrnResourcePath string             `json:"mrn_resource_path"`
-	Key             string             `json:"key"`
-	Description     string             `json:"description"`
-	Tags            []byte             `json:"tags"`
-	CurrentVersion  int32              `json:"current_version"`
-	KeepVersions    pgtype.Int4        `json:"keep_versions"`
-	RotationPolicy  []byte             `json:"rotation_policy"`
-	RotatedAt       pgtype.Timestamptz `json:"rotated_at"`
-	ExpiresAt       pgtype.Timestamptz `json:"expires_at"`
-	Metadata        []byte             `json:"metadata"`
-	CreatedBy       pgtype.Int8        `json:"created_by"`
-	UpdatedBy       pgtype.Int8        `json:"updated_by"`
-	CreatedAt       time.Time          `json:"created_at"`
-	UpdatedAt       time.Time          `json:"updated_at"`
-	DeletedAt       pgtype.Timestamptz `json:"deleted_at"`
-	DestroyAfter    pgtype.Timestamptz `json:"destroy_after"`
+	SecretID           int64              `json:"secret_id"`
+	SecretUuid         uuid.UUID          `json:"secret_uuid"`
+	TenantID           int64              `json:"tenant_id"`
+	ProjectID          int64              `json:"project_id"`
+	EnvironmentID      int64              `json:"environment_id"`
+	FolderID           int64              `json:"folder_id"`
+	MrnService         string             `json:"mrn_service"`
+	MrnTenant          string             `json:"mrn_tenant"`
+	MrnProject         string             `json:"mrn_project"`
+	MrnResourcePath    string             `json:"mrn_resource_path"`
+	Key                string             `json:"key"`
+	Description        string             `json:"description"`
+	Tags               []byte             `json:"tags"`
+	CurrentVersion     int32              `json:"current_version"`
+	KeepVersions       pgtype.Int4        `json:"keep_versions"`
+	RotationPolicy     []byte             `json:"rotation_policy"`
+	RotatedAt          pgtype.Timestamptz `json:"rotated_at"`
+	ExpiresAt          pgtype.Timestamptz `json:"expires_at"`
+	LeaseTtlSeconds    pgtype.Int4        `json:"lease_ttl_seconds"`
+	LeaseMaxTtlSeconds pgtype.Int4        `json:"lease_max_ttl_seconds"`
+	LeaseMaxReads      pgtype.Int4        `json:"lease_max_reads"`
+	Metadata           []byte             `json:"metadata"`
+	CreatedBy          pgtype.Int8        `json:"created_by"`
+	UpdatedBy          pgtype.Int8        `json:"updated_by"`
+	CreatedAt          time.Time          `json:"created_at"`
+	UpdatedAt          time.Time          `json:"updated_at"`
+	DeletedAt          pgtype.Timestamptz `json:"deleted_at"`
+	DestroyAfter       pgtype.Timestamptz `json:"destroy_after"`
+}
+
+type SecretLease struct {
+	LeaseID       int64              `json:"lease_id"`
+	LeaseUuid     uuid.UUID          `json:"lease_uuid"`
+	TenantID      int64              `json:"tenant_id"`
+	SecretID      int64              `json:"secret_id"`
+	ResourceMrn   string             `json:"resource_mrn"`
+	Requester     string             `json:"requester"`
+	RequesterKind string             `json:"requester_kind"`
+	IssuedAt      time.Time          `json:"issued_at"`
+	ExpiresAt     time.Time          `json:"expires_at"`
+	MaxReads      pgtype.Int4        `json:"max_reads"`
+	ReadsUsed     int32              `json:"reads_used"`
+	LastReadAt    pgtype.Timestamptz `json:"last_read_at"`
+	RevokedAt     pgtype.Timestamptz `json:"revoked_at"`
+	RevokeReason  string             `json:"revoke_reason"`
+	CreatedAt     time.Time          `json:"created_at"`
+	UpdatedAt     time.Time          `json:"updated_at"`
 }
 
 type SecretVersion struct {
@@ -173,21 +235,51 @@ type Tenant struct {
 	DeletedAt      pgtype.Timestamptz `json:"deleted_at"`
 }
 
+type TransitKey struct {
+	KeyID             int64              `json:"key_id"`
+	KeyUuid           uuid.UUID          `json:"key_uuid"`
+	TenantID          int64              `json:"tenant_id"`
+	ProjectID         int64              `json:"project_id"`
+	Name              string             `json:"name"`
+	Description       string             `json:"description"`
+	CurrentVersion    int32              `json:"current_version"`
+	Status            string             `json:"status"`
+	MinDecryptVersion int32              `json:"min_decrypt_version"`
+	Metadata          []byte             `json:"metadata"`
+	CreatedAt         time.Time          `json:"created_at"`
+	UpdatedAt         time.Time          `json:"updated_at"`
+	DeletedAt         pgtype.Timestamptz `json:"deleted_at"`
+}
+
+type TransitKeyVersion struct {
+	VersionID          int64     `json:"version_id"`
+	KeyID              int64     `json:"key_id"`
+	Version            int32     `json:"version"`
+	MaterialCiphertext []byte    `json:"material_ciphertext"`
+	MaterialNonce      []byte    `json:"material_nonce"`
+	MaterialDekWrapped []byte    `json:"material_dek_wrapped"`
+	MaterialDekNonce   []byte    `json:"material_dek_nonce"`
+	KekID              string    `json:"kek_id"`
+	CreatedAt          time.Time `json:"created_at"`
+}
+
 type WebhookDelivery struct {
-	DeliveryID     int64       `json:"delivery_id"`
-	DeliveryUuid   uuid.UUID   `json:"delivery_uuid"`
-	EndpointID     int64       `json:"endpoint_id"`
-	TenantID       int64       `json:"tenant_id"`
-	EventType      string      `json:"event_type"`
-	ResourceMrn    string      `json:"resource_mrn"`
-	Version        pgtype.Int4 `json:"version"`
-	AttemptCount   int32       `json:"attempt_count"`
-	Status         string      `json:"status"`
-	ResponseStatus pgtype.Int4 `json:"response_status"`
-	Error          string      `json:"error"`
-	Payload        []byte      `json:"payload"`
-	CreatedAt      time.Time   `json:"created_at"`
-	UpdatedAt      time.Time   `json:"updated_at"`
+	DeliveryID      int64              `json:"delivery_id"`
+	DeliveryUuid    uuid.UUID          `json:"delivery_uuid"`
+	EndpointID      int64              `json:"endpoint_id"`
+	TenantID        int64              `json:"tenant_id"`
+	EventType       string             `json:"event_type"`
+	ResourceMrn     string             `json:"resource_mrn"`
+	Version         pgtype.Int4        `json:"version"`
+	AttemptCount    int32              `json:"attempt_count"`
+	Status          string             `json:"status"`
+	ResponseStatus  pgtype.Int4        `json:"response_status"`
+	Error           string             `json:"error"`
+	Payload         []byte             `json:"payload"`
+	NextAttemptAt   pgtype.Timestamptz `json:"next_attempt_at"`
+	RedriveAttempts int32              `json:"redrive_attempts"`
+	CreatedAt       time.Time          `json:"created_at"`
+	UpdatedAt       time.Time          `json:"updated_at"`
 }
 
 type WebhookEndpoint struct {

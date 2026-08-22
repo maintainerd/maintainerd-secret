@@ -13,6 +13,10 @@ import (
 )
 
 type Querier interface {
+	// AbandonWebhookDelivery marks a delivery permanently failed WITHOUT spending an
+	// attempt, for the case where there is nothing left to attempt against: the endpoint
+	// has been deleted. Recording it as an attempt would claim we posted somewhere.
+	AbandonWebhookDelivery(ctx context.Context, arg AbandonWebhookDeliveryParams) (int64, error)
 	AllowAuditLogDelete(ctx context.Context, setConfig string) error
 	// AllowSecretVersionDelete sets the transaction-local GUC the append-only trigger
 	// checks. Valid reasons: 'retention', 'secret_destroy', 'tenant_delete'. is_local
@@ -21,9 +25,32 @@ type Querier interface {
 	// inside an explicit transaction to have any effect at all.
 	AllowSecretVersionDelete(ctx context.Context, setConfig string) error
 	AllowSecretVersionRewrap(ctx context.Context) error
+	AllowTransitVersionDelete(ctx context.Context, setConfig string) error
+	// AllowTransitVersionRewrap sets the transaction-local GUC the append-only trigger
+	// checks. is_local is true, so the permission dies with the transaction and cannot
+	// leak into the next statement on a pooled connection — which is why it only has any
+	// effect inside an explicit transaction.
+	AllowTransitVersionRewrap(ctx context.Context) error
 	// The access trail. Append-only: there is no UPDATE statement in this file, and
 	// there never should be — the trigger on the table would reject one anyway.
 	AppendAuditEvent(ctx context.Context, arg AppendAuditEventParams) (AuditLog, error)
+	// ClaimWebhookDeliveriesForRedrive takes ownership of a batch of due deliveries.
+	//
+	// FOR UPDATE SKIP LOCKED is what makes this worker SAFE IN EVERY REPLICA with no
+	// leader election: two workers racing the same tick take disjoint batches, because a
+	// row another transaction has locked is skipped rather than waited on. A plain
+	// SELECT-then-UPDATE would let both claim the same delivery and double-post it to a
+	// customer's endpoint.
+	//
+	// THE UPDATE PUSHES next_attempt_at FORWARD BY A VISIBILITY LEASE before the attempt
+	// is made. That is the crash-safety half: if this process dies between the claim and
+	// the outcome, nothing has to notice — the row simply becomes due again when the
+	// lease expires. It also means the lease must be comfortably longer than one
+	// attempt's timeout, or a slow receiver produces a concurrent second attempt.
+	//
+	// The counters are NOT touched here. attempt_count and redrive_attempts move on
+	// RecordWebhookRedriveOutcome, so a claim that never completes costs no budget.
+	ClaimWebhookDeliveriesForRedrive(ctx context.Context, arg ClaimWebhookDeliveriesForRedriveParams) ([]ClaimWebhookDeliveriesForRedriveRow, error)
 	// CompleteSetup is the one-shot itself. The `WHERE setup_state.completed_at IS
 	// NULL` guard on the DO UPDATE branch is what makes it single-use: a second caller
 	// matches the conflict, fails the guard, updates nothing, and gets NO ROW back —
@@ -35,17 +62,64 @@ type Querier interface {
 	// window on every process restart (and, with an empty bootstrap token, reopened it
 	// unauthenticated).
 	CompleteSetup(ctx context.Context, arg CompleteSetupParams) (SetupState, error)
+	// ConsumeSecretLease records one read against a lease.
+	//
+	// THE CAP IS IN THE WHERE CLAUSE, not only in the service. reads_used < max_reads is
+	// re-checked by the database under the row lock the caller already holds, so a service
+	// path that forgot to check — or a future second caller of this query — still cannot
+	// take a read past the limit. Zero rows returned means "refused", and the service maps
+	// that to the precise error rather than serving the value.
+	ConsumeSecretLease(ctx context.Context, leaseID int64) (int64, error)
 	CountAuditEventsByTenant(ctx context.Context, tenantID pgtype.Int8) (int64, error)
+	// CountAuditEventsFiltered must apply the SAME predicate list as the query above,
+	// word for word. A total computed over a different WHERE clause is a pagination
+	// control that walks off the end of its own result set.
+	CountAuditEventsFiltered(ctx context.Context, arg CountAuditEventsFilteredParams) (int64, error)
+	CountDynamicLeasesByRole(ctx context.Context, arg CountDynamicLeasesByRoleParams) (int64, error)
+	CountDynamicRolesByProject(ctx context.Context, arg CountDynamicRolesByProjectParams) (int64, error)
 	CountFoldersInSubtree(ctx context.Context, arg CountFoldersInSubtreeParams) (int64, error)
+	// CountLiveDynamicLeasesByRole is the delete guard: a role config with outstanding
+	// credentials must not be soft-deleted out from under them, because the revocation
+	// template lives on the config and deleting it would strand every issued account.
+	CountLiveDynamicLeasesByRole(ctx context.Context, roleID int64) (int64, error)
 	CountProjectsByTenant(ctx context.Context, tenantID int64) (int64, error)
+	CountSecretLeases(ctx context.Context, arg CountSecretLeasesParams) (int64, error)
 	CountSecretVersions(ctx context.Context, secretID int64) (int64, error)
 	CountSecretsInSubtree(ctx context.Context, arg CountSecretsInSubtreeParams) (int64, error)
 	CountTenants(ctx context.Context) (int64, error)
+	CountTransitKeyVersions(ctx context.Context, keyID int64) (int64, error)
+	CountTransitKeysByProject(ctx context.Context, arg CountTransitKeysByProjectParams) (int64, error)
+	// CountTransitVersionsByKEK is half of the retirement proof. A root key may only be
+	// retired when NO secret version AND no transit key version references it; retiring
+	// one that a transit version still points at would make that key's ciphertexts
+	// permanently undecryptable while every secret read kept working, which is the worst
+	// kind of partial failure — invisible until the application needs its data.
+	CountTransitVersionsByKEK(ctx context.Context, kekID string) (int64, error)
 	// CountVersionsByKEK is the retirement proof: a root key may only be retired when
 	// this returns zero.
 	CountVersionsByKEK(ctx context.Context, kekID string) (int64, error)
+	// CountWebhookDeliveriesAwaitingRedrive is the backlog depth, for the worker's log
+	// line. An operator watching a receiver come back up wants one number, and a growing
+	// one is the signal that the budget is being spent faster than deliveries succeed.
+	CountWebhookDeliveriesAwaitingRedrive(ctx context.Context) (int64, error)
 	CountWebhookDeliveriesByEndpoint(ctx context.Context, arg CountWebhookDeliveriesByEndpointParams) (int64, error)
 	CountWebhookEndpointsByProject(ctx context.Context, arg CountWebhookEndpointsByProjectParams) (int64, error)
+	// CreateDynamicLease records an issued credential. It is written in the SAME
+	// transaction that runs the creation SQL against the target database, so there is no
+	// window in which a database role exists with no lease row demanding its revocation.
+	CreateDynamicLease(ctx context.Context, arg CreateDynamicLeaseParams) (DynamicLease, error)
+	// Dynamic secrets: the role CONFIGURATION an operator registers, and the LEASES
+	// issued against it.
+	//
+	// TENANT SCOPING IS IN THE QUERY, not in the service — the same rule the secret
+	// queries follow, for the same reason: a WHERE clause that is part of the generated
+	// function's signature cannot be forgotten, whereas a service-layer check is one
+	// early return away from leaking.
+	//
+	// NOTE WHAT NO QUERY IN THIS FILE DOES: none of them writes or reads a generated
+	// password, because there is no column to hold one. The credential is returned to
+	// the caller once, in the issue response, and revocation needs only a role name.
+	CreateDynamicRole(ctx context.Context, arg CreateDynamicRoleParams) (DynamicRole, error)
 	// Environments. The table has no tenant_id column (it hangs off a project), so
 	// tenant scoping is applied with a project subquery rather than a join — that
 	// keeps the select list a plain `*` (so sqlc returns the Environment struct) while
@@ -83,6 +157,7 @@ type Querier interface {
 	// parameter. This is also why tenant_id is denormalized onto secrets rather than
 	// reached by joining up through project and environment.
 	CreateSecret(ctx context.Context, arg CreateSecretParams) (Secret, error)
+	CreateSecretLease(ctx context.Context, arg CreateSecretLeaseParams) (SecretLease, error)
 	// Secret versions: the encrypted payloads.
 	//
 	// These are the only queries in the repo that touch ciphertext, and every one of
@@ -99,6 +174,17 @@ type Querier interface {
 	// subject string, and it is recorded where it belongs, in audit_log.actor_subject.
 	// The BIGINT audit columns are kept for schema parity with core.
 	CreateTenant(ctx context.Context, arg CreateTenantParams) (Tenant, error)
+	// Transit keys and their versions.
+	//
+	// THE MATERIAL COLUMNS ARE SELECTED BY EXACTLY TWO QUERIES — the one that resolves
+	// the version an Encrypt writes under, and the one that resolves the version a
+	// Decrypt token names. Every listing and every metadata read goes through a *Meta
+	// shape that does not select them at all, the same belt-and-braces rule the secret
+	// listing and the webhook listing follow. A transit key's whole value proposition is
+	// that the material never leaves the service; a listing query that selected it would
+	// be one JSON marshal away from ending that.
+	CreateTransitKey(ctx context.Context, arg CreateTransitKeyParams) (TransitKey, error)
+	CreateTransitKeyVersion(ctx context.Context, arg CreateTransitKeyVersionParams) (TransitKeyVersion, error)
 	CreateWebhookDelivery(ctx context.Context, arg CreateWebhookDeliveryParams) (WebhookDelivery, error)
 	// Webhook endpoints and their delivery log.
 	//
@@ -117,9 +203,31 @@ type Querier interface {
 	DeleteSecretVersion(ctx context.Context, versionID int64) (int64, error)
 	// The durable one-shot setup lock.
 	EnsureSetupState(ctx context.Context) error
+	// ExpireDueSecretLeases retires leases whose TTL has run out, in bulk. now() is the
+	// DATABASE's: a skewed process clock must not be able to expire a lease early or keep
+	// a dead one alive. This is housekeeping rather than enforcement — the consume path
+	// already refuses an expired lease on its own — so it is safe to run on a timer and
+	// safe to skip.
+	ExpireDueSecretLeases(ctx context.Context, rowLimit int32) (int64, error)
+	// FinishWebhookDelivery records the outcome of the INLINE attempt sequence.
+	//
+	// next_attempt_at is set (to a time a few seconds out) when the status is 'retrying'
+	// and NULL otherwise, which is what hands the row to the re-drive worker. The column
+	// check on the table refuses a schedule on a terminal row, so a caller that sets one
+	// with status 'success' gets a constraint violation rather than a duplicate delivery.
 	FinishWebhookDelivery(ctx context.Context, arg FinishWebhookDeliveryParams) (WebhookDelivery, error)
 	GetActiveRootKey(ctx context.Context) (RootKey, error)
 	GetDeletedSecretByUUID(ctx context.Context, arg GetDeletedSecretByUUIDParams) (Secret, error)
+	GetDynamicLeaseByUUID(ctx context.Context, arg GetDynamicLeaseByUUIDParams) (DynamicLease, error)
+	// GetDynamicRoleByID resolves the config a lease was issued against, for the reaper —
+	// which starts from a lease row and needs the revocation template. It is NOT
+	// tenant-scoped because a lease row's role_id was itself reached through a
+	// tenant-scoped read (or, for the reaper, through a query that carries the tenant
+	// alongside), and a background sweep has no caller tenant to scope by. The revocation
+	// it performs is bounded by the lease row, not by the caller.
+	GetDynamicRoleByID(ctx context.Context, roleID int64) (DynamicRole, error)
+	GetDynamicRoleByName(ctx context.Context, arg GetDynamicRoleByNameParams) (DynamicRole, error)
+	GetDynamicRoleByUUID(ctx context.Context, arg GetDynamicRoleByUUIDParams) (DynamicRole, error)
 	GetEnvironmentByID(ctx context.Context, arg GetEnvironmentByIDParams) (Environment, error)
 	GetEnvironmentBySlug(ctx context.Context, arg GetEnvironmentBySlugParams) (Environment, error)
 	GetEnvironmentByUUID(ctx context.Context, arg GetEnvironmentByUUIDParams) (Environment, error)
@@ -127,10 +235,25 @@ type Querier interface {
 	GetFolderByPath(ctx context.Context, arg GetFolderByPathParams) (Folder, error)
 	GetFolderByUUID(ctx context.Context, arg GetFolderByUUIDParams) (Folder, error)
 	GetLatestSecretVersion(ctx context.Context, secretID int64) (SecretVersion, error)
+	GetLatestTransitKeyVersion(ctx context.Context, keyID int64) (TransitKeyVersion, error)
 	// GetLatestVersionChecksum answers "is this write actually a change?" without
 	// decrypting anything, and without the root key being involved at all. That is the
 	// whole reason checksum is a stored column.
 	GetLatestVersionChecksum(ctx context.Context, secretID int64) (GetLatestVersionChecksumRow, error)
+	// Read leases on static secrets.
+	//
+	// The policy lives on `secrets` (lease_ttl_seconds, lease_max_ttl_seconds,
+	// lease_max_reads — see secret.sql's SetSecretLeasePolicy); these queries manage the
+	// leases actually issued against it.
+	//
+	// THE CONSUME PATH IS A LOCK, A DECISION, AND AN UPDATE, in that order, inside one
+	// transaction. Anything looser is a bypass: two concurrent reveals that both read
+	// reads_used = 9 against a cap of 10 would both be served, which is precisely the
+	// exfiltration pattern the cap exists to refuse.
+	// GetLiveSecretLeaseForUpdate takes the caller's current lease under a row lock. NULL
+	// rows (no lease yet) come back as pgx.ErrNoRows, which the service reads as "issue
+	// one".
+	GetLiveSecretLeaseForUpdate(ctx context.Context, arg GetLiveSecretLeaseForUpdateParams) (SecretLease, error)
 	GetProjectByID(ctx context.Context, arg GetProjectByIDParams) (Project, error)
 	GetProjectBySlug(ctx context.Context, arg GetProjectBySlugParams) (Project, error)
 	GetProjectByUUID(ctx context.Context, arg GetProjectByUUIDParams) (Project, error)
@@ -144,11 +267,46 @@ type Querier interface {
 	GetSecretByAddressForUpdate(ctx context.Context, arg GetSecretByAddressForUpdateParams) (Secret, error)
 	GetSecretByUUID(ctx context.Context, arg GetSecretByUUIDParams) (Secret, error)
 	GetSecretVersion(ctx context.Context, arg GetSecretVersionParams) (SecretVersion, error)
+	// GetSecretVersionValueType answers "is this secret a reference or a literal?" for
+	// ONE secret, which is what the single-secret metadata paths (describe, a metadata
+	// edit, a restore) need to fill SecretMeta.ValueType. The listing gets the same
+	// column from its own LATERAL join (secret.sql) so it never runs this per row.
+	//
+	// It selects value_type ALONE. A describe that fetched the version row and discarded
+	// the payload would put ciphertext in a handler's locals for a metadata read, and
+	// would make the "describe never reaches secret_versions' payload" property something
+	// a reviewer has to trace rather than read.
+	GetSecretVersionValueType(ctx context.Context, arg GetSecretVersionValueTypeParams) (string, error)
 	GetSetupState(ctx context.Context) (SetupState, error)
+	// GetSignedWebhookEndpointByID is the RE-DRIVE read: a retry has a delivery row and
+	// therefore an endpoint_id, never a UUID the caller supplied, so it cannot go through
+	// GetWebhookEndpointByUUID.
+	//
+	// It selects the signing-key columns, like ListActiveWebhookEndpointsByProject and
+	// for the same reason — a retry has to compute the same HMAC — and it joins tenants
+	// for tenant_uuid, which is the AAD the key was sealed under.
+	//
+	// deleted_at IS NULL is load-bearing rather than tidiness: an endpoint deleted while
+	// a delivery sat in the backlog must NOT be retried, and a missing row here is how
+	// the worker learns to abandon it. `status` is deliberately NOT filtered — a delivery
+	// already recorded against an endpoint an operator has since DISABLED is finished
+	// rather than dropped, because disabling stops new events, not the acknowledgement of
+	// one already announced.
+	GetSignedWebhookEndpointByID(ctx context.Context, endpointID int64) (GetSignedWebhookEndpointByIDRow, error)
 	GetTenantByAuthTenantUUID(ctx context.Context, authTenantUuid pgtype.UUID) (Tenant, error)
 	GetTenantByID(ctx context.Context, tenantID int64) (Tenant, error)
 	GetTenantByName(ctx context.Context, name string) (Tenant, error)
 	GetTenantByUUID(ctx context.Context, tenantUuid uuid.UUID) (Tenant, error)
+	GetTransitKeyByName(ctx context.Context, arg GetTransitKeyByNameParams) (TransitKey, error)
+	// GetTransitKeyByNameForUpdate takes a row lock for the rotate path. Two concurrent
+	// rotations would otherwise both read the same current_version and the second would
+	// collide on uq_transit_key_versions_key_version — the same race
+	// GetSecretByAddressForUpdate exists to serialize.
+	GetTransitKeyByNameForUpdate(ctx context.Context, arg GetTransitKeyByNameForUpdateParams) (TransitKey, error)
+	// GetTransitKeyVersion is one of the two queries that select material. It takes an
+	// explicit version because a DECRYPT must open the version the TOKEN names, not the
+	// current one — that is the whole reason a token carries its key version.
+	GetTransitKeyVersion(ctx context.Context, arg GetTransitKeyVersionParams) (TransitKeyVersion, error)
 	GetWebhookEndpointByUUID(ctx context.Context, arg GetWebhookEndpointByUUIDParams) (WebhookEndpoint, error)
 	// HardDeleteSecret is irreversible. The recovery-window guard is IN THE QUERY and
 	// reads now() from the database rather than trusting a timestamp from the caller:
@@ -164,10 +322,45 @@ type Querier interface {
 	ListAuditEventsByActor(ctx context.Context, arg ListAuditEventsByActorParams) ([]AuditLog, error)
 	ListAuditEventsBySecret(ctx context.Context, arg ListAuditEventsBySecretParams) ([]AuditLog, error)
 	ListAuditEventsByTenant(ctx context.Context, arg ListAuditEventsByTenantParams) ([]AuditLog, error)
+	// ListAuditEventsFiltered is the console's read, and the reason it exists is that
+	// ListAuditEventsByTenant above could only PAGE the trail. A console that fetches
+	// one page and filters it client-side answers "no matches" when it means "not on
+	// this page" — which on an access trail is the difference between "nobody read that
+	// credential" and "nobody read it in the last hundred rows".
+	//
+	// EVERY PREDICATE IS OPTIONAL AND TENANT SCOPING IS NOT. tenant_id is a positional
+	// argument, never nullable: a filter that could widen the tenant boundary would be
+	// the one bug in this file that matters. The rest use sqlc.narg, so an absent filter
+	// is a SQL NULL and the branch short-circuits to TRUE.
+	//
+	// THE TWO PREFIX FILTERS TAKE A READY-MADE LIKE PATTERN, not a bare prefix. The
+	// escaping (of %, _ and \) happens in Go — see store.likePrefix — because doing it
+	// here would mean three nested replace() calls inside the predicate, which is both
+	// unreadable and un-index-able. ESCAPE '\' is stated explicitly rather than relying
+	// on the default, so the pattern's meaning does not depend on backslash_quote or on
+	// standard_conforming_strings.
+	//
+	// ORDER BY created_at DESC matches the composite indexes' trailing column, so a
+	// filtered page is an index scan and not a sort of the whole tenant's trail.
+	ListAuditEventsFiltered(ctx context.Context, arg ListAuditEventsFilteredParams) ([]AuditLog, error)
 	// ListDeletedSecretMeta is the recovery-window view: what can still be restored,
 	// and until when. Metadata only, same rule as the live listing.
 	ListDeletedSecretMeta(ctx context.Context, arg ListDeletedSecretMetaParams) ([]ListDeletedSecretMetaRow, error)
+	ListDynamicLeasesByRole(ctx context.Context, arg ListDynamicLeasesByRoleParams) ([]ListDynamicLeasesByRoleRow, error)
+	// ListDynamicRoleMetaByProject is the API/console read. The select list omits nothing
+	// sensitive — there is nothing sensitive to omit, because the DSN is a REFERENCE
+	// rather than a credential — but it does omit the SQL templates, which are long and
+	// belong on the detail read rather than in every page of a listing.
+	ListDynamicRoleMetaByProject(ctx context.Context, arg ListDynamicRoleMetaByProjectParams) ([]ListDynamicRoleMetaByProjectRow, error)
 	ListEnvironmentsByProject(ctx context.Context, arg ListEnvironmentsByProjectParams) ([]Environment, error)
+	// ListExpiredDynamicLeases is THE REAPER'S QUERY, and the reason expiry does not
+	// depend on the creation template having included VALID UNTIL. now() is the
+	// database's, not the caller's: a skewed process clock must not be able to reap early
+	// or late.
+	//
+	// Ordered by expires_at so the longest-overdue account is dropped first, and limited
+	// so one pass cannot hold a connection to every target database at once.
+	ListExpiredDynamicLeases(ctx context.Context, rowLimit int32) ([]ListExpiredDynamicLeasesRow, error)
 	ListFoldersBySubtree(ctx context.Context, arg ListFoldersBySubtreeParams) ([]Folder, error)
 	ListProjectsByTenant(ctx context.Context, arg ListProjectsByTenantParams) ([]Project, error)
 	// ListPrunableVersions returns the versions that fall outside retention, oldest
@@ -189,6 +382,7 @@ type Querier interface {
 	// a resolution order that varies between replicas would make "which value did we
 	// get" unanswerable.
 	ListScopeImportsByTarget(ctx context.Context, arg ListScopeImportsByTargetParams) ([]ListScopeImportsByTargetRow, error)
+	ListSecretLeases(ctx context.Context, arg ListSecretLeasesParams) ([]ListSecretLeasesRow, error)
 	// ListSecretMetaBySubtree is the hierarchical listing: everything at or under a
 	// folder path, in one environment, for one tenant.
 	//
@@ -198,6 +392,20 @@ type Querier interface {
 	// future column from joining a list response by accident. (The structural
 	// guarantee is stronger still: there is no ciphertext column on secrets to
 	// select. Both belts are worn.)
+	//
+	// THE LATERAL JOIN SELECTS value_type AND NOTHING ELSE FROM secret_versions. That
+	// is the one column of the current version a listing needs, because it is what
+	// distinguishes a `reference` (a pointer of the form ${project/env/KEY}) from a
+	// literal credential — and without it a console has to issue one extra call PER ROW
+	// to find out. It is deliberately a narrow projection rather than `v.*`: this query
+	// is now the only place a listing touches the payload table at all, and the column
+	// list above is what makes "listing cannot leak a value" checkable by inspection.
+	// ciphertext, nonce, dek_wrapped and dek_nonce are not selected and must never be.
+	//
+	// LEFT JOIN, not JOIN: a secret row can legitimately exist with no version (the
+	// window between CreateSecret and CreateSecretVersion), and an inner join would make
+	// such a row vanish from its own listing. value_type is then NULL, surfaced as an
+	// empty string.
 	ListSecretMetaBySubtree(ctx context.Context, arg ListSecretMetaBySubtreeParams) ([]ListSecretMetaBySubtreeRow, error)
 	// ListSecretVersionMeta deliberately omits ciphertext, nonce, dek_wrapped and
 	// dek_nonce: version history is browsable metadata, not a bulk decryption
@@ -220,6 +428,14 @@ type Querier interface {
 	// a NEW value, so it never needs to read the current one.
 	ListSecretsWithRotationPolicy(ctx context.Context, arg ListSecretsWithRotationPolicyParams) ([]ListSecretsWithRotationPolicyRow, error)
 	ListTenants(ctx context.Context, arg ListTenantsParams) ([]Tenant, error)
+	ListTransitKeyMetaByProject(ctx context.Context, arg ListTransitKeyMetaByProjectParams) ([]ListTransitKeyMetaByProjectRow, error)
+	// ListTransitKeyVersionMeta omits every material column: version history is
+	// browsable metadata, never a way to enumerate key material.
+	ListTransitKeyVersionMeta(ctx context.Context, arg ListTransitKeyVersionMetaParams) ([]ListTransitKeyVersionMetaRow, error)
+	// ListTransitVersionWrapsByKEK is the rewrap work queue, the transit twin of
+	// ListVersionWrapsByKEK. It selects ONLY the wrapping columns — a rewrap never reads
+	// key material, which is the entire point of wrapping it in the first place.
+	ListTransitVersionWrapsByKEK(ctx context.Context, arg ListTransitVersionWrapsByKEKParams) ([]ListTransitVersionWrapsByKEKRow, error)
 	// ListVersionWrapsByKEK is the rewrap work queue: every version still wrapped
 	// under a given root key, oldest row first, in batches. It selects ONLY the
 	// wrapping columns — a rewrap never reads or writes ciphertext, which is the
@@ -232,6 +448,10 @@ type Querier interface {
 	// every signing-key column: an endpoint listing must never be a way to obtain the
 	// key that authenticates deliveries to that endpoint.
 	ListWebhookEndpointMetaByProject(ctx context.Context, arg ListWebhookEndpointMetaByProjectParams) ([]ListWebhookEndpointMetaByProjectRow, error)
+	// MarkDynamicLeaseRevoked closes a lease. Guarded on revoked_at IS NULL so a
+	// concurrent reaper pass and an explicit revoke cannot both claim the same lease —
+	// whichever loses gets zero rows and stops, rather than running DROP ROLE twice.
+	MarkDynamicLeaseRevoked(ctx context.Context, arg MarkDynamicLeaseRevokedParams) (int64, error)
 	// The KEK registry. No key material passes through these queries — only the
 	// fingerprint that says which key wrapped what.
 	// MarkOtherRootKeysRetiring must run BEFORE UpsertActiveRootKey in the same
@@ -246,6 +466,18 @@ type Querier interface {
 	// below the moved node, so '/db/primary' under a '/db' -> '/data' move becomes
 	// '/data' || '/primary'.
 	MoveFolderSubtreePaths(ctx context.Context, arg MoveFolderSubtreePathsParams) (int64, error)
+	// RecordDynamicLeaseRevokeFailure leaves the lease OPEN on purpose. A revocation that
+	// the target database refused has not happened, and marking it revoked anyway would
+	// lose the only record that a live account needs dropping. The attempt count and the
+	// error are what an operator sees when a role has been orphaned by an outage.
+	RecordDynamicLeaseRevokeFailure(ctx context.Context, arg RecordDynamicLeaseRevokeFailureParams) (int64, error)
+	// RecordWebhookRedriveOutcome records what one WORKER attempt did.
+	//
+	// Both counters advance together: attempt_count is the total an operator reads,
+	// redrive_attempts is the durable budget the worker spends. next_attempt_at carries
+	// the next backoff on 'retrying' and is NULL on either terminal status, which the
+	// table's CHECK enforces.
+	RecordWebhookRedriveOutcome(ctx context.Context, arg RecordWebhookRedriveOutcomeParams) (int64, error)
 	// RefreshSecretMrnPathsInSubtree recomputes the materialized MRN resource path
 	// after a folder move. mrn_resource_path is derived from the environment slug,
 	// folder.path and key, so a move that rewrote folder paths leaves it stale — and a
@@ -268,11 +500,20 @@ type Querier interface {
 	// also have proved that no version references it (CountVersionsByKEK = 0) —
 	// retiring a still-referenced key would leave rows that can never be decrypted.
 	RetireRootKey(ctx context.Context, kekID string) (int64, error)
+	RevokeSecretLease(ctx context.Context, arg RevokeSecretLeaseParams) (int64, error)
+	// RevokeSecretLeasesForSecret closes every outstanding lease on one secret. Used when
+	// the lease policy is removed (the leases it governed no longer mean anything) and
+	// when the secret is deleted.
+	RevokeSecretLeasesForSecret(ctx context.Context, arg RevokeSecretLeasesForSecretParams) (int64, error)
 	// RewrapSecretVersion is the ONLY sanctioned UPDATE on this table. It requires the
 	// maintainerd.allow_secret_version_rewrap GUC (see AllowSecretVersionRewrap) and
 	// the trigger additionally verifies that ciphertext, nonce, version, checksum and
 	// created_at came through untouched.
 	RewrapSecretVersion(ctx context.Context, arg RewrapSecretVersionParams) (int64, error)
+	// RewrapTransitKeyVersion is the ONLY sanctioned UPDATE on this table. It requires the
+	// maintainerd.allow_transit_version_rewrap GUC and the trigger additionally verifies
+	// that the material ciphertext, nonce, version and created_at came through untouched.
+	RewrapTransitKeyVersion(ctx context.Context, arg RewrapTransitKeyVersionParams) (int64, error)
 	SetScopeImportEnabled(ctx context.Context, arg SetScopeImportEnabledParams) (ScopeImport, error)
 	// SetSecretCurrentVersion publishes a newly written version.
 	//
@@ -281,6 +522,23 @@ type Querier interface {
 	// version after it — a new value for an existing secret IS a rotation, whether it
 	// came from an operator or a rotation job.
 	SetSecretCurrentVersion(ctx context.Context, arg SetSecretCurrentVersionParams) (Secret, error)
+	// SetSecretLeasePolicy is a SEPARATE statement from UpdateSecretMeta, deliberately.
+	//
+	// The lease policy decides whether a value can be read at all and how often; secret
+	// metadata is a description and some tags. Folding the two together would mean a
+	// routine description edit that omitted the lease fields silently removed the policy —
+	// the same argument that already keeps UpdateSecretMeta separate from PutSecret one
+	// level down. A caller clearing the policy has to say so by passing NULLs to THIS
+	// statement.
+	//
+	// All three columns are set together because they are one policy: a TTL left beside a
+	// stale max_reads from a previous policy is not a state any caller asked for.
+	SetSecretLeasePolicy(ctx context.Context, arg SetSecretLeasePolicyParams) (Secret, error)
+	// SetTransitKeyCurrentVersion publishes a newly created key version. current_version
+	// only ever moves forward, for the reason secrets.current_version does: a version
+	// number that could be reused would make a stored token ambiguous.
+	SetTransitKeyCurrentVersion(ctx context.Context, arg SetTransitKeyCurrentVersionParams) (TransitKey, error)
+	SoftDeleteDynamicRole(ctx context.Context, arg SoftDeleteDynamicRoleParams) (int64, error)
 	SoftDeleteEnvironment(ctx context.Context, arg SoftDeleteEnvironmentParams) (int64, error)
 	SoftDeleteFolderSubtree(ctx context.Context, arg SoftDeleteFolderSubtreeParams) (int64, error)
 	SoftDeleteProject(ctx context.Context, arg SoftDeleteProjectParams) (int64, error)
@@ -291,12 +549,15 @@ type Querier interface {
 	SoftDeleteSecret(ctx context.Context, arg SoftDeleteSecretParams) (Secret, error)
 	SoftDeleteSecretsInFolderSubtree(ctx context.Context, arg SoftDeleteSecretsInFolderSubtreeParams) (int64, error)
 	SoftDeleteTenant(ctx context.Context, tenantUuid uuid.UUID) (int64, error)
+	SoftDeleteTransitKey(ctx context.Context, arg SoftDeleteTransitKeyParams) (int64, error)
 	SoftDeleteWebhookEndpoint(ctx context.Context, arg SoftDeleteWebhookEndpointParams) (int64, error)
 	TouchWebhookEndpoint(ctx context.Context, endpointID int64) (int64, error)
+	UpdateDynamicRole(ctx context.Context, arg UpdateDynamicRoleParams) (DynamicRole, error)
 	UpdateEnvironment(ctx context.Context, arg UpdateEnvironmentParams) (Environment, error)
 	UpdateProject(ctx context.Context, arg UpdateProjectParams) (Project, error)
 	UpdateSecretMeta(ctx context.Context, arg UpdateSecretMetaParams) (Secret, error)
 	UpdateTenant(ctx context.Context, arg UpdateTenantParams) (Tenant, error)
+	UpdateTransitKey(ctx context.Context, arg UpdateTransitKeyParams) (TransitKey, error)
 	UpdateWebhookEndpoint(ctx context.Context, arg UpdateWebhookEndpointParams) (WebhookEndpoint, error)
 	UpsertActiveRootKey(ctx context.Context, arg UpsertActiveRootKeyParams) (RootKey, error)
 }

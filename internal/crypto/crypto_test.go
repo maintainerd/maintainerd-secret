@@ -596,16 +596,19 @@ func TestFileProviderErrors(t *testing.T) {
 	})
 }
 
-func TestKMSProvidersAreRegisteredButNotBuilt(t *testing.T) {
-	// Registered so config validation and the schema's provider CHECK accept them
-	// today; construction fails clearly rather than returning a provider that errors
-	// on every read, because a vault that boots and then refuses everything looks
-	// like an outage instead of a config error.
+// The cloud providers are BUILT — see provider_kms_test.go, which covers all three
+// against fakes (round trip, AAD binding, retry classification, redaction, boot
+// self-test, cross-provider rewrap). What belongs here is only the factory's half of
+// the contract: a cloud provider is still constructed through the registry, and it
+// still refuses to hand back a provider it could not configure. A vault that boots
+// and then fails every read looks like an outage; one that refuses to boot is a
+// config error an operator fixes in a minute.
+func TestKMSProvidersAreReachableThroughTheFactory(t *testing.T) {
 	for _, provider := range []string{ProviderAWSKMS, ProviderGCPKMS, ProviderAzureKV} {
 		t.Run(provider, func(t *testing.T) {
 			_, err := NewRootKeyProvider(ProviderConfig{Provider: provider, AppEnv: "production"})
-			require.Error(t, err)
-			assert.Contains(t, err.Error(), "not built yet")
+			require.Error(t, err, "an unconfigured cloud provider must not construct")
+			assert.NotContains(t, err.Error(), "not built")
 		})
 		assert.Contains(t, KnownProviders(), provider)
 	}

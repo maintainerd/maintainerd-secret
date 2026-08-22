@@ -118,8 +118,9 @@ func TestInitValidatesTheRootKeyProvider(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "SECRET_ROOT_KEY_PROVIDER")
 
-	// The KMS providers are accepted by config even though the clients are not built
-	// — that is the point of the seam: an operator's aws_kms config validates today.
+	// Every provider the factory builds is accepted here, each with the settings it
+	// actually needs. Config validation and crypto.KnownProviders are two views of
+	// one set, and this is the test that keeps them from drifting.
 	for _, provider := range []string{"env", "file", "aws_kms", "gcp_kms", "azure_kv"} {
 		t.Run(provider, func(t *testing.T) {
 			setRequiredEnv(t)
@@ -127,6 +128,7 @@ func TestInitValidatesTheRootKeyProvider(t *testing.T) {
 			if provider == "file" {
 				t.Setenv("SECRET_ROOT_KEY_FILE", "/run/secrets/root.key")
 			}
+			setKMSEnv(t)
 			require.NoError(t, Init())
 			assert.Equal(t, provider, RootKeyProvider)
 		})
@@ -290,6 +292,13 @@ func TestNoAuthConfigurationIsPermittedInCoreMode(t *testing.T) {
 	setRequiredEnv(t)
 	clearAuthEnv(t)
 	t.Setenv("MAINTAINERD_MODE", "core")
+	// The gRPC TLS material is supplied because setRequiredEnv runs in production, and
+	// core mode refuses to serve the control plane in the clear (initTransportSecurity;
+	// asserted by TestCoreModeRefusesToServeTheControlPlaneInTheClear). That rule is not
+	// this test's subject — which is that MISSING AUTH is the normal pre-provisioning
+	// state — so the transport is configured here to keep the two from being tested
+	// through each other.
+	setGRPCMaterial(t)
 	require.NoError(t, Init())
 	assert.Equal(t, ModeCore, Mode)
 	assert.False(t, IsStandalone())
@@ -324,6 +333,9 @@ func TestModeIsValidated(t *testing.T) {
 	t.Run("case and whitespace are tolerated", func(t *testing.T) {
 		setRequiredEnv(t)
 		t.Setenv("MAINTAINERD_MODE", "  CORE ")
+		// Resolving to core mode brings the control-plane TLS requirement with it; the
+		// subject here is only that the value is normalised.
+		setGRPCMaterial(t)
 		require.NoError(t, Init())
 		assert.Equal(t, ModeCore, Mode)
 	})
@@ -416,6 +428,9 @@ func TestCoreModeIgnoresTheStandaloneCredentials(t *testing.T) {
 	t.Setenv("SECRET_CLIENT_ID", "")
 	t.Setenv("SECRET_CLIENT_SECRET", "")
 	t.Setenv("SECRET_CONSOLE_CLIENT_ID", "")
+	// Core mode's control-plane TLS requirement is a separate rule; supplied so this
+	// test stays about the standalone credentials being core's to provision.
+	setGRPCMaterial(t)
 	require.NoError(t, Init())
 	assert.Equal(t, ModeCore, Mode)
 	assert.Contains(t, DescribeMode(), "core")
@@ -448,4 +463,197 @@ func TestMalformedNumericSettingsAreRefused(t *testing.T) {
 		t.Setenv(key, "lots")
 		require.Error(t, Init(), "%s must refuse a non-integer", key)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Cloud KMS root keys
+// ---------------------------------------------------------------------------
+
+// setKMSEnv sets a complete, valid set of coordinates for all three cloud providers
+// at once, and clears the ambient AWS variables the region falls back to so a
+// developer's own shell cannot change what a test proves.
+//
+// Setting all three is deliberate: only the SELECTED provider's variables are
+// validated, and an operator mid-migration legitimately has two sets in place.
+func setKMSEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "")
+	t.Setenv("SECRET_KMS_AWS_KEY_ID", "arn:aws:kms:us-east-2:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab")
+	t.Setenv("SECRET_KMS_AWS_REGION", "us-east-2")
+	t.Setenv("SECRET_KMS_GCP_KEY_NAME", "projects/acme/locations/us-east1/keyRings/secret/cryptoKeys/root")
+	t.Setenv("SECRET_KMS_AZURE_VAULT_URL", "https://acme-vault.vault.azure.net/")
+	t.Setenv("SECRET_KMS_AZURE_KEY_NAME", "secret-root")
+	t.Setenv("SECRET_KMS_AZURE_KEY_VERSION", "")
+}
+
+func TestKMSSettingsAreRequiredAtBootForTheSelectedProvider(t *testing.T) {
+	// THE WHOLE POINT: a cloud provider selected without its coordinates must refuse
+	// to boot. The alternative is a process that starts, passes its health check,
+	// joins the load balancer, and fails on the first Wrap — the same class of
+	// deferred failure as a silently generated root key.
+	cases := []struct {
+		provider string
+		clear    []string
+		wantName string
+	}{
+		{"aws_kms", []string{"SECRET_KMS_AWS_KEY_ID"}, "SECRET_KMS_AWS_KEY_ID"},
+		{"aws_kms", []string{"SECRET_KMS_AWS_REGION"}, "SECRET_KMS_AWS_REGION"},
+		{"gcp_kms", []string{"SECRET_KMS_GCP_KEY_NAME"}, "SECRET_KMS_GCP_KEY_NAME"},
+		{"azure_kv", []string{"SECRET_KMS_AZURE_VAULT_URL"}, "SECRET_KMS_AZURE_VAULT_URL"},
+		{"azure_kv", []string{"SECRET_KMS_AZURE_KEY_NAME"}, "SECRET_KMS_AZURE_KEY_NAME"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.provider+" without "+tc.wantName, func(t *testing.T) {
+			setRequiredEnv(t)
+			setKMSEnv(t)
+			t.Setenv("SECRET_ROOT_KEY_PROVIDER", tc.provider)
+			for _, key := range tc.clear {
+				t.Setenv(key, "")
+			}
+			err := Init()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantName)
+			assert.Contains(t, err.Error(), "SECRET_ROOT_KEY_PROVIDER="+tc.provider)
+		})
+	}
+}
+
+func TestKMSMissingSettingsAreAllNamedAtOnce(t *testing.T) {
+	// One restart per missing variable turns a two-minute setup into three restarts,
+	// which is why kmsMissing reports the whole list.
+	setRequiredEnv(t)
+	setKMSEnv(t)
+	t.Setenv("SECRET_ROOT_KEY_PROVIDER", "azure_kv")
+	t.Setenv("SECRET_KMS_AZURE_VAULT_URL", "")
+	t.Setenv("SECRET_KMS_AZURE_KEY_NAME", "")
+
+	err := Init()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "SECRET_KMS_AZURE_VAULT_URL")
+	assert.Contains(t, err.Error(), "SECRET_KMS_AZURE_KEY_NAME")
+}
+
+func TestAWSRegionFallsBackToTheSDKVariables(t *testing.T) {
+	// A workload that already sets AWS_REGION for its other AWS calls should not
+	// have to set a second name for the same fact.
+	for _, fallback := range []string{"AWS_REGION", "AWS_DEFAULT_REGION"} {
+		t.Run(fallback, func(t *testing.T) {
+			setRequiredEnv(t)
+			setKMSEnv(t)
+			t.Setenv("SECRET_ROOT_KEY_PROVIDER", "aws_kms")
+			t.Setenv("SECRET_KMS_AWS_REGION", "")
+			t.Setenv(fallback, "eu-west-1")
+			require.NoError(t, Init())
+			assert.Equal(t, "eu-west-1", KMSAWSRegion)
+		})
+	}
+}
+
+func TestKMSSettingsForAnUnselectedProviderAreNotValidated(t *testing.T) {
+	// An operator migrating aws_kms → gcp_kms keeps both sets in place through the
+	// rewrap. Validating the inactive one would make that migration impossible.
+	setRequiredEnv(t)
+	setKMSEnv(t)
+	t.Setenv("SECRET_ROOT_KEY_PROVIDER", "env")
+	t.Setenv("SECRET_KMS_GCP_KEY_NAME", "this-is-not-a-resource-name")
+	t.Setenv("SECRET_KMS_AZURE_VAULT_URL", "http://insecure.example/")
+	require.NoError(t, Init())
+}
+
+func TestGCPKeyNameShapeIsValidatedAtBoot(t *testing.T) {
+	t.Run("a pinned key version is refused", func(t *testing.T) {
+		// Encrypt accepts a cryptoKeyVersion name and Decrypt does not, so this
+		// would boot, wrap, and then fail every unwrap.
+		setRequiredEnv(t)
+		setKMSEnv(t)
+		t.Setenv("SECRET_ROOT_KEY_PROVIDER", "gcp_kms")
+		t.Setenv("SECRET_KMS_GCP_KEY_NAME",
+			"projects/acme/locations/us-east1/keyRings/secret/cryptoKeys/root/cryptoKeyVersions/3")
+		err := Init()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "cryptoKeyVersion")
+	})
+
+	t.Run("a key-ring name is refused", func(t *testing.T) {
+		setRequiredEnv(t)
+		setKMSEnv(t)
+		t.Setenv("SECRET_ROOT_KEY_PROVIDER", "gcp_kms")
+		t.Setenv("SECRET_KMS_GCP_KEY_NAME", "projects/acme/locations/us-east1/keyRings/secret")
+		err := Init()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "SECRET_KMS_GCP_KEY_NAME")
+	})
+}
+
+func TestAzureVaultURLMustBeHTTPS(t *testing.T) {
+	// A plain-http vault URL would send this service's Azure token — a credential
+	// that can unwrap the vault's root key — in the clear.
+	setRequiredEnv(t)
+	setKMSEnv(t)
+	t.Setenv("SECRET_ROOT_KEY_PROVIDER", "azure_kv")
+	t.Setenv("SECRET_KMS_AZURE_VAULT_URL", "http://acme-vault.vault.azure.net/")
+	err := Init()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "https")
+}
+
+func TestKMSTimeoutDefaultsAndRefusesGarbage(t *testing.T) {
+	setRequiredEnv(t)
+	setKMSEnv(t)
+	require.NoError(t, Init())
+	assert.Equal(t, 10*time.Second, KMSTimeout)
+
+	t.Setenv("SECRET_KMS_TIMEOUT", "2s")
+	require.NoError(t, Init())
+	assert.Equal(t, 2*time.Second, KMSTimeout)
+
+	for _, bad := range []string{"soon", "0s", "-5s"} {
+		t.Setenv("SECRET_KMS_TIMEOUT", bad)
+		err := Init()
+		require.Error(t, err, "SECRET_KMS_TIMEOUT=%s must be refused", bad)
+		assert.Contains(t, err.Error(), "SECRET_KMS_TIMEOUT")
+	}
+}
+
+func TestRootKeyProviderConfigCarriesEverythingTheFactoryNeeds(t *testing.T) {
+	// The root of trust is assembled from ONE place, so no call site has to know
+	// which fields a given provider reads.
+	setRequiredEnv(t)
+	setKMSEnv(t)
+	t.Setenv("SECRET_ROOT_KEY_PROVIDER", "aws_kms")
+	t.Setenv("SECRET_KMS_TIMEOUT", "3s")
+	require.NoError(t, Init())
+
+	cfg := RootKeyProviderConfig()
+	assert.Equal(t, "aws_kms", cfg.Provider)
+	assert.Equal(t, AppEnv, cfg.AppEnv)
+	assert.Equal(t, RootKey, cfg.Key)
+	assert.Equal(t, RootKeyFile, cfg.KeyFile)
+	assert.Equal(t, 3*time.Second, cfg.KMS.Timeout)
+	assert.Equal(t, KMSAWSKeyID, cfg.KMS.AWSKeyID)
+	assert.Equal(t, "us-east-2", cfg.KMS.AWSRegion)
+	assert.Equal(t, KMSGCPKeyName, cfg.KMS.GCPKeyName)
+	assert.Equal(t, KMSAzureVaultURL, cfg.KMS.AzureVaultURL)
+	assert.Equal(t, KMSAzureKeyName, cfg.KMS.AzureKeyName)
+	assert.Equal(t, KMSAzureKeyVersion, cfg.KMS.AzureKeyVersion)
+}
+
+func TestDescribeRootKeyNamesTheKeyWithoutMaterial(t *testing.T) {
+	setRequiredEnv(t)
+	setKMSEnv(t)
+
+	t.Setenv("SECRET_ROOT_KEY_PROVIDER", "aws_kms")
+	require.NoError(t, Init())
+	assert.Contains(t, DescribeRootKey(), "us-east-2")
+	assert.NotContains(t, DescribeRootKey(), RootKey)
+
+	t.Setenv("SECRET_ROOT_KEY_PROVIDER", "azure_kv")
+	require.NoError(t, Init())
+	assert.Contains(t, DescribeRootKey(), "current", "an unpinned Azure version reads as current, not empty")
+
+	t.Setenv("SECRET_ROOT_KEY_PROVIDER", "env")
+	require.NoError(t, Init())
+	assert.Equal(t, "env", DescribeRootKey())
+	assert.NotContains(t, DescribeRootKey(), RootKey)
 }

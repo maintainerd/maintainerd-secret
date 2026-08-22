@@ -15,7 +15,7 @@
 // URL segment it guards, or which RPC needs it. That is this service's
 // vocabulary, and it is what lives here:
 //
-//	the twelve secret: permission constants
+//	the secret: permission constants (see All)
 //	the REST route table       (exact method+path -> rule; segment pair where uniform)
 //	the gRPC method table      (full method -> permission, + actor constraint)
 //	the exemption set          (health probes + the self-guarded setup surfaces)
@@ -126,6 +126,73 @@ const (
 	PermManageRotation = "secret:ManageRotation"
 	// PermReadAudit reads the access trail.
 	PermReadAudit = "secret:ReadAudit"
+
+	// --- dynamic secrets ---------------------------------------------------
+	//
+	// THE SPLIT BETWEEN THESE TWO IS THE SECURITY MODEL OF DYNAMIC SECRETS, and
+	// collapsing it would undo the feature. Configuring a role means choosing which
+	// database is targeted and writing the SQL that decides what an issued credential
+	// can do — a privileged, reviewable, human act. Issuing one means asking for the
+	// short-lived account that configuration already described.
+
+	// PermManageDynamicRole configures a dynamic role: the target DSN reference, the
+	// creation and revocation templates, the TTLs. Whoever holds it decides what every
+	// credential issued from that role is able to do, which is why its surfaces are
+	// user-only.
+	PermManageDynamicRole = "secret:ManageDynamicRole"
+
+	// PermIssueDynamicCredential obtains one on-demand credential, and revokes one.
+	//
+	// It is deliberately open to SERVICE principals: a workload asking for its own
+	// short-lived database credential at boot IS the feature, and requiring a human
+	// would push consumers back onto a shared static password. The blast radius is
+	// bounded by the MRN grant (which roles) and by the role's creation template (what
+	// the credential can do) — not by the caller's class.
+	//
+	// Note what it does NOT imply: any ability to read the target DSN. A holder never
+	// sees the administrative connection string on any path, which is the property
+	// that makes handing this grant to a workload reasonable.
+	PermIssueDynamicCredential = "secret:IssueDynamicCredential"
+
+	// --- transit -----------------------------------------------------------
+	//
+	// THREE PERMISSIONS RATHER THAN ONE, split by blast radius rather than by verb.
+	// Encrypt produces ciphertext and on its own recovers nothing, so a write-only
+	// workload — an ingest path that stores encrypted fields and never reads them
+	// back — can hold Encrypt alone. Decrypt is the grant that recovers plaintext, so
+	// it is the one an incident review cares about. Managing keys decides what both of
+	// the others operate on.
+	//
+	// Collapsing Encrypt and Decrypt would mean every service that WRITES an encrypted
+	// column could also READ every encrypted column — the same mistake as collapsing
+	// ReadMetadata into GetSecret.
+
+	// PermEncrypt seals a plaintext under a transit key and returns a ciphertext token.
+	PermEncrypt = "secret:Encrypt"
+	// PermDecrypt recovers a plaintext from a transit ciphertext token. Audited on
+	// every use, like a reveal.
+	PermDecrypt = "secret:Decrypt"
+	// PermManageTransitKey creates, rotates, updates and deletes transit keys. Key
+	// LIFECYCLE, never key material: there is no export operation to grant, by design
+	// (see internal/transit).
+	PermManageTransitKey = "secret:ManageTransitKey"
+
+	// --- leases on static secrets ------------------------------------------
+
+	// PermManageLease sets and clears a secret's lease policy, and revokes outstanding
+	// leases.
+	//
+	// IT IS NOT REQUIRED TO READ A LEASED SECRET — that is still PermGetSecret —
+	// because a lease is not authorization: the grant decides who may read, and the
+	// lease decides how much reading an already authorized principal may do. Requiring
+	// both would make every leased secret unreadable by exactly the consumers the
+	// lease was written for.
+	//
+	// It is administrative, so its surfaces are user-only: deciding a credential may
+	// be read ten times an hour is a policy call, and a workload making it is the
+	// signal rather than the workflow.
+	PermManageLease = "secret:ManageLease"
+
 	// PermAdmin is the blanket grant. It implies every permission above; it does NOT
 	// widen resource scope, so an admin grant written for one tenant is still
 	// confined to that tenant's MRNs. It is declared to the SDK as a BlanketAction,
@@ -141,6 +208,8 @@ const (
 	APIPrefix = "/api/v1/"
 	// SetupPath is the self-guarded first-run wizard (see the exemption set).
 	SetupPath = "/api/v1/setup"
+	// CapabilitiesPath is the anonymous capability probe (see the exemption set).
+	CapabilitiesPath = "/api/v1/capabilities"
 	// HealthzPath is the liveness probe and ReadyzPath the readiness probe.
 	HealthzPath = "/healthz"
 	ReadyzPath  = "/readyz"
@@ -411,15 +480,40 @@ func Map() sdkauthz.Map {
 		//	                  hop of a reference chain
 		//	PermDeleteSecret  deleting a folder (which deletes the secrets under it)
 		//
-		// Both are also primary permissions on routes of their own, so this list adds
-		// nothing to DeclaredPermissions today. It stays because the property it
+		// The first two are also primary permissions on routes of their own, so they
+		// add nothing to DeclaredPermissions. They stay because the property this list
 		// encodes is "a permission this service can demand must be registered in
-		// Auth", and that must survive a future where one of these is enforced ONLY
-		// as a second check — otherwise the guard would demand something no token
-		// could ever carry.
+		// Auth", and that must survive a future where one of them is enforced ONLY as
+		// a second check — otherwise the guard would demand something no token could
+		// ever carry.
+		//
+		// THE SIX BELOW THEM ARE THE CASE THAT PROPERTY WAS WRITTEN FOR. Dynamic
+		// secrets, transit and static-secret leases are enforced today ONLY inside
+		// internal/api — every one of their operations runs through s.guard against a
+		// concrete target MRN — because the transports have not mounted their routes
+		// and RPCs yet. Without these entries the permissions would be demandable by
+		// the api layer and registered nowhere in Auth, which is the exact silent,
+		// total failure the DeclaredPermissions doc below describes: a guard asking
+		// for something no token can hold, so every call answers 403 and nothing in
+		// any log says why.
+		//
+		// They are listed here rather than in Exact/Methods deliberately: the surface
+		// allowlist must describe the surface that EXISTS. An Exact entry for a route
+		// nothing serves is a stale row, and audit_test.go's
+		// TestEveryMappedRouteSurfaceIsLive fails on it — correctly, because a
+		// hand-kept table that can describe imaginary routes has stopped being an
+		// allowlist. When the transports mount these surfaces, each one gains its
+		// Exact/Methods entry, its actor constraint and its spec row, and the entries
+		// here become redundant in the same harmless way the first two are.
 		OperationPermissions: []string{
 			PermGetSecret,
 			PermDeleteSecret,
+			PermManageDynamicRole,
+			PermIssueDynamicCredential,
+			PermEncrypt,
+			PermDecrypt,
+			PermManageTransitKey,
+			PermManageLease,
 		},
 
 		// secret:Admin covers every required action. It does NOT widen resource scope.
@@ -438,6 +532,27 @@ func Map() sdkauthz.Map {
 		//	          self-guarded by SETUP_BOOTSTRAP_TOKEN compared in constant time,
 		//	          IP rate-limited, and refused outright once an orchestrator owns
 		//	          the instance (or when MAINTAINERD_MODE=core declares one will).
+		//	/api/v1/capabilities
+		//	          the capability probe. It answers the questions a client must
+		//	          settle BEFORE it can hold a token — is the guard enforced or
+		//	          dev-open, is this instance provisioned, and which issuer and
+		//	          audience a token must carry — so requiring a token to ask them
+		//	          would be circular. It is exempt because it is UNAUTHENTICATABLE,
+		//	          not because it is convenient.
+		//
+		//	          What it discloses is bounded to facts an anonymous caller could
+		//	          already obtain from the port it is talking to: the service name
+		//	          (a constant), the version (already public as an image tag), the
+		//	          guard mode (determinable in one unauthenticated request by
+		//	          reading whether a guarded route answers 401 or 200), the setup
+		//	          bit (already the documented anonymous disclosure of
+		//	          /setup/status and SecretService/Ping), the run mode (named by
+		//	          rest_wizard_open today), and — only when the guard is ENFORCED —
+		//	          the issuer and audience, both of which appear in the clear in
+		//	          every token this service verifies. It has no write path, no
+		//	          client secret, no JWKS URL (routinely an internal address), no
+		//	          tenant, project or permission list, no file path, and it reads
+		//	          nothing per-request that is not memoized in-process.
 		//
 		// The two probes are ALSO mounted outside the /api/v1 group the guard wraps,
 		// so they are exempt by construction as well as by declaration. Listing them
@@ -447,7 +562,7 @@ func Map() sdkauthz.Map {
 		//
 		// Prefix matching is segment-aware in the SDK, so "/api/v1/setup" exempts
 		// "/api/v1/setup/status" and never "/api/v1/setup-admin".
-		ExemptPaths: []string{HealthzPath, ReadyzPath, SetupPath},
+		ExemptPaths: []string{HealthzPath, ReadyzPath, SetupPath, CapabilitiesPath},
 
 		// EXEMPT METHODS — matched EXACTLY, never by prefix, so a new RPC on any of
 		// these services fails closed instead of inheriting an exemption.
@@ -508,8 +623,8 @@ func BlanketActions() []string { return []string{PermAdmin} }
 func DeclaredPermissions() []string { return Map().DeclaredPermissions() }
 
 // All is the canonical constant list, in declaration order. It exists so a test
-// can assert that the Map demands exactly these twelve and no more — the drift
-// guard in the other direction from DeclaredPermissions.
+// can assert that the Map demands exactly these and no more — the drift guard in
+// the other direction from DeclaredPermissions.
 func All() []string {
 	return []string{
 		PermReadMetadata,
@@ -523,6 +638,12 @@ func All() []string {
 		PermManageFolder,
 		PermManageRotation,
 		PermReadAudit,
+		PermManageDynamicRole,
+		PermIssueDynamicCredential,
+		PermEncrypt,
+		PermDecrypt,
+		PermManageTransitKey,
+		PermManageLease,
 		PermAdmin,
 	}
 }

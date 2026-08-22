@@ -27,6 +27,29 @@
 --                    one because "when it was deleted" and "when it becomes
 --                    unrecoverable" are different questions and the window is
 --                    configurable per call.
+--
+-- THE LEASE POLICY (lease_ttl_seconds / lease_max_ttl_seconds / lease_max_reads).
+-- Three nullable columns, and the NULL is the whole design: a secret with no
+-- lease_ttl_seconds has NO lease policy and reads behave exactly as they always
+-- have. Setting one opts THIS secret into leased reads — every reveal issues (or
+-- consumes) a row in secret_leases, and a read past the lease's expiry or beyond
+-- its remaining use count is refused rather than served.
+--
+--   lease_ttl_seconds      the lifetime of an issued read lease. NULL = unleased.
+--   lease_max_ttl_seconds  the ceiling a caller may ask for when it requests a
+--                          longer lease than the default. NULL = the default is
+--                          also the maximum, which is the safe reading of "no
+--                          ceiling was configured" — an absent ceiling must never
+--                          mean an unbounded one.
+--   lease_max_reads        how many reads one lease may serve. NULL = unlimited
+--                          within the TTL, which is the useful default for a
+--                          workload that re-reads on every boot.
+--
+-- expires_at (above) is the CREDENTIAL's own lifetime and is advisory for an
+-- unleased secret, as it always has been. For a secret that carries a lease policy
+-- it becomes a hard gate: once an operator has declared reads of this value
+-- lease-governed, serving a value the operator already declared dead would defeat
+-- the point. See internal/lease.
 CREATE TABLE IF NOT EXISTS secrets (
     secret_id       BIGSERIAL PRIMARY KEY,
     secret_uuid     UUID NOT NULL UNIQUE DEFAULT gen_random_uuid(),
@@ -62,6 +85,11 @@ CREATE TABLE IF NOT EXISTS secrets (
     rotation_policy JSONB NOT NULL DEFAULT '{}',
     rotated_at      TIMESTAMPTZ,
     expires_at      TIMESTAMPTZ,
+    -- The lease policy. NULL lease_ttl_seconds = no policy = reads behave exactly
+    -- as they did before leases existed. See the table comment.
+    lease_ttl_seconds     INT,
+    lease_max_ttl_seconds INT,
+    lease_max_reads       INT,
     metadata        JSONB NOT NULL DEFAULT '{}',
     created_by      BIGINT,
     updated_by      BIGINT,
@@ -73,7 +101,24 @@ CREATE TABLE IF NOT EXISTS secrets (
     CONSTRAINT chk_secrets_keep_versions CHECK (keep_versions IS NULL OR keep_versions >= 1),
     -- destroy_after is only meaningful for a deleted row; a live secret with a
     -- destruction date would be a scheduled data-loss bug.
-    CONSTRAINT chk_secrets_destroy_after CHECK (destroy_after IS NULL OR deleted_at IS NOT NULL)
+    CONSTRAINT chk_secrets_destroy_after CHECK (destroy_after IS NULL OR deleted_at IS NOT NULL),
+    -- A lease TTL of zero would issue leases that are already expired, which reads
+    -- as "this secret is unreadable" rather than as a policy. Refuse it at the
+    -- column rather than discovering it as an unexplained 403.
+    CONSTRAINT chk_secrets_lease_ttl CHECK (lease_ttl_seconds IS NULL OR lease_ttl_seconds >= 1),
+    CONSTRAINT chk_secrets_lease_max_reads CHECK (lease_max_reads IS NULL OR lease_max_reads >= 1),
+    -- The ceiling is only meaningful alongside a default, and it must not be BELOW
+    -- it: a maximum smaller than the default would make the default itself
+    -- unissuable.
+    CONSTRAINT chk_secrets_lease_max_ttl CHECK (
+        lease_max_ttl_seconds IS NULL
+        OR (lease_ttl_seconds IS NOT NULL AND lease_max_ttl_seconds >= lease_ttl_seconds)
+    ),
+    -- max_reads without a TTL is a cap nothing enforces, because it is the TTL that
+    -- makes a secret leased at all.
+    CONSTRAINT chk_secrets_lease_reads_need_ttl CHECK (
+        lease_max_reads IS NULL OR lease_ttl_seconds IS NOT NULL
+    )
 );
 
 -- The address. A secret is identified by environment + folder + key; the same key
@@ -99,6 +144,11 @@ CREATE INDEX IF NOT EXISTS idx_secrets_destroy_after ON secrets (destroy_after) 
 CREATE INDEX IF NOT EXISTS idx_secrets_expires_at ON secrets (expires_at) WHERE expires_at IS NOT NULL AND deleted_at IS NULL;
 -- Rotation scheduling reads the policy next to the last rotation.
 CREATE INDEX IF NOT EXISTS idx_secrets_rotated_at ON secrets (rotated_at) WHERE deleted_at IS NULL;
+-- "Which secrets are lease-governed" — the console read, and the sweep that expires
+-- their outstanding leases. Partial, because in most installs almost no secret
+-- carries a lease policy and a full index would be mostly NULLs.
+CREATE INDEX IF NOT EXISTS idx_secrets_lease_policy
+    ON secrets (lease_ttl_seconds) WHERE lease_ttl_seconds IS NOT NULL AND deleted_at IS NULL;
 
 -- +goose Down
 DROP TABLE IF EXISTS secrets;

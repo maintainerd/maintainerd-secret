@@ -13,6 +13,129 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const abandonWebhookDelivery = `-- name: AbandonWebhookDelivery :execrows
+UPDATE webhook_deliveries
+SET status          = 'failed',
+    error           = $1,
+    next_attempt_at = NULL,
+    updated_at      = now()
+WHERE delivery_id = $2
+`
+
+type AbandonWebhookDeliveryParams struct {
+	Error      string `json:"error"`
+	DeliveryID int64  `json:"delivery_id"`
+}
+
+// AbandonWebhookDelivery marks a delivery permanently failed WITHOUT spending an
+// attempt, for the case where there is nothing left to attempt against: the endpoint
+// has been deleted. Recording it as an attempt would claim we posted somewhere.
+func (q *Queries) AbandonWebhookDelivery(ctx context.Context, arg AbandonWebhookDeliveryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, abandonWebhookDelivery, arg.Error, arg.DeliveryID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const claimWebhookDeliveriesForRedrive = `-- name: ClaimWebhookDeliveriesForRedrive :many
+WITH due AS (
+    SELECT delivery_id FROM webhook_deliveries
+    WHERE status = 'retrying'
+      AND next_attempt_at IS NOT NULL
+      AND next_attempt_at <= now()
+    ORDER BY next_attempt_at
+    LIMIT $2
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE webhook_deliveries d
+SET next_attempt_at = now() + make_interval(secs => $1::int),
+    updated_at      = now()
+FROM due
+WHERE d.delivery_id = due.delivery_id
+RETURNING d.delivery_id, d.delivery_uuid, d.endpoint_id, d.tenant_id, d.event_type,
+          d.resource_mrn, d.version, d.attempt_count, d.redrive_attempts, d.payload
+`
+
+type ClaimWebhookDeliveriesForRedriveParams struct {
+	LeaseSeconds int32 `json:"lease_seconds"`
+	RowLimit     int32 `json:"row_limit"`
+}
+
+type ClaimWebhookDeliveriesForRedriveRow struct {
+	DeliveryID      int64       `json:"delivery_id"`
+	DeliveryUuid    uuid.UUID   `json:"delivery_uuid"`
+	EndpointID      int64       `json:"endpoint_id"`
+	TenantID        int64       `json:"tenant_id"`
+	EventType       string      `json:"event_type"`
+	ResourceMrn     string      `json:"resource_mrn"`
+	Version         pgtype.Int4 `json:"version"`
+	AttemptCount    int32       `json:"attempt_count"`
+	RedriveAttempts int32       `json:"redrive_attempts"`
+	Payload         []byte      `json:"payload"`
+}
+
+// ClaimWebhookDeliveriesForRedrive takes ownership of a batch of due deliveries.
+//
+// FOR UPDATE SKIP LOCKED is what makes this worker SAFE IN EVERY REPLICA with no
+// leader election: two workers racing the same tick take disjoint batches, because a
+// row another transaction has locked is skipped rather than waited on. A plain
+// SELECT-then-UPDATE would let both claim the same delivery and double-post it to a
+// customer's endpoint.
+//
+// THE UPDATE PUSHES next_attempt_at FORWARD BY A VISIBILITY LEASE before the attempt
+// is made. That is the crash-safety half: if this process dies between the claim and
+// the outcome, nothing has to notice — the row simply becomes due again when the
+// lease expires. It also means the lease must be comfortably longer than one
+// attempt's timeout, or a slow receiver produces a concurrent second attempt.
+//
+// The counters are NOT touched here. attempt_count and redrive_attempts move on
+// RecordWebhookRedriveOutcome, so a claim that never completes costs no budget.
+func (q *Queries) ClaimWebhookDeliveriesForRedrive(ctx context.Context, arg ClaimWebhookDeliveriesForRedriveParams) ([]ClaimWebhookDeliveriesForRedriveRow, error) {
+	rows, err := q.db.Query(ctx, claimWebhookDeliveriesForRedrive, arg.LeaseSeconds, arg.RowLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ClaimWebhookDeliveriesForRedriveRow{}
+	for rows.Next() {
+		var i ClaimWebhookDeliveriesForRedriveRow
+		if err := rows.Scan(
+			&i.DeliveryID,
+			&i.DeliveryUuid,
+			&i.EndpointID,
+			&i.TenantID,
+			&i.EventType,
+			&i.ResourceMrn,
+			&i.Version,
+			&i.AttemptCount,
+			&i.RedriveAttempts,
+			&i.Payload,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const countWebhookDeliveriesAwaitingRedrive = `-- name: CountWebhookDeliveriesAwaitingRedrive :one
+SELECT count(*) FROM webhook_deliveries WHERE status = 'retrying'
+`
+
+// CountWebhookDeliveriesAwaitingRedrive is the backlog depth, for the worker's log
+// line. An operator watching a receiver come back up wants one number, and a growing
+// one is the signal that the budget is being spent faster than deliveries succeed.
+func (q *Queries) CountWebhookDeliveriesAwaitingRedrive(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, countWebhookDeliveriesAwaitingRedrive)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countWebhookDeliveriesByEndpoint = `-- name: CountWebhookDeliveriesByEndpoint :one
 SELECT count(*) FROM webhook_deliveries
 WHERE tenant_id = $1 AND endpoint_id = $2
@@ -51,7 +174,7 @@ const createWebhookDelivery = `-- name: CreateWebhookDelivery :one
 INSERT INTO webhook_deliveries (
     endpoint_id, tenant_id, event_type, resource_mrn, version, payload
 ) VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING delivery_id, delivery_uuid, endpoint_id, tenant_id, event_type, resource_mrn, version, attempt_count, status, response_status, error, payload, created_at, updated_at
+RETURNING delivery_id, delivery_uuid, endpoint_id, tenant_id, event_type, resource_mrn, version, attempt_count, status, response_status, error, payload, next_attempt_at, redrive_attempts, created_at, updated_at
 `
 
 type CreateWebhookDeliveryParams struct {
@@ -86,6 +209,8 @@ func (q *Queries) CreateWebhookDelivery(ctx context.Context, arg CreateWebhookDe
 		&i.ResponseStatus,
 		&i.Error,
 		&i.Payload,
+		&i.NextAttemptAt,
+		&i.RedriveAttempts,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -182,25 +307,34 @@ SET attempt_count   = $1,
     status          = $2,
     response_status = $3,
     error           = $4,
+    next_attempt_at = $5,
     updated_at      = now()
-WHERE delivery_id = $5
-RETURNING delivery_id, delivery_uuid, endpoint_id, tenant_id, event_type, resource_mrn, version, attempt_count, status, response_status, error, payload, created_at, updated_at
+WHERE delivery_id = $6
+RETURNING delivery_id, delivery_uuid, endpoint_id, tenant_id, event_type, resource_mrn, version, attempt_count, status, response_status, error, payload, next_attempt_at, redrive_attempts, created_at, updated_at
 `
 
 type FinishWebhookDeliveryParams struct {
-	AttemptCount   int32       `json:"attempt_count"`
-	Status         string      `json:"status"`
-	ResponseStatus pgtype.Int4 `json:"response_status"`
-	Error          string      `json:"error"`
-	DeliveryID     int64       `json:"delivery_id"`
+	AttemptCount   int32              `json:"attempt_count"`
+	Status         string             `json:"status"`
+	ResponseStatus pgtype.Int4        `json:"response_status"`
+	Error          string             `json:"error"`
+	NextAttemptAt  pgtype.Timestamptz `json:"next_attempt_at"`
+	DeliveryID     int64              `json:"delivery_id"`
 }
 
+// FinishWebhookDelivery records the outcome of the INLINE attempt sequence.
+//
+// next_attempt_at is set (to a time a few seconds out) when the status is 'retrying'
+// and NULL otherwise, which is what hands the row to the re-drive worker. The column
+// check on the table refuses a schedule on a terminal row, so a caller that sets one
+// with status 'success' gets a constraint violation rather than a duplicate delivery.
 func (q *Queries) FinishWebhookDelivery(ctx context.Context, arg FinishWebhookDeliveryParams) (WebhookDelivery, error) {
 	row := q.db.QueryRow(ctx, finishWebhookDelivery,
 		arg.AttemptCount,
 		arg.Status,
 		arg.ResponseStatus,
 		arg.Error,
+		arg.NextAttemptAt,
 		arg.DeliveryID,
 	)
 	var i WebhookDelivery
@@ -217,8 +351,84 @@ func (q *Queries) FinishWebhookDelivery(ctx context.Context, arg FinishWebhookDe
 		&i.ResponseStatus,
 		&i.Error,
 		&i.Payload,
+		&i.NextAttemptAt,
+		&i.RedriveAttempts,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getSignedWebhookEndpointByID = `-- name: GetSignedWebhookEndpointByID :one
+SELECT e.endpoint_id, e.endpoint_uuid, e.tenant_id, e.project_id, e.url, e.description, e.secret_ciphertext, e.secret_nonce, e.secret_dek_wrapped, e.secret_dek_nonce, e.kek_id, e.events, e.status, e.timeout_seconds, e.max_attempts, e.last_triggered_at, e.metadata, e.created_at, e.updated_at, e.deleted_at, t.tenant_uuid
+FROM webhook_endpoints e
+JOIN tenants t ON t.tenant_id = e.tenant_id
+WHERE e.endpoint_id = $1 AND e.deleted_at IS NULL
+`
+
+type GetSignedWebhookEndpointByIDRow struct {
+	EndpointID       int64              `json:"endpoint_id"`
+	EndpointUuid     uuid.UUID          `json:"endpoint_uuid"`
+	TenantID         int64              `json:"tenant_id"`
+	ProjectID        int64              `json:"project_id"`
+	Url              string             `json:"url"`
+	Description      string             `json:"description"`
+	SecretCiphertext []byte             `json:"secret_ciphertext"`
+	SecretNonce      []byte             `json:"secret_nonce"`
+	SecretDekWrapped []byte             `json:"secret_dek_wrapped"`
+	SecretDekNonce   []byte             `json:"secret_dek_nonce"`
+	KekID            string             `json:"kek_id"`
+	Events           []byte             `json:"events"`
+	Status           string             `json:"status"`
+	TimeoutSeconds   int32              `json:"timeout_seconds"`
+	MaxAttempts      int32              `json:"max_attempts"`
+	LastTriggeredAt  pgtype.Timestamptz `json:"last_triggered_at"`
+	Metadata         []byte             `json:"metadata"`
+	CreatedAt        time.Time          `json:"created_at"`
+	UpdatedAt        time.Time          `json:"updated_at"`
+	DeletedAt        pgtype.Timestamptz `json:"deleted_at"`
+	TenantUuid       uuid.UUID          `json:"tenant_uuid"`
+}
+
+// GetSignedWebhookEndpointByID is the RE-DRIVE read: a retry has a delivery row and
+// therefore an endpoint_id, never a UUID the caller supplied, so it cannot go through
+// GetWebhookEndpointByUUID.
+//
+// It selects the signing-key columns, like ListActiveWebhookEndpointsByProject and
+// for the same reason — a retry has to compute the same HMAC — and it joins tenants
+// for tenant_uuid, which is the AAD the key was sealed under.
+//
+// deleted_at IS NULL is load-bearing rather than tidiness: an endpoint deleted while
+// a delivery sat in the backlog must NOT be retried, and a missing row here is how
+// the worker learns to abandon it. `status` is deliberately NOT filtered — a delivery
+// already recorded against an endpoint an operator has since DISABLED is finished
+// rather than dropped, because disabling stops new events, not the acknowledgement of
+// one already announced.
+func (q *Queries) GetSignedWebhookEndpointByID(ctx context.Context, endpointID int64) (GetSignedWebhookEndpointByIDRow, error) {
+	row := q.db.QueryRow(ctx, getSignedWebhookEndpointByID, endpointID)
+	var i GetSignedWebhookEndpointByIDRow
+	err := row.Scan(
+		&i.EndpointID,
+		&i.EndpointUuid,
+		&i.TenantID,
+		&i.ProjectID,
+		&i.Url,
+		&i.Description,
+		&i.SecretCiphertext,
+		&i.SecretNonce,
+		&i.SecretDekWrapped,
+		&i.SecretDekNonce,
+		&i.KekID,
+		&i.Events,
+		&i.Status,
+		&i.TimeoutSeconds,
+		&i.MaxAttempts,
+		&i.LastTriggeredAt,
+		&i.Metadata,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DeletedAt,
+		&i.TenantUuid,
 	)
 	return i, err
 }
@@ -321,7 +531,7 @@ func (q *Queries) ListActiveWebhookEndpointsByProject(ctx context.Context, arg L
 }
 
 const listWebhookDeliveriesByEndpoint = `-- name: ListWebhookDeliveriesByEndpoint :many
-SELECT delivery_id, delivery_uuid, endpoint_id, tenant_id, event_type, resource_mrn, version, attempt_count, status, response_status, error, payload, created_at, updated_at FROM webhook_deliveries
+SELECT delivery_id, delivery_uuid, endpoint_id, tenant_id, event_type, resource_mrn, version, attempt_count, status, response_status, error, payload, next_attempt_at, redrive_attempts, created_at, updated_at FROM webhook_deliveries
 WHERE tenant_id = $1
   AND endpoint_id = $2
 ORDER BY created_at DESC
@@ -362,6 +572,8 @@ func (q *Queries) ListWebhookDeliveriesByEndpoint(ctx context.Context, arg ListW
 			&i.ResponseStatus,
 			&i.Error,
 			&i.Payload,
+			&i.NextAttemptAt,
+			&i.RedriveAttempts,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
@@ -445,6 +657,46 @@ func (q *Queries) ListWebhookEndpointMetaByProject(ctx context.Context, arg List
 		return nil, err
 	}
 	return items, nil
+}
+
+const recordWebhookRedriveOutcome = `-- name: RecordWebhookRedriveOutcome :execrows
+UPDATE webhook_deliveries
+SET attempt_count    = attempt_count + 1,
+    redrive_attempts = redrive_attempts + 1,
+    status           = $1,
+    response_status  = $2,
+    error            = $3,
+    next_attempt_at  = $4,
+    updated_at       = now()
+WHERE delivery_id = $5
+`
+
+type RecordWebhookRedriveOutcomeParams struct {
+	Status         string             `json:"status"`
+	ResponseStatus pgtype.Int4        `json:"response_status"`
+	Error          string             `json:"error"`
+	NextAttemptAt  pgtype.Timestamptz `json:"next_attempt_at"`
+	DeliveryID     int64              `json:"delivery_id"`
+}
+
+// RecordWebhookRedriveOutcome records what one WORKER attempt did.
+//
+// Both counters advance together: attempt_count is the total an operator reads,
+// redrive_attempts is the durable budget the worker spends. next_attempt_at carries
+// the next backoff on 'retrying' and is NULL on either terminal status, which the
+// table's CHECK enforces.
+func (q *Queries) RecordWebhookRedriveOutcome(ctx context.Context, arg RecordWebhookRedriveOutcomeParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordWebhookRedriveOutcome,
+		arg.Status,
+		arg.ResponseStatus,
+		arg.Error,
+		arg.NextAttemptAt,
+		arg.DeliveryID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const softDeleteWebhookEndpoint = `-- name: SoftDeleteWebhookEndpoint :execrows

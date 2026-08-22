@@ -1,19 +1,18 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   getCoreRowModel,
   getSortedRowModel,
   useReactTable,
   type SortingState,
 } from '@tanstack/react-table'
-import { Info, ScrollText } from 'lucide-react'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { ScrollText } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { PageContainer } from '@/components/layout/PageContainer'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { DataTable, DataTableEmpty, DataTablePagination } from '@/components/data-table'
 import { FormInputField, FormSelectField } from '@/components/form'
 import { auditRowClassName, buildAuditColumns } from './components/auditColumns'
-import { EMPTY_AUDIT_FILTERS, useAudit, type AuditFilters } from '@/hooks/useAudit'
+import { EMPTY_AUDIT_FILTERS, hasAuditFilters, useAudit, type AuditFilters } from '@/hooks/useAudit'
 import { AUDIT_ACTIONS } from '@/services/api/types'
 import type { AuditEntry } from '@/services/api/types'
 
@@ -33,38 +32,82 @@ const OUTCOME_OPTIONS = [
   { value: 'error', label: 'error' },
 ]
 
+/** How long a typed actor/MRN prefix settles before it becomes a request. */
+const TEXT_FILTER_DEBOUNCE_MS = 350
+
 /**
  * The access trail.
  *
  * Composed on maintainerd-auth's listing primitives — `PageContainer`,
  * `PageHeader`, `DataTable`, `DataTablePagination` — but NOT on
- * `ResourceListing`, and the reason is on screen as well as in this comment:
- * `GET /audit` accepts only `page` and `limit`, so the filters below narrow the
- * page that was fetched and nothing more. `ResourceListing`'s toolbar would
- * present a single search box that looks like it searched the whole trail. A
- * filter that silently searches one page of a long trail is worse than no
- * filter: it answers "no matches" when it means "not on this page".
+ * `ResourceListing`, whose toolbar is a single free-text search box. This trail
+ * needs six distinct predicates with different semantics (two exact, two prefix,
+ * a date range) and collapsing them into one box would hide which of them is
+ * being applied.
+ *
+ * THE FILTERS SEARCH THE WHOLE TRAIL. They are query parameters the service
+ * applies in SQL, so `total` below is the number of matching events and the
+ * pagination control walks the filtered result set. This page used to carry an
+ * on-screen caveat saying the opposite — that the filters narrowed the fetched
+ * page only — because the endpoint could not filter. It can, so the caveat is
+ * gone rather than merely reworded: a filter that silently searched one page
+ * answered "no matches" when it meant "not on this page", which on an access
+ * trail is the difference between closing an incident and missing one.
+ *
+ * The two text filters are DEBOUNCED. They are prefixes an operator types
+ * character by character, and each keystroke would otherwise be a query against
+ * an audited endpoint — filling the trail with `audit.read` rows for a word
+ * being typed.
  *
  * Reading this page is itself audited — `audit.read` appears in the trail you
- * just read, which is intentional and worth knowing before wondering where the
- * row came from.
+ * just read, and it records which filters were used, which is intentional and
+ * worth knowing before wondering where the row came from.
  */
 export default function AuditPage() {
   const [page, setPage] = useState(1)
+  // Two pieces of state for the text filters: `draft` is what the inputs show,
+  // `filters` is what has settled and is being queried.
+  const [draft, setDraft] = useState<AuditFilters>(EMPTY_AUDIT_FILTERS)
   const [filters, setFilters] = useState<AuditFilters>(EMPTY_AUDIT_FILTERS)
   const [sorting, setSorting] = useState<SortingState>(DEFAULT_SORT)
   const audit = useAudit({ page, limit: PAGE_SIZE }, filters)
 
-  const update = (patch: Partial<AuditFilters>) =>
-    setFilters((current) => ({ ...current, ...patch }))
+  // Any filter change resets to page 1. Staying on page 7 of a narrower result
+  // set shows an empty table that reads as "no matches".
+  const update = (patch: Partial<AuditFilters>) => {
+    setDraft((current) => ({ ...current, ...patch }))
+    setPage(1)
+  }
+
+  // The dropdowns and dates apply immediately; the two prefixes settle first.
+  useEffect(() => {
+    const immediate = draft.action !== filters.action ||
+      draft.outcome !== filters.outcome ||
+      draft.from !== filters.from ||
+      draft.to !== filters.to
+    if (immediate) {
+      setFilters(draft)
+      return
+    }
+    if (draft.actor === filters.actor && draft.resource === filters.resource) return
+    const timer = setTimeout(() => setFilters(draft), TEXT_FILTER_DEBOUNCE_MS)
+    return () => clearTimeout(timer)
+  }, [draft, filters])
 
   const columns = useMemo(() => buildAuditColumns(), [])
   const lastPage = Math.max(1, Math.ceil(audit.total / PAGE_SIZE))
-  const isFiltered = Object.values(filters).some((value) => value !== '')
+  const isFiltered = hasAuditFilters(draft)
 
-  // One TanStack table over the fetched page: sorting is client-side (the API
-  // has no sort_by), and pagination is driven by `page` below, so the table's own
-  // pagination model is left at a single page of everything it was handed.
+  const clearFilters = () => {
+    setDraft(EMPTY_AUDIT_FILTERS)
+    setFilters(EMPTY_AUDIT_FILTERS)
+    setPage(1)
+  }
+
+  // One TanStack table over the fetched page. Sorting stays CLIENT-SIDE and only
+  // reorders the page in view: the API has no sort_by, and it always returns
+  // newest-first, which is the ordering that matters on a trail. Filtering is
+  // NOT client-side any more — it is the query.
   const table = useReactTable<AuditEntry>({
     data: audit.entries,
     columns,
@@ -99,60 +142,52 @@ export default function AuditPage() {
       <PageHeader
         title="Audit log"
         icon={ScrollText}
-        description="Every read, write, rotation and denial. Reading this page is itself audited."
+        description="Every read, write, rotation and denial, across the whole trail. Reading this page is itself audited."
       />
-
-      <Alert>
-        <Info className="size-4" aria-hidden="true" />
-        <AlertTitle>Filters narrow this page, not the whole trail</AlertTitle>
-        <AlertDescription>
-          The API pages the trail but does not search it. The filters below apply to the{' '}
-          <strong>{audit.fetchedCount}</strong> {audit.fetchedCount === 1 ? 'row' : 'rows'} fetched
-          for this page, not to all {audit.total}. Page through to widen the window.
-        </AlertDescription>
-      </Alert>
 
       <div className="grid gap-5 md:grid-cols-3 lg:grid-cols-6">
         <FormSelectField
           id="filter-action"
           label="Action"
           options={ACTION_OPTIONS}
-          value={filters.action || ANY}
+          value={draft.action || ANY}
           onValueChange={(value) => update({ action: value === ANY ? '' : value })}
         />
         <FormSelectField
           id="filter-outcome"
           label="Outcome"
           options={OUTCOME_OPTIONS}
-          value={filters.outcome || ANY}
+          value={draft.outcome || ANY}
           onValueChange={(value) => update({ outcome: value === ANY ? '' : value })}
         />
         <FormInputField
           id="filter-actor"
-          label="Actor"
-          value={filters.actor}
+          label="Actor starts with"
+          value={draft.actor}
           autoComplete="off"
+          placeholder="svc-reconciler"
           onChange={(event) => update({ actor: event.target.value })}
         />
         <FormInputField
           id="filter-resource"
-          label="Secret / MRN"
-          value={filters.resource}
+          label="MRN starts with"
+          value={draft.resource}
           autoComplete="off"
+          placeholder="mrn:secret:acme:billing-app:secret/prod"
           onChange={(event) => update({ resource: event.target.value })}
         />
         <FormInputField
           id="filter-from"
           label="From"
           type="date"
-          value={filters.from}
+          value={draft.from}
           onChange={(event) => update({ from: event.target.value })}
         />
         <FormInputField
           id="filter-to"
           label="To"
           type="date"
-          value={filters.to}
+          value={draft.to}
           onChange={(event) => update({ to: event.target.value })}
         />
       </div>
@@ -169,14 +204,9 @@ export default function AuditPage() {
               <DataTableEmpty
                 variant="no-results"
                 title="No matching events"
-                description="Nothing on this page matches. Try another page or clear the filters."
+                description="Nothing in this tenant's trail matches these filters — the whole trail was searched, not just this page."
               >
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="mt-1"
-                  onClick={() => setFilters(EMPTY_AUDIT_FILTERS)}
-                >
+                <Button variant="outline" size="sm" className="mt-1" onClick={clearFilters}>
                   Clear filters
                 </Button>
               </DataTableEmpty>

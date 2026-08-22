@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -102,6 +103,14 @@ type Options struct {
 	// /readyz equivalent to /healthz, which is the honest answer for a server with no
 	// dependencies wired — and never the production configuration.
 	Readiness []ReadinessCheck
+	// Capabilities are the static facts GET /api/v1/capabilities reports. They are
+	// passed in rather than read from a config package so a test constructs a Server
+	// the same way the bootstrap does.
+	Capabilities CapabilityInfo
+	// ConsoleDir is the built SPA's directory, or "" to not serve it from this
+	// process. See console.go for the whole argument, including why this is a runtime
+	// directory rather than a go:embed.
+	ConsoleDir string
 }
 
 func (o Options) withDefaults() Options {
@@ -124,6 +133,11 @@ type Server struct {
 	guard   sdkauthz.Guard
 	opts    Options
 	limiter *mw.Limiter
+	// console serves the built SPA, or is nil when this process does not.
+	console *consoleHandler
+	// capabilityCache memoizes the one database-backed field of the anonymous
+	// capability payload. See capabilities.go.
+	capabilityCache capabilitiesCache
 }
 
 // NewServer builds the REST server.
@@ -149,7 +163,27 @@ func NewServer(svc *api.Service, setupSvc *setup.Service, guard sdkauthz.Guard, 
 	if resolved.RateLimit.Enabled {
 		s.limiter = mw.NewLimiter(resolved.RateLimit.Window)
 	}
+	// A console directory that cannot be opened is logged and skipped rather than
+	// fatal: config already proved the path at boot, so failing here means it changed
+	// underneath the process — and the vault must keep serving secrets whether or not
+	// its UI is available. The log line names it so the operator is not left guessing
+	// why the console 404s.
+	if console, err := newConsoleHandler(resolved.ConsoleDir); err != nil {
+		slog.Error("console: the configured directory could not be opened; the console will not be served",
+			"error", err)
+	} else {
+		s.console = console
+	}
 	return s
+}
+
+// Close releases resources the server holds open — today, the console's directory
+// handle. Safe on a nil Server and safe to call more than once.
+func (s *Server) Close() error {
+	if s == nil {
+		return nil
+	}
+	return s.console.Close()
 }
 
 // UseLimiter replaces the server's own limiter with a shared one.
@@ -194,12 +228,32 @@ func (s *Server) Router() http.Handler {
 
 	r.Route("/api/v1", func(v1 chi.Router) {
 		v1.Use(mw.Timeout(s.opts.RequestTimeout))
+		// An unknown path UNDER /api/v1 must answer as an API, not as the console.
+		// Without this the root NotFound handler below (which chi propagates into
+		// mounted subrouters) would hand a mistyped API route the SPA's index.html
+		// with a 200, and its client would parse HTML as JSON instead of seeing a 404.
+		// The console handler refuses these prefixes too — belt and braces, because
+		// getting this wrong is silent.
+		v1.NotFound(func(w http.ResponseWriter, _ *http.Request) {
+			response.Error(w, http.StatusNotFound, "no such endpoint")
+		})
 		// The SDK guard — the same decision path the gRPC interceptors run, over the
 		// same permissions.Map. It is mounted on the /api/v1 group (rather than at the
 		// root) so the probes above are outside it by construction as well as by the
 		// Map's exemption list, and it places the verified Principal in the request
 		// context for the handlers' MRN-level operation checks.
 		v1.Use(s.guard.HTTPMiddleware())
+
+		// The capability probe. UNAUTHENTICATED by declaration (it is in the Map's
+		// exemption set, with its justification pinned by the gap-audit test) and it
+		// discloses only facts a caller could obtain from the port it is already
+		// talking to — see capabilities.go for the field-by-field argument.
+		//
+		// It carries NO rate-limit class. The one field that costs a database read is
+		// memoized in-process, so hammering it cannot amplify into query load, and a
+		// budget here would refuse the console's own boot request as readily as an
+		// attacker's.
+		v1.Get("/capabilities", s.capabilities)
 
 		v1.Route("/setup", func(g chi.Router) {
 			// The setup surface carries its OWN rate limit, keyed by client IP,
@@ -283,6 +337,26 @@ func (s *Server) Router() http.Handler {
 
 		v1.Get("/audit", s.listAudit)
 	})
+
+	// THE CONSOLE, MOUNTED AS THE ROOT NOT-FOUND HANDLER — which is what puts it
+	// OUTSIDE the guarded /api/v1 group by construction, exactly like the probes
+	// above, rather than by an exception inside the guard.
+	//
+	// NotFound rather than a `/*` route on purpose. A wildcard route at the root would
+	// be matched by chi against every request and would need its own precedence
+	// reasoning against /api/v1 and the probes; NotFound runs only when nothing else
+	// matched, so the API and the probes keep their routing unchanged and the console
+	// answers everything left over. That is precisely the SPA contract: any path that
+	// is not a real asset is a client-side route and must receive index.html.
+	//
+	// With no console configured this stays chi's default 404, so the routing table is
+	// identical to what it was before this existed.
+	if s.console != nil {
+		r.NotFound(s.console.ServeHTTP)
+		// A method the SPA cannot answer is a 405 from chi by default, which for a
+		// browser asking for a deep link with anything but GET/HEAD is the right
+		// answer; the handler refuses those too.
+	}
 
 	return r
 }

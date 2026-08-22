@@ -376,6 +376,15 @@ func (f *fakeRepo) GetSecretVersion(_ context.Context, arg storage.GetSecretVers
 	return storage.SecretVersion{}, pgx.ErrNoRows
 }
 
+func (f *fakeRepo) GetSecretVersionValueType(_ context.Context, arg storage.GetSecretVersionValueTypeParams) (string, error) {
+	for _, v := range f.versions {
+		if v.SecretID == arg.SecretID && v.Version == arg.Version {
+			return v.ValueType, nil
+		}
+	}
+	return "", pgx.ErrNoRows
+}
+
 func (f *fakeRepo) GetLatestVersionChecksum(ctx context.Context, secretID int64) (storage.GetLatestVersionChecksumRow, error) {
 	v, err := f.GetLatestSecretVersion(ctx, secretID)
 	if err != nil {

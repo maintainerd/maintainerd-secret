@@ -37,9 +37,9 @@ type ForbiddenError struct{ Reason string }
 
 func (e *ForbiddenError) Error() string { return e.Reason }
 
-// UnavailableError means a dependency this operation needs is not built or not
-// reachable — the KMS root-key providers that are registered but not yet
-// implemented return this.
+// UnavailableError means a dependency this operation needs is not reachable — a
+// cloud KMS that is throttling or unreachable behind the root-key provider, for
+// instance. It is about a dependency being down, not about a request being wrong.
 type UnavailableError struct{ Reason string }
 
 func (e *UnavailableError) Error() string { return e.Reason }

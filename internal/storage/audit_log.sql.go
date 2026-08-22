@@ -101,6 +101,45 @@ func (q *Queries) CountAuditEventsByTenant(ctx context.Context, tenantID pgtype.
 	return count, err
 }
 
+const countAuditEventsFiltered = `-- name: CountAuditEventsFiltered :one
+SELECT count(*) FROM audit_log
+WHERE tenant_id = $1
+  AND ($2::varchar IS NULL OR action = $2)
+  AND ($3::varchar IS NULL OR outcome = $3)
+  AND ($4::varchar IS NULL OR actor_subject LIKE $4 ESCAPE '\')
+  AND ($5::text IS NULL OR resource_mrn LIKE $5 ESCAPE '\')
+  AND ($6::timestamptz IS NULL OR created_at >= $6)
+  AND ($7::timestamptz IS NULL OR created_at <= $7)
+`
+
+type CountAuditEventsFilteredParams struct {
+	TenantID        pgtype.Int8        `json:"tenant_id"`
+	Action          pgtype.Text        `json:"action"`
+	Outcome         pgtype.Text        `json:"outcome"`
+	ActorPattern    pgtype.Text        `json:"actor_pattern"`
+	ResourcePattern pgtype.Text        `json:"resource_pattern"`
+	FromTime        pgtype.Timestamptz `json:"from_time"`
+	ToTime          pgtype.Timestamptz `json:"to_time"`
+}
+
+// CountAuditEventsFiltered must apply the SAME predicate list as the query above,
+// word for word. A total computed over a different WHERE clause is a pagination
+// control that walks off the end of its own result set.
+func (q *Queries) CountAuditEventsFiltered(ctx context.Context, arg CountAuditEventsFilteredParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countAuditEventsFiltered,
+		arg.TenantID,
+		arg.Action,
+		arg.Outcome,
+		arg.ActorPattern,
+		arg.ResourcePattern,
+		arg.FromTime,
+		arg.ToTime,
+	)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const deleteAuditEventsBefore = `-- name: DeleteAuditEventsBefore :execrows
 DELETE FROM audit_log WHERE created_at < $1
 `
@@ -228,6 +267,98 @@ type ListAuditEventsByTenantParams struct {
 
 func (q *Queries) ListAuditEventsByTenant(ctx context.Context, arg ListAuditEventsByTenantParams) ([]AuditLog, error) {
 	rows, err := q.db.Query(ctx, listAuditEventsByTenant, arg.TenantID, arg.Limit, arg.Offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AuditLog{}
+	for rows.Next() {
+		var i AuditLog
+		if err := rows.Scan(
+			&i.EventID,
+			&i.EventUuid,
+			&i.TenantID,
+			&i.ActorSubject,
+			&i.ActorKind,
+			&i.Action,
+			&i.ResourceMrn,
+			&i.SecretID,
+			&i.Version,
+			&i.Outcome,
+			&i.Reason,
+			&i.IpAddress,
+			&i.UserAgent,
+			&i.RequestID,
+			&i.Metadata,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAuditEventsFiltered = `-- name: ListAuditEventsFiltered :many
+SELECT event_id, event_uuid, tenant_id, actor_subject, actor_kind, action, resource_mrn, secret_id, version, outcome, reason, ip_address, user_agent, request_id, metadata, created_at FROM audit_log
+WHERE tenant_id = $1
+  AND ($2::varchar IS NULL OR action = $2)
+  AND ($3::varchar IS NULL OR outcome = $3)
+  AND ($4::varchar IS NULL OR actor_subject LIKE $4 ESCAPE '\')
+  AND ($5::text IS NULL OR resource_mrn LIKE $5 ESCAPE '\')
+  AND ($6::timestamptz IS NULL OR created_at >= $6)
+  AND ($7::timestamptz IS NULL OR created_at <= $7)
+ORDER BY created_at DESC
+LIMIT $9 OFFSET $8
+`
+
+type ListAuditEventsFilteredParams struct {
+	TenantID        pgtype.Int8        `json:"tenant_id"`
+	Action          pgtype.Text        `json:"action"`
+	Outcome         pgtype.Text        `json:"outcome"`
+	ActorPattern    pgtype.Text        `json:"actor_pattern"`
+	ResourcePattern pgtype.Text        `json:"resource_pattern"`
+	FromTime        pgtype.Timestamptz `json:"from_time"`
+	ToTime          pgtype.Timestamptz `json:"to_time"`
+	RowOffset       int32              `json:"row_offset"`
+	RowLimit        int32              `json:"row_limit"`
+}
+
+// ListAuditEventsFiltered is the console's read, and the reason it exists is that
+// ListAuditEventsByTenant above could only PAGE the trail. A console that fetches
+// one page and filters it client-side answers "no matches" when it means "not on
+// this page" — which on an access trail is the difference between "nobody read that
+// credential" and "nobody read it in the last hundred rows".
+//
+// EVERY PREDICATE IS OPTIONAL AND TENANT SCOPING IS NOT. tenant_id is a positional
+// argument, never nullable: a filter that could widen the tenant boundary would be
+// the one bug in this file that matters. The rest use sqlc.narg, so an absent filter
+// is a SQL NULL and the branch short-circuits to TRUE.
+//
+// THE TWO PREFIX FILTERS TAKE A READY-MADE LIKE PATTERN, not a bare prefix. The
+// escaping (of %, _ and \) happens in Go — see store.likePrefix — because doing it
+// here would mean three nested replace() calls inside the predicate, which is both
+// unreadable and un-index-able. ESCAPE '\' is stated explicitly rather than relying
+// on the default, so the pattern's meaning does not depend on backslash_quote or on
+// standard_conforming_strings.
+//
+// ORDER BY created_at DESC matches the composite indexes' trailing column, so a
+// filtered page is an index scan and not a sort of the whole tenant's trail.
+func (q *Queries) ListAuditEventsFiltered(ctx context.Context, arg ListAuditEventsFilteredParams) ([]AuditLog, error) {
+	rows, err := q.db.Query(ctx, listAuditEventsFiltered,
+		arg.TenantID,
+		arg.Action,
+		arg.Outcome,
+		arg.ActorPattern,
+		arg.ResourcePattern,
+		arg.FromTime,
+		arg.ToTime,
+		arg.RowOffset,
+		arg.RowLimit,
+	)
 	if err != nil {
 		return nil, err
 	}

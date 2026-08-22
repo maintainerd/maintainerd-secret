@@ -23,35 +23,30 @@
 #   (CI does the same with actions/checkout into .deps/kit and .deps/sdk)
 #
 # -----------------------------------------------------------------------------
-# WIRING STILL REQUIRED — the console is shipped but not yet SERVED
+# THE CONSOLE IS SERVED BY THE BINARY, from /srv/console
 # -----------------------------------------------------------------------------
-# maintainerd-auth compiles its SPAs INTO the binary with go:embed behind an
-# `embedassets` build tag. maintainerd-secret has no such embed point today: the
-# only go:embed in this repo is migrations/embed.go, and internal/httpapi serves
-# the JSON API only — there is no static file handler and no config key naming a
-# console directory. Adding that is Go work and deliberately out of scope here.
+# The SPA is built in stage 1, baked at /srv/console, and served by the Go
+# process itself on the REST port: no nginx, no second container, no static host
+# in front. The contract is the CONSOLE_DIR variable declared below —
+# internal/platform/config reads it (empty disables serving) and
+# internal/httpapi mounts a traversal-safe static handler OUTSIDE the guarded
+# /api/v1 group, with an index.html fallback so SPA deep links survive a hard
+# refresh. Config REFUSES TO BOOT if CONSOLE_DIR is set but holds no readable
+# index.html, so a broken bake is a log line rather than a site of 404s.
 #
-# So this image BAKES the built SPA at /srv/console and declares CONSOLE_DIR as
-# the contract, but nothing reads it yet. To finish the wiring, the Go side needs:
+# WHY A DIRECTORY AND NOT go:embed. maintainerd-auth compiles its SPAs into its
+# binary behind an `embedassets` build tag, which suits it: two SPAs, two
+# dedicated ports, each needing its API same-origin for __Host- cookies. Here a
+# runtime directory is the better fit and the reasoning is in
+# internal/httpapi/console.go — the short version is that this image already
+# reads the SPA's own settings at runtime from /srv/console/config.js
+# (window.__ENV__) so one built image targets several deployments, that an embed
+# behind a build tag is a code path `go test` never compiles, and that embedding
+# would require the Docker build to write dist/ into its own source tree.
 #
-#   1. A config key — e.g. CONSOLE_DIR in internal/platform/config, empty by
-#      default so the current behaviour is unchanged when it is not set.
-#   2. A static handler in internal/httpapi/server.Router() mounted at "/",
-#      OUTSIDE the /api/v1 guarded group and alongside /healthz, serving
-#      CONSOLE_DIR with an index.html fallback for unknown paths (the console is
-#      a client-side-routed SPA, so a deep link must not 404).
-#   3. Optionally a dedicated console port if the SPA should not share :8092
-#      with the API — in which case add its EXPOSE and HEALTHCHECK probe below.
-#
-# Until then the SPA can be served by any static host pointed at the files, or
-# extracted from the image; nothing about this image needs to change once the
-# handler lands. The SPA's own settings are read at RUNTIME from
-# /srv/console/config.js (window.__ENV__), so one built image targets several
-# deployments without a rebuild.
-#
-# NOTE: VERSION is used for the OCI label only. There is no AppVersion variable
-# in internal/platform/config to -X into, unlike maintainerd-auth. Add one and
-# this build picks it up with a single ldflags edit.
+# VERSION is stamped into the binary (config.AppVersion, via -ldflags -X) as well
+# as into the OCI label, so `/api/v1/capabilities` and the boot log report the
+# same version the image tag advertises.
 # =============================================================================
 
 # --- Stage 1: build the console SPA ---
@@ -93,8 +88,13 @@ RUN go mod edit -replace github.com/maintainerd/kit=./.deps/kit \
  && go mod edit -replace github.com/maintainerd/sdk=./.deps/sdk \
  && go mod download
 
+# -X stamps the release version into the binary, so the boot log, the OCI label
+# and GET /api/v1/capabilities all report one value. It is a link-time constant
+# rather than an environment variable on purpose: a version an operator can set
+# is a version that can disagree with the binary.
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build \
-    -trimpath -ldflags="-s -w" \
+    -trimpath \
+    -ldflags="-s -w -X github.com/maintainerd/secret/internal/platform/config.AppVersion=$VERSION" \
     -o /secretd ./cmd/secretd
 
 # --- Stage 3: runtime ---
@@ -120,13 +120,15 @@ COPY --from=backend /secretd /usr/local/bin/secretd
 # rewrite the UI it serves.
 COPY --from=console --chown=root:root /app/dist /srv/console
 
-# The contract for the static handler described in the header. Inert until the
-# Go side reads it; harmless if it never does.
+# The console directory the Go process serves from. Unset it to run the API
+# alone (the SPA files stay in the image, unserved).
 ENV CONSOLE_DIR=/srv/console
 
-# 8092 is the REST API (and, once wired, the console). 9092 is gRPC. Neither
-# should be exposed to the public internet without a TLS-terminating edge in
-# front — this is a vault, and /healthz is the only unguarded route on 8092.
+# 8092 serves the REST API AND the console; 9092 is gRPC. Neither should be
+# exposed to the public internet without a TLS-terminating edge in front — this is
+# a vault. The unguarded routes on 8092 are /healthz, /readyz, the self-guarded
+# /api/v1/setup wizard, the anonymous /api/v1/capabilities probe, and the console's
+# static files.
 EXPOSE 8092 9092
 
 # Generous start-period: the service loads the root key, connects to Postgres and

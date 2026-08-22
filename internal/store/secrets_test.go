@@ -187,12 +187,28 @@ func TestListSecretsReturnsNoCiphertext(t *testing.T) {
 	require.Len(t, metas, 2)
 
 	// Structural: the returned type has no field that could hold a value.
+	//
+	// The scan is a substring match, so a field whose NAME contains a payload word but
+	// which provably cannot carry one is allowlisted BY EXACT NAME rather than by
+	// dropping the word from the banned list. Dropping "value" would let a future field
+	// actually called Value, SecretValue or CurrentValue through — which is the single
+	// thing this test exists to catch.
+	metaSafeFields := map[string]bool{
+		// ValueType is the declared-type display hint ("text", "json", "reference").
+		// It is read by a query that selects value_type alone and touches no payload
+		// column, and its domain is a fixed vocabulary, not caller-supplied bytes.
+		"ValueType": true,
+	}
 	metaType := reflect.TypeOf(SecretMeta{})
 	for i := 0; i < metaType.NumField(); i++ {
-		name := strings.ToLower(metaType.Field(i).Name)
+		field := metaType.Field(i).Name
+		if metaSafeFields[field] {
+			continue
+		}
+		name := strings.ToLower(field)
 		for _, banned := range []string{"value", "ciphertext", "nonce", "dek", "plaintext", "secretvalue"} {
 			assert.NotContains(t, name, banned,
-				"SecretMeta.%s looks like it could carry a payload; listing must be metadata only", metaType.Field(i).Name)
+				"SecretMeta.%s looks like it could carry a payload; listing must be metadata only", field)
 		}
 	}
 

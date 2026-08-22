@@ -74,7 +74,7 @@ This service is a **vault**. The design assumption is that its database will eve
 |---------|---------------|
 | Encryption at rest | Envelope: AES-256-GCM per-version DEK, wrapped by an AES-256 root key |
 | AAD binding | `(tenant UUID, secret UUID, version)` — immutable coordinates, so a folder move never destroys readability |
-| Root of trust | Pluggable provider: `env`, `file` (built); `aws_kms`, `gcp_kms`, `azure_kv` (registered, not built) |
+| Root of trust | Pluggable provider: `env`, `file`, `aws_kms`, `gcp_kms`, `azure_kv`. Each cloud provider binds the wrap to this service and the `kek_id` (KMS encryption context, GCP AAD, an Azure binding frame), and self-tests both halves of its IAM grant at boot |
 | Key rotation | Re-wraps DEKs, never rewrites ciphertext; batched, resumable, idempotent |
 | Integrity / change detection | SHA-256 checksum of the plaintext; an unchanged write creates no new version |
 | Memory hygiene | Plaintexts and DEKs zeroized after use; redacting `Plaintext` type |

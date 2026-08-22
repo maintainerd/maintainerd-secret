@@ -29,8 +29,24 @@ import (
 //	secret/<env>/<path...>/<key>             a secret (the shape stored on secrets.mrn_resource_path)
 //	import/<uuid>                            one scope-import edge
 //	webhook/<uuid>                           one webhook endpoint
+//	dynamic-role                             a project's dynamic-role COLLECTION
+//	dynamic-role/<name>                      one dynamic role config (and its leases)
+//	transit                                  a project's transit-key COLLECTION
+//	transit/<name>                           one transit key
 //	audit                                    the tenant's access trail
 //	setup                                    the one-time setup surface
+//
+// DYNAMIC ROLES AND TRANSIT KEYS ARE NAMED BY NAME, NOT BY UUID, unlike imports and
+// webhooks. That is not an inconsistency: a caller ISSUES against a role name and
+// ENCRYPTS against a key name — the name is the address it holds — so a grant an
+// operator writes has to be expressible over names. `dynamic-role/reporting-*` is a
+// policy somebody can write; the same grant over UUIDs is not.
+//
+// A LEASE HAS NO RESOURCE PATH OF ITS OWN. Issuing a credential and revoking it are
+// authorized against the ROLE, and reading a secret's leases is authorized against the
+// SECRET, because a lease is an instrument of the thing it was issued against rather
+// than a resource somebody is granted access to. Giving leases their own prefix would
+// invite a grant that could revoke credentials on a role it holds nothing else over.
 //
 // FOLDERS ARE NOT UNDER `secret/`, and that is on purpose. A grant that lets a
 // principal read secrets in staging must not also let it MOVE staging's folders —
@@ -54,6 +70,15 @@ const ResourceSetup = "setup"
 // create and a listing are authorized against, before any endpoint UUID exists.
 // WebhookResourcePath names one endpoint under it.
 const ResourceWebhook = "webhook"
+
+// ResourceDynamicRole is the resource path of a project's dynamic-role COLLECTION — the
+// scope a create and a listing are authorized against, before any role name exists.
+// DynamicRoleResourcePath names one role under it.
+const ResourceDynamicRole = "dynamic-role"
+
+// ResourceTransit is the resource path of a project's transit-key COLLECTION.
+// TransitResourcePath names one key under it.
+const ResourceTransit = "transit"
 
 // EnvironmentResourcePath returns the resource path of one environment.
 func EnvironmentResourcePath(environmentSlug string) string {
@@ -81,6 +106,18 @@ func ImportResourcePath(importUUID uuid.UUID) string { return "import/" + import
 
 // WebhookResourcePath returns the resource path of one webhook endpoint.
 func WebhookResourcePath(endpointUUID uuid.UUID) string { return "webhook/" + endpointUUID.String() }
+
+// DynamicRoleResourcePath returns the resource path of one dynamic role config.
+//
+// The name is validated as a slug before it ever reaches here (see
+// dynamic.ValidateConfigName), which is what keeps a '/' out of it — a name carrying a
+// separator would forge an extra MRN segment and could make a grant match something its
+// author never wrote.
+func DynamicRoleResourcePath(name string) string { return ResourceDynamicRole + "/" + name }
+
+// TransitResourcePath returns the resource path of one transit key. The name is
+// slug-validated for the same reason a dynamic role's is.
+func TransitResourcePath(name string) string { return ResourceTransit + "/" + name }
 
 // MRN renders a full MRN from its parts. Exported so the API layer can name a
 // target before the target exists (a create is authorized against the MRN the

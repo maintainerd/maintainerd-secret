@@ -27,6 +27,14 @@
 // DELIVERY IS BEST-EFFORT AND NEVER FAILS THE WRITE. The durable fact is the new
 // version; the notification is a courtesy that saves a consumer a polling interval.
 // A failed delivery is recorded and logged, never propagated.
+//
+// IT IS BEST-EFFORT, NOT ONE-SHOT. There are two halves to this package. Notify below
+// is the INLINE attempt, bounded by a latency a write can absorb; redrive.go is the
+// DURABLE retry loop that owns anything the inline attempt could not deliver, with
+// exponential backoff and a bounded budget. The handoff between them is a row state
+// ('retrying' plus a next-attempt time), not a goroutine, which is why it survives a
+// restart — and why a notification is no longer lost just because the receiver
+// happened to be redeploying.
 package webhook
 
 import (
@@ -94,6 +102,16 @@ type Options struct {
 	// would hold a write open for the sum of them.
 	MaxTimeout  time.Duration
 	MaxAttempts int32
+
+	// RedriveDelay is how long after an exhausted inline sequence the DURABLE retry
+	// loop may first pick the delivery up (see redrive.go). Zero disables the handoff,
+	// which restores the old behaviour exactly: a failed delivery is recorded as
+	// 'failed' and nothing retries it.
+	//
+	// The handoff is a state on the delivery row, not a goroutine — which is the whole
+	// reason it survives a restart. Notify does not wait for it and a secret write is
+	// never held open by it.
+	RedriveDelay time.Duration
 }
 
 // Defaults when Options leaves a bound unset.
@@ -247,15 +265,32 @@ func (n *Notifier) deliver(ctx context.Context, note api.Notification, endpoint 
 		}
 	}
 
-	outcome := "success"
+	// THE OUTCOME IS EITHER TERMINAL OR A HANDOFF. An exhausted inline sequence used to
+	// be recorded as 'failed' and forgotten, which made the miss visible without making
+	// it recoverable — and the inline budget is deliberately tiny (a few hundred
+	// milliseconds, because this runs on a write path), so "failed" mostly meant "the
+	// receiver was restarting". It is now parked as 'retrying' with a next-attempt time
+	// and the durable worker owns it from here; only that worker's budget produces a
+	// permanent 'failed'.
+	outcome := store.WebhookDeliverySuccess
 	failure := ""
+	var nextAttempt *time.Time
 	if lastErr != nil {
-		outcome = "failed"
+		outcome = store.WebhookDeliveryFailed
 		failure = lastErr.Error()
-		slog.Warn("webhook: delivery failed after every attempt",
-			"endpoint", endpoint.UUID, "resource", note.ResourceMRN, "attempts", attempt-1, "error", lastErr)
+		if n.opts.RedriveDelay > 0 {
+			outcome = store.WebhookDeliveryRetrying
+			at := time.Now().Add(n.opts.RedriveDelay)
+			nextAttempt = &at
+			slog.Warn("webhook: inline delivery failed; handed to the durable re-drive queue",
+				"endpoint", endpoint.UUID, "resource", note.ResourceMRN,
+				"attempts", attempt-1, "next_attempt_at", at.UTC().Format(time.RFC3339), "error", lastErr)
+		} else {
+			slog.Warn("webhook: delivery failed after every attempt and re-drive is disabled — the consumer will not be told",
+				"endpoint", endpoint.UUID, "resource", note.ResourceMRN, "attempts", attempt-1, "error", lastErr)
+		}
 	}
-	if err := n.store.FinishWebhookDelivery(ctx, deliveryID, min32(attempt, maxAttempts), outcome, lastStatus, failure); err != nil {
+	if err := n.store.FinishWebhookDelivery(ctx, deliveryID, min32(attempt, maxAttempts), outcome, lastStatus, failure, nextAttempt); err != nil {
 		slog.Warn("webhook: recording the delivery outcome failed", "endpoint", endpoint.UUID, "error", err)
 	}
 	if lastErr == nil {

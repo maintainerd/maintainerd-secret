@@ -54,7 +54,7 @@ INSERT INTO secrets (
     $5, $6, $7, $8,
     $9, $10, $11, $12, $13, $14, $15
 )
-RETURNING secret_id, secret_uuid, tenant_id, project_id, environment_id, folder_id, mrn_service, mrn_tenant, mrn_project, mrn_resource_path, key, description, tags, current_version, keep_versions, rotation_policy, rotated_at, expires_at, metadata, created_by, updated_by, created_at, updated_at, deleted_at, destroy_after
+RETURNING secret_id, secret_uuid, tenant_id, project_id, environment_id, folder_id, mrn_service, mrn_tenant, mrn_project, mrn_resource_path, key, description, tags, current_version, keep_versions, rotation_policy, rotated_at, expires_at, lease_ttl_seconds, lease_max_ttl_seconds, lease_max_reads, metadata, created_by, updated_by, created_at, updated_at, deleted_at, destroy_after
 `
 
 type CreateSecretParams struct {
@@ -124,6 +124,9 @@ func (q *Queries) CreateSecret(ctx context.Context, arg CreateSecretParams) (Sec
 		&i.RotationPolicy,
 		&i.RotatedAt,
 		&i.ExpiresAt,
+		&i.LeaseTtlSeconds,
+		&i.LeaseMaxTtlSeconds,
+		&i.LeaseMaxReads,
 		&i.Metadata,
 		&i.CreatedBy,
 		&i.UpdatedBy,
@@ -136,7 +139,7 @@ func (q *Queries) CreateSecret(ctx context.Context, arg CreateSecretParams) (Sec
 }
 
 const getDeletedSecretByUUID = `-- name: GetDeletedSecretByUUID :one
-SELECT secret_id, secret_uuid, tenant_id, project_id, environment_id, folder_id, mrn_service, mrn_tenant, mrn_project, mrn_resource_path, key, description, tags, current_version, keep_versions, rotation_policy, rotated_at, expires_at, metadata, created_by, updated_by, created_at, updated_at, deleted_at, destroy_after FROM secrets WHERE tenant_id = $1 AND secret_uuid = $2 AND deleted_at IS NOT NULL
+SELECT secret_id, secret_uuid, tenant_id, project_id, environment_id, folder_id, mrn_service, mrn_tenant, mrn_project, mrn_resource_path, key, description, tags, current_version, keep_versions, rotation_policy, rotated_at, expires_at, lease_ttl_seconds, lease_max_ttl_seconds, lease_max_reads, metadata, created_by, updated_by, created_at, updated_at, deleted_at, destroy_after FROM secrets WHERE tenant_id = $1 AND secret_uuid = $2 AND deleted_at IS NOT NULL
 `
 
 type GetDeletedSecretByUUIDParams struct {
@@ -166,6 +169,9 @@ func (q *Queries) GetDeletedSecretByUUID(ctx context.Context, arg GetDeletedSecr
 		&i.RotationPolicy,
 		&i.RotatedAt,
 		&i.ExpiresAt,
+		&i.LeaseTtlSeconds,
+		&i.LeaseMaxTtlSeconds,
+		&i.LeaseMaxReads,
 		&i.Metadata,
 		&i.CreatedBy,
 		&i.UpdatedBy,
@@ -178,7 +184,7 @@ func (q *Queries) GetDeletedSecretByUUID(ctx context.Context, arg GetDeletedSecr
 }
 
 const getSecretByAddress = `-- name: GetSecretByAddress :one
-SELECT secret_id, secret_uuid, tenant_id, project_id, environment_id, folder_id, mrn_service, mrn_tenant, mrn_project, mrn_resource_path, key, description, tags, current_version, keep_versions, rotation_policy, rotated_at, expires_at, metadata, created_by, updated_by, created_at, updated_at, deleted_at, destroy_after FROM secrets
+SELECT secret_id, secret_uuid, tenant_id, project_id, environment_id, folder_id, mrn_service, mrn_tenant, mrn_project, mrn_resource_path, key, description, tags, current_version, keep_versions, rotation_policy, rotated_at, expires_at, lease_ttl_seconds, lease_max_ttl_seconds, lease_max_reads, metadata, created_by, updated_by, created_at, updated_at, deleted_at, destroy_after FROM secrets
 WHERE tenant_id = $1 AND environment_id = $2 AND folder_id = $3 AND key = $4 AND deleted_at IS NULL
 `
 
@@ -216,6 +222,9 @@ func (q *Queries) GetSecretByAddress(ctx context.Context, arg GetSecretByAddress
 		&i.RotationPolicy,
 		&i.RotatedAt,
 		&i.ExpiresAt,
+		&i.LeaseTtlSeconds,
+		&i.LeaseMaxTtlSeconds,
+		&i.LeaseMaxReads,
 		&i.Metadata,
 		&i.CreatedBy,
 		&i.UpdatedBy,
@@ -228,7 +237,7 @@ func (q *Queries) GetSecretByAddress(ctx context.Context, arg GetSecretByAddress
 }
 
 const getSecretByAddressForUpdate = `-- name: GetSecretByAddressForUpdate :one
-SELECT secret_id, secret_uuid, tenant_id, project_id, environment_id, folder_id, mrn_service, mrn_tenant, mrn_project, mrn_resource_path, key, description, tags, current_version, keep_versions, rotation_policy, rotated_at, expires_at, metadata, created_by, updated_by, created_at, updated_at, deleted_at, destroy_after FROM secrets
+SELECT secret_id, secret_uuid, tenant_id, project_id, environment_id, folder_id, mrn_service, mrn_tenant, mrn_project, mrn_resource_path, key, description, tags, current_version, keep_versions, rotation_policy, rotated_at, expires_at, lease_ttl_seconds, lease_max_ttl_seconds, lease_max_reads, metadata, created_by, updated_by, created_at, updated_at, deleted_at, destroy_after FROM secrets
 WHERE tenant_id = $1 AND environment_id = $2 AND folder_id = $3 AND key = $4 AND deleted_at IS NULL
 FOR UPDATE
 `
@@ -271,6 +280,9 @@ func (q *Queries) GetSecretByAddressForUpdate(ctx context.Context, arg GetSecret
 		&i.RotationPolicy,
 		&i.RotatedAt,
 		&i.ExpiresAt,
+		&i.LeaseTtlSeconds,
+		&i.LeaseMaxTtlSeconds,
+		&i.LeaseMaxReads,
 		&i.Metadata,
 		&i.CreatedBy,
 		&i.UpdatedBy,
@@ -283,7 +295,7 @@ func (q *Queries) GetSecretByAddressForUpdate(ctx context.Context, arg GetSecret
 }
 
 const getSecretByUUID = `-- name: GetSecretByUUID :one
-SELECT secret_id, secret_uuid, tenant_id, project_id, environment_id, folder_id, mrn_service, mrn_tenant, mrn_project, mrn_resource_path, key, description, tags, current_version, keep_versions, rotation_policy, rotated_at, expires_at, metadata, created_by, updated_by, created_at, updated_at, deleted_at, destroy_after FROM secrets WHERE tenant_id = $1 AND secret_uuid = $2 AND deleted_at IS NULL
+SELECT secret_id, secret_uuid, tenant_id, project_id, environment_id, folder_id, mrn_service, mrn_tenant, mrn_project, mrn_resource_path, key, description, tags, current_version, keep_versions, rotation_policy, rotated_at, expires_at, lease_ttl_seconds, lease_max_ttl_seconds, lease_max_reads, metadata, created_by, updated_by, created_at, updated_at, deleted_at, destroy_after FROM secrets WHERE tenant_id = $1 AND secret_uuid = $2 AND deleted_at IS NULL
 `
 
 type GetSecretByUUIDParams struct {
@@ -313,6 +325,9 @@ func (q *Queries) GetSecretByUUID(ctx context.Context, arg GetSecretByUUIDParams
 		&i.RotationPolicy,
 		&i.RotatedAt,
 		&i.ExpiresAt,
+		&i.LeaseTtlSeconds,
+		&i.LeaseMaxTtlSeconds,
+		&i.LeaseMaxReads,
 		&i.Metadata,
 		&i.CreatedBy,
 		&i.UpdatedBy,
@@ -436,9 +451,15 @@ SELECT
     s.rotated_at,
     s.expires_at,
     s.created_at,
-    s.updated_at
+    s.updated_at,
+    v.value_type
 FROM secrets s
 JOIN folders f ON f.folder_id = s.folder_id
+LEFT JOIN LATERAL (
+    SELECT sv.value_type FROM secret_versions sv
+    WHERE sv.secret_id = s.secret_id AND sv.version = s.current_version
+    LIMIT 1
+) v ON true
 WHERE s.tenant_id = $1
   AND s.environment_id = $2
   AND (f.path = $3 OR f.path LIKE $4)
@@ -473,6 +494,7 @@ type ListSecretMetaBySubtreeRow struct {
 	ExpiresAt       pgtype.Timestamptz `json:"expires_at"`
 	CreatedAt       time.Time          `json:"created_at"`
 	UpdatedAt       time.Time          `json:"updated_at"`
+	ValueType       string             `json:"value_type"`
 }
 
 // ListSecretMetaBySubtree is the hierarchical listing: everything at or under a
@@ -484,6 +506,20 @@ type ListSecretMetaBySubtreeRow struct {
 // future column from joining a list response by accident. (The structural
 // guarantee is stronger still: there is no ciphertext column on secrets to
 // select. Both belts are worn.)
+//
+// THE LATERAL JOIN SELECTS value_type AND NOTHING ELSE FROM secret_versions. That
+// is the one column of the current version a listing needs, because it is what
+// distinguishes a `reference` (a pointer of the form ${project/env/KEY}) from a
+// literal credential — and without it a console has to issue one extra call PER ROW
+// to find out. It is deliberately a narrow projection rather than `v.*`: this query
+// is now the only place a listing touches the payload table at all, and the column
+// list above is what makes "listing cannot leak a value" checkable by inspection.
+// ciphertext, nonce, dek_wrapped and dek_nonce are not selected and must never be.
+//
+// LEFT JOIN, not JOIN: a secret row can legitimately exist with no version (the
+// window between CreateSecret and CreateSecretVersion), and an inner join would make
+// such a row vanish from its own listing. value_type is then NULL, surfaced as an
+// empty string.
 func (q *Queries) ListSecretMetaBySubtree(ctx context.Context, arg ListSecretMetaBySubtreeParams) ([]ListSecretMetaBySubtreeRow, error) {
 	rows, err := q.db.Query(ctx, listSecretMetaBySubtree,
 		arg.TenantID,
@@ -516,6 +552,7 @@ func (q *Queries) ListSecretMetaBySubtree(ctx context.Context, arg ListSecretMet
 			&i.ExpiresAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.ValueType,
 		); err != nil {
 			return nil, err
 		}
@@ -701,7 +738,7 @@ SET deleted_at    = NULL,
     destroy_after = NULL,
     updated_at    = now()
 WHERE tenant_id = $1 AND secret_uuid = $2 AND deleted_at IS NOT NULL
-RETURNING secret_id, secret_uuid, tenant_id, project_id, environment_id, folder_id, mrn_service, mrn_tenant, mrn_project, mrn_resource_path, key, description, tags, current_version, keep_versions, rotation_policy, rotated_at, expires_at, metadata, created_by, updated_by, created_at, updated_at, deleted_at, destroy_after
+RETURNING secret_id, secret_uuid, tenant_id, project_id, environment_id, folder_id, mrn_service, mrn_tenant, mrn_project, mrn_resource_path, key, description, tags, current_version, keep_versions, rotation_policy, rotated_at, expires_at, lease_ttl_seconds, lease_max_ttl_seconds, lease_max_reads, metadata, created_by, updated_by, created_at, updated_at, deleted_at, destroy_after
 `
 
 type RestoreSecretParams struct {
@@ -735,6 +772,9 @@ func (q *Queries) RestoreSecret(ctx context.Context, arg RestoreSecretParams) (S
 		&i.RotationPolicy,
 		&i.RotatedAt,
 		&i.ExpiresAt,
+		&i.LeaseTtlSeconds,
+		&i.LeaseMaxTtlSeconds,
+		&i.LeaseMaxReads,
 		&i.Metadata,
 		&i.CreatedBy,
 		&i.UpdatedBy,
@@ -755,7 +795,7 @@ WHERE tenant_id = $3
   AND secret_id = $4
   AND deleted_at IS NULL
   AND current_version < $1
-RETURNING secret_id, secret_uuid, tenant_id, project_id, environment_id, folder_id, mrn_service, mrn_tenant, mrn_project, mrn_resource_path, key, description, tags, current_version, keep_versions, rotation_policy, rotated_at, expires_at, metadata, created_by, updated_by, created_at, updated_at, deleted_at, destroy_after
+RETURNING secret_id, secret_uuid, tenant_id, project_id, environment_id, folder_id, mrn_service, mrn_tenant, mrn_project, mrn_resource_path, key, description, tags, current_version, keep_versions, rotation_policy, rotated_at, expires_at, lease_ttl_seconds, lease_max_ttl_seconds, lease_max_reads, metadata, created_by, updated_by, created_at, updated_at, deleted_at, destroy_after
 `
 
 type SetSecretCurrentVersionParams struct {
@@ -798,6 +838,80 @@ func (q *Queries) SetSecretCurrentVersion(ctx context.Context, arg SetSecretCurr
 		&i.RotationPolicy,
 		&i.RotatedAt,
 		&i.ExpiresAt,
+		&i.LeaseTtlSeconds,
+		&i.LeaseMaxTtlSeconds,
+		&i.LeaseMaxReads,
+		&i.Metadata,
+		&i.CreatedBy,
+		&i.UpdatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DeletedAt,
+		&i.DestroyAfter,
+	)
+	return i, err
+}
+
+const setSecretLeasePolicy = `-- name: SetSecretLeasePolicy :one
+UPDATE secrets
+SET lease_ttl_seconds     = $1,
+    lease_max_ttl_seconds = $2,
+    lease_max_reads       = $3,
+    updated_at            = now()
+WHERE tenant_id = $4 AND secret_uuid = $5 AND deleted_at IS NULL
+RETURNING secret_id, secret_uuid, tenant_id, project_id, environment_id, folder_id, mrn_service, mrn_tenant, mrn_project, mrn_resource_path, key, description, tags, current_version, keep_versions, rotation_policy, rotated_at, expires_at, lease_ttl_seconds, lease_max_ttl_seconds, lease_max_reads, metadata, created_by, updated_by, created_at, updated_at, deleted_at, destroy_after
+`
+
+type SetSecretLeasePolicyParams struct {
+	LeaseTtlSeconds    pgtype.Int4 `json:"lease_ttl_seconds"`
+	LeaseMaxTtlSeconds pgtype.Int4 `json:"lease_max_ttl_seconds"`
+	LeaseMaxReads      pgtype.Int4 `json:"lease_max_reads"`
+	TenantID           int64       `json:"tenant_id"`
+	SecretUuid         uuid.UUID   `json:"secret_uuid"`
+}
+
+// SetSecretLeasePolicy is a SEPARATE statement from UpdateSecretMeta, deliberately.
+//
+// The lease policy decides whether a value can be read at all and how often; secret
+// metadata is a description and some tags. Folding the two together would mean a
+// routine description edit that omitted the lease fields silently removed the policy —
+// the same argument that already keeps UpdateSecretMeta separate from PutSecret one
+// level down. A caller clearing the policy has to say so by passing NULLs to THIS
+// statement.
+//
+// All three columns are set together because they are one policy: a TTL left beside a
+// stale max_reads from a previous policy is not a state any caller asked for.
+func (q *Queries) SetSecretLeasePolicy(ctx context.Context, arg SetSecretLeasePolicyParams) (Secret, error) {
+	row := q.db.QueryRow(ctx, setSecretLeasePolicy,
+		arg.LeaseTtlSeconds,
+		arg.LeaseMaxTtlSeconds,
+		arg.LeaseMaxReads,
+		arg.TenantID,
+		arg.SecretUuid,
+	)
+	var i Secret
+	err := row.Scan(
+		&i.SecretID,
+		&i.SecretUuid,
+		&i.TenantID,
+		&i.ProjectID,
+		&i.EnvironmentID,
+		&i.FolderID,
+		&i.MrnService,
+		&i.MrnTenant,
+		&i.MrnProject,
+		&i.MrnResourcePath,
+		&i.Key,
+		&i.Description,
+		&i.Tags,
+		&i.CurrentVersion,
+		&i.KeepVersions,
+		&i.RotationPolicy,
+		&i.RotatedAt,
+		&i.ExpiresAt,
+		&i.LeaseTtlSeconds,
+		&i.LeaseMaxTtlSeconds,
+		&i.LeaseMaxReads,
 		&i.Metadata,
 		&i.CreatedBy,
 		&i.UpdatedBy,
@@ -815,7 +929,7 @@ SET deleted_at    = now(),
     destroy_after = $1,
     updated_at    = now()
 WHERE tenant_id = $2 AND secret_id = $3 AND deleted_at IS NULL
-RETURNING secret_id, secret_uuid, tenant_id, project_id, environment_id, folder_id, mrn_service, mrn_tenant, mrn_project, mrn_resource_path, key, description, tags, current_version, keep_versions, rotation_policy, rotated_at, expires_at, metadata, created_by, updated_by, created_at, updated_at, deleted_at, destroy_after
+RETURNING secret_id, secret_uuid, tenant_id, project_id, environment_id, folder_id, mrn_service, mrn_tenant, mrn_project, mrn_resource_path, key, description, tags, current_version, keep_versions, rotation_policy, rotated_at, expires_at, lease_ttl_seconds, lease_max_ttl_seconds, lease_max_reads, metadata, created_by, updated_by, created_at, updated_at, deleted_at, destroy_after
 `
 
 type SoftDeleteSecretParams struct {
@@ -849,6 +963,9 @@ func (q *Queries) SoftDeleteSecret(ctx context.Context, arg SoftDeleteSecretPara
 		&i.RotationPolicy,
 		&i.RotatedAt,
 		&i.ExpiresAt,
+		&i.LeaseTtlSeconds,
+		&i.LeaseMaxTtlSeconds,
+		&i.LeaseMaxReads,
 		&i.Metadata,
 		&i.CreatedBy,
 		&i.UpdatedBy,
@@ -906,7 +1023,7 @@ SET description     = $1,
     metadata        = $6,
     updated_at      = now()
 WHERE tenant_id = $7 AND secret_uuid = $8 AND deleted_at IS NULL
-RETURNING secret_id, secret_uuid, tenant_id, project_id, environment_id, folder_id, mrn_service, mrn_tenant, mrn_project, mrn_resource_path, key, description, tags, current_version, keep_versions, rotation_policy, rotated_at, expires_at, metadata, created_by, updated_by, created_at, updated_at, deleted_at, destroy_after
+RETURNING secret_id, secret_uuid, tenant_id, project_id, environment_id, folder_id, mrn_service, mrn_tenant, mrn_project, mrn_resource_path, key, description, tags, current_version, keep_versions, rotation_policy, rotated_at, expires_at, lease_ttl_seconds, lease_max_ttl_seconds, lease_max_reads, metadata, created_by, updated_by, created_at, updated_at, deleted_at, destroy_after
 `
 
 type UpdateSecretMetaParams struct {
@@ -951,6 +1068,9 @@ func (q *Queries) UpdateSecretMeta(ctx context.Context, arg UpdateSecretMetaPara
 		&i.RotationPolicy,
 		&i.RotatedAt,
 		&i.ExpiresAt,
+		&i.LeaseTtlSeconds,
+		&i.LeaseMaxTtlSeconds,
+		&i.LeaseMaxReads,
 		&i.Metadata,
 		&i.CreatedBy,
 		&i.UpdatedBy,

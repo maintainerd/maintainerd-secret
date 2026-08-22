@@ -25,11 +25,17 @@ interface PrivateLayoutProps {
  * forgetting it is on. It renders inside the content inset (below the fixed bar)
  * so it cannot be scrolled away from either.
  *
+ * IT NOW SAYS WHAT THE SERVICE REPORTED, not what this console guessed. The
+ * banner used to be shown whenever the console had no identity configuration,
+ * which conflated two opposite states — see `authContext.ts`. `identity-missing`
+ * gets its own banner and its own text, because "no token is needed" and "a token
+ * is required and I cannot get one" must not read the same.
+ *
  * Access gating (auth, setup completion, scope) is handled by the route tree in
  * App.tsx; this layout only renders chrome.
  */
 export function PrivateLayout({ fullWidth = false }: PrivateLayoutProps) {
-  const { mode } = useAuth()
+  const { mode, capabilities } = useAuth()
 
   return (
     <div className="min-h-svh bg-background">
@@ -47,10 +53,39 @@ export function PrivateLayout({ fullWidth = false }: PrivateLayoutProps) {
                 aria-hidden="true"
               />
               <p>
-                <span className="font-medium">No identity is configured.</span> This console is
-                calling the API without a bearer token, which only works while the service runs in
-                development-open mode — where it serves every caller as a blanket-granted
-                principal. Never point this build at a production vault.
+                <span className="font-medium">
+                  This vault reports its guard is development-open.
+                </span>{' '}
+                It serves every caller as a blanket-granted principal, so this console is calling
+                the API without a bearer token — and so is anything else that can reach it. Never
+                run a production vault in this mode.
+              </p>
+            </div>
+          )}
+
+          {mode === 'identity-missing' && (
+            <div
+              role="status"
+              className="flex items-start gap-2 border-b border-destructive/40 bg-destructive/10 px-4 py-2 text-sm sm:px-6"
+            >
+              <ShieldAlert
+                className="mt-0.5 size-4 shrink-0 text-destructive"
+                aria-hidden="true"
+              />
+              <p>
+                <span className="font-medium">
+                  This vault enforces authentication and this console has no identity configured.
+                </span>{' '}
+                Every request will be refused until{' '}
+                <code>SECRET_CONSOLE_CLIENT_ID</code>, <code>AUTH_ISSUER</code> and{' '}
+                <code>SECRET_CONSOLE_TOKEN_URL</code> are set for this build.
+                {capabilities?.auth ? (
+                  <>
+                    {' '}
+                    The service expects tokens from <code>{capabilities.auth.issuer}</code> for
+                    audience <code>{capabilities.auth.audience}</code>.
+                  </>
+                ) : null}
               </p>
             </div>
           )}

@@ -18,6 +18,7 @@ const SECRET: SecretMeta = {
   tags: ['db', 'prod'],
   current_version: 4,
   keep_versions: 10,
+  value_type: 'text',
   rotation_policy: {},
   mrn_resource_path: 'secret/app/prod/db/DATABASE_PASSWORD',
   mrn: 'mrn:secret:acme:secret/app/prod/db/DATABASE_PASSWORD',

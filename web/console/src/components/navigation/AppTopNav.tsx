@@ -48,6 +48,12 @@ const resourceLinks = [
 export function AppTopNav() {
   const { mode, signOut } = useAuth()
   const guardOpen = mode === 'guard-open'
+  // The chip has THREE states, not two. `identity-missing` means the service is
+  // enforcing and this console cannot obtain a token, so a plain "Guarded" would be
+  // technically true and actively misleading — the operator would read the reassuring
+  // chip while every request comes back 401. The banner in PrivateLayout names the
+  // settings to fix; the chip's job is to not contradict it.
+  const tokenUnobtainable = mode === 'identity-missing'
 
   return (
     <header
@@ -82,15 +88,17 @@ export function AppTopNav() {
           className={
             guardOpen
               ? 'hidden items-center gap-1.5 rounded-md border border-destructive/60 bg-destructive/20 px-2 py-1 text-xs font-medium text-red-200 sm:inline-flex'
-              : 'hidden items-center gap-1.5 rounded-md border border-slate-700 bg-white/5 px-2 py-1 text-xs font-medium text-slate-300 sm:inline-flex'
+              : tokenUnobtainable
+                ? 'hidden items-center gap-1.5 rounded-md border border-amber-500/60 bg-amber-500/15 px-2 py-1 text-xs font-medium text-amber-200 sm:inline-flex'
+                : 'hidden items-center gap-1.5 rounded-md border border-slate-700 bg-white/5 px-2 py-1 text-xs font-medium text-slate-300 sm:inline-flex'
           }
         >
-          {guardOpen ? (
+          {guardOpen || tokenUnobtainable ? (
             <ShieldAlert className="size-3.5" aria-hidden="true" />
           ) : (
             <ShieldCheck className="size-3.5" aria-hidden="true" />
           )}
-          {guardOpen ? 'Guard open' : 'Guarded'}
+          {guardOpen ? 'Guard open' : tokenUnobtainable ? 'No credentials' : 'Guarded'}
         </span>
 
         <DropdownMenu>

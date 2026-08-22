@@ -23,6 +23,7 @@ import (
 	"github.com/maintainerd/secret/internal/crypto"
 	"github.com/maintainerd/secret/internal/grpcserver"
 	"github.com/maintainerd/secret/internal/httpapi"
+	"github.com/maintainerd/secret/internal/leader"
 	"github.com/maintainerd/secret/internal/platform/config"
 	"github.com/maintainerd/secret/internal/platform/database"
 	"github.com/maintainerd/secret/internal/platform/logging"
@@ -74,6 +75,7 @@ func run(parent context.Context) error {
 	})
 
 	slog.Info("starting maintainerd-secret",
+		"version", config.AppVersion,
 		"app_env", config.AppEnv,
 		"mode", config.DescribeMode(),
 		"grpc_port", config.GRPCAddr,
@@ -82,12 +84,12 @@ func run(parent context.Context) error {
 	)
 	logRunMode()
 
-	rootKey, err := crypto.NewRootKeyProvider(crypto.ProviderConfig{
-		Provider: config.RootKeyProvider,
-		AppEnv:   config.AppEnv,
-		Key:      config.RootKey,
-		KeyFile:  config.RootKeyFile,
-	})
+	// config owns the assembly, rather than this call listing fields inline. The four
+	// AES fields were listed here once, and adding the KMS providers silently made that
+	// list incomplete: the cloud settings arrived zero-valued, so every KMS provider
+	// failed its own settings check no matter how the operator configured it. A single
+	// accessor cannot drift from the variables it reads.
+	rootKey, err := crypto.NewRootKeyProvider(config.RootKeyProviderConfig())
 	if err != nil {
 		return err
 	}
@@ -157,16 +159,50 @@ func run(parent context.Context) error {
 	}
 
 	var notifier api.Notifier
+	var redriver *webhook.Redriver
 	if config.WebhooksEnabled {
+		// The INLINE half. Its retry budget is measured in milliseconds because it runs
+		// on the write path; anything it cannot deliver is handed to the durable loop
+		// below by parking the delivery row, not by holding the write open.
+		redriveDelay := time.Duration(0)
+		if config.WebhookRedriveEnabled {
+			redriveDelay = config.WebhookRedriveBaseBackoff
+		}
 		notifier = webhook.New(svc, webhook.Options{
 			Enabled:     true,
 			Concurrency: config.WebhookConcurrency,
 			// The same bounds the API applies at registration, applied again at
 			// delivery. A stored row can carry a larger value than the API would
 			// accept today, and a delivery runs inline on a secret write.
-			MaxTimeout:  time.Duration(config.WebhookMaxTimeoutSeconds) * time.Second,
-			MaxAttempts: int32(config.WebhookMaxAttempts),
+			MaxTimeout:   time.Duration(config.WebhookMaxTimeoutSeconds) * time.Second,
+			MaxAttempts:  int32(config.WebhookMaxAttempts),
+			RedriveDelay: redriveDelay,
 		})
+
+		// The DURABLE half — see internal/webhook/redrive.go. It is constructed even
+		// when disabled so the log line below states which it is; Enabled() gates the
+		// loop.
+		redriver = webhook.NewRedriver(svc, webhook.RedriveOptions{
+			Enabled:     config.WebhookRedriveEnabled,
+			Interval:    config.WebhookRedriveInterval,
+			Batch:       config.WebhookRedriveBatch,
+			MaxAttempts: int32(config.WebhookRedriveMaxAttempts),
+			BaseBackoff: config.WebhookRedriveBaseBackoff,
+			MaxBackoff:  config.WebhookRedriveMaxBackoff,
+			MaxTimeout:  time.Duration(config.WebhookMaxTimeoutSeconds) * time.Second,
+		})
+		if config.WebhookRedriveEnabled {
+			slog.Info("webhook re-drive enabled",
+				"interval", config.WebhookRedriveInterval.String(),
+				"batch", config.WebhookRedriveBatch,
+				"max_attempts", config.WebhookRedriveMaxAttempts,
+				"backoff", config.WebhookRedriveBaseBackoff.String()+" doubling to "+config.WebhookRedriveMaxBackoff.String(),
+				"detail", "a delivery that fails inline is retried durably and marked permanently failed once the budget is spent")
+		} else {
+			slog.Warn("webhook re-drive is DISABLED — a delivery that fails inline is never retried",
+				"effect", "a consumer that missed a rotation notification keeps using a replaced credential until it polls",
+				"variable", "SECRET_WEBHOOK_REDRIVE_ENABLED")
+		}
 	}
 
 	appSvc, err := api.New(svc, auditor, notifier, api.Options{
@@ -196,19 +232,55 @@ func run(parent context.Context) error {
 	secretAPI := grpcserver.New(appSvc, setupSvc, config.SetupBootstrapToken, config.IsDevelopment(), config.DefaultTenant)
 	setupAPI := grpcserver.NewSetupServer(setupSvc)
 
+	// LEADER ELECTION, resolved before the workers that depend on it.
+	//
+	// Every request surface in this service is safe on N replicas. The BACKGROUND
+	// work is not: two replicas ticking the rotator find the same due secret and
+	// rotate it twice — two versions, two webhook fan-outs, and a consumer holding a
+	// value that is already superseded. So the periodic work runs on exactly one
+	// replica, chosen by a PostgreSQL advisory lock (see internal/leader for why an
+	// advisory lock rather than a lease table).
+	var elector *leader.Elector
+	if config.LeaderElectionEnabled {
+		elector = leader.New(leader.NewPgLocker(pool), leader.Options{})
+		slog.Info("leader election enabled",
+			"lock", elector.Name(), "lock_key", elector.Key(),
+			"detail", "background workers run on the replica that holds this advisory lock")
+	}
+
 	// ONE LIMITER FOR BOTH TRANSPORTS. A per-transport budget is not a budget: a
 	// client that has spent its reveal allowance over REST would otherwise open a gRPC
 	// channel and spend another one. Both surfaces reach the same secrets with the
 	// same grants, so they share a counter keyed by the same principal.
+	//
+	// AND ONE BUDGET ACROSS REPLICAS, for the same reason one step out: a per-process
+	// counter on N replicas is N times the configured ceiling, and the reveal ceiling
+	// is the exfiltration bound on a compromised token. The shared budget is metered
+	// through the PostgreSQL this service already requires — no new dependency in
+	// front of the reveal path — and it reserves slices rather than counting per
+	// request, so it costs no round trip on the hot path. Full protocol and
+	// trade-offs: internal/platform/middleware/rate_limit.go.
 	var limiter *mw.Limiter
+	var rateLimitStore *mw.PgReservationStore
 	if config.RateLimitEnabled {
 		limiter = mw.NewLimiter(config.RateLimitWindow)
-		slog.Info("rate limiting enabled (in-process, per-replica)",
+		if config.RateLimitShared {
+			rateLimitStore = mw.NewPgReservationStore(pool)
+			// ctx, not context.Background(): a reservation in flight when SIGTERM
+			// arrives is cancelled with the rest of the process rather than
+			// outliving the drain.
+			limiter.WithStore(ctx, rateLimitStore)
+		}
+		scope := "per-replica (counters are per-process; with N replicas the effective ceiling is N times these numbers)"
+		if limiter.IsShared() {
+			scope = "shared across replicas (postgres-backed reservations; degrades to per-replica if the database is unreachable)"
+		}
+		slog.Info("rate limiting enabled",
 			"window", config.RateLimitWindow.String(),
 			"reveal_per_window", config.RateLimitReveal,
 			"write_per_window", config.RateLimitWrite,
 			"setup_per_window", config.RateLimitSetup,
-			"caveat", "counters are per-process; with N replicas the effective ceiling is N times these numbers")
+			"scope", scope)
 	} else {
 		slog.Warn("rate limiting is DISABLED — the reveal and setup surfaces are unmetered",
 			"variable", "SECRET_RATE_LIMIT_ENABLED")
@@ -233,7 +305,7 @@ func run(parent context.Context) error {
 	// no allowlist. maintainerd.secret.v1 has no streaming RPC today, which is exactly
 	// why that hole was invisible; wiring it now means the first one added arrives
 	// guarded instead of open.
-	gs := grpc.NewServer(
+	grpcOpts := []grpc.ServerOption{
 		grpc.ChainUnaryInterceptor(
 			grpcserver.RecoveryUnaryInterceptor(),
 			grpcserver.AuthUnaryInterceptor(guard),
@@ -246,7 +318,43 @@ func run(parent context.Context) error {
 		grpc.ChainStreamInterceptor(
 			grpcserver.AuthStreamInterceptor(guard),
 		),
-	)
+	}
+
+	// TRANSPORT SECURITY, INSTALLED BEFORE THE SERVER EXISTS.
+	//
+	// The interceptors above prove what a caller is ALLOWED to do. Mutual TLS decides
+	// whether a caller reaches an interceptor at all — and on this listener that
+	// matters more than usual, because SetupService is here: the RPC through which
+	// maintainerd-core provisions this vault and records itself as controller. A
+	// bearer token asserts "I am core"; a verified client certificate proves it.
+	//
+	// config has already refused the combinations that cannot be served safely (a
+	// partial set in any environment; no material at all in core mode outside
+	// development), so a nil credential here means "config decided plaintext is
+	// permissible for this run", not "the material failed to load" — that is an error
+	// and returns below.
+	creds, err := grpcserver.ServerCredentials(grpcserver.TLSOptions{
+		CertFile:     config.GRPCTLSCertFile,
+		KeyFile:      config.GRPCTLSKeyFile,
+		ClientCAFile: config.GRPCClientCAFile,
+	})
+	if err != nil {
+		return err
+	}
+	if creds != nil {
+		grpcOpts = append(grpcOpts, grpc.Creds(creds))
+		slog.Info("grpc listener: mutual TLS enabled",
+			"client_auth", "RequireAndVerifyClientCert",
+			"min_version", "TLS 1.2",
+			"cipher_policy", "ECDHE key exchange, AEAD bulk encryption only (no CBC, no static RSA)",
+			"client_ca", config.GRPCClientCAFile)
+	} else {
+		slog.Warn("grpc listener: serving WITHOUT TLS",
+			"acceptable_only_if", "a service mesh or sidecar terminates mTLS in front of this process",
+			"to_enable", "SECRET_GRPC_CERT_FILE, SECRET_GRPC_KEY_FILE, SECRET_GRPC_CA_FILE")
+	}
+
+	gs := grpc.NewServer(grpcOpts...)
 	secretv1.RegisterSecretServiceServer(gs, secretAPI)
 	secretv1.RegisterSetupServiceServer(gs, setupAPI)
 	healthpb.RegisterHealthServer(gs, health.NewServer())
@@ -260,6 +368,12 @@ func run(parent context.Context) error {
 		Enabled:  config.RotationEnabled,
 		Interval: config.RotationInterval,
 		Batch:    config.RotationBatch,
+		// leader.Wrap, NOT a bare `elector`. Assigning a nil *Elector to this
+		// interface field would produce a non-nil interface holding a nil pointer,
+		// IsLeader would answer false, and the rotator would silently never run —
+		// the exact opposite of what disabling election is meant to do. Wrap
+		// collapses the nil pointer to a nil interface, which means "no election".
+		Leader: leader.Wrap(elector),
 	})
 
 	restServer := httpapi.NewServer(appSvc, setupSvc, guard, httpapi.Options{
@@ -275,17 +389,41 @@ func run(parent context.Context) error {
 			Setup:   config.RateLimitSetup,
 		},
 		Readiness: readinessChecks(pool, guard),
+		// The anonymous capability probe's static half. The issuer and audience are
+		// handed over unconditionally and PUBLISHED only when the guard actually
+		// resolved to enforced (see internal/httpapi/capabilities.go), so a leftover
+		// pair in a dev-open instance's environment is never advertised as verified.
+		Capabilities: httpapi.CapabilityInfo{
+			Version:      config.AppVersion,
+			RunMode:      config.Mode,
+			AuthIssuer:   config.AuthIssuer,
+			AuthAudience: config.AuthAudience,
+		},
+		// Serving the console from this process. Empty in development (it runs under
+		// vite there); set by the release image, which bakes the built SPA at
+		// /srv/console. config has already proved the path is servable.
+		ConsoleDir: config.ConsoleDir,
 	})
 	// The REST server owns its own limiter instance by default; replace it with the
 	// shared one so the two transports spend one budget.
 	restServer.UseLimiter(limiter)
+	// The console's directory handle is released on the way out. Deferred here rather
+	// than after server.Run so it also covers an early return below.
+	defer func() { _ = restServer.Close() }()
+	if config.ConsoleDir != "" {
+		slog.Info("serving the console from this process",
+			"dir", config.ConsoleDir,
+			"detail", "mounted at / outside the guarded /api/v1 group, with an index.html fallback for SPA deep links")
+	}
 
 	timeouts := serverTimeouts{
-		ReadHeader: config.HTTPReadHeaderTimeout,
-		Read:       config.HTTPReadTimeout,
-		Write:      config.HTTPWriteTimeout,
-		Idle:       config.HTTPIdleTimeout,
-		Shutdown:   config.ShutdownTimeout,
+		ReadHeader:  config.HTTPReadHeaderTimeout,
+		Read:        config.HTTPReadTimeout,
+		Write:       config.HTTPWriteTimeout,
+		Idle:        config.HTTPIdleTimeout,
+		Shutdown:    config.ShutdownTimeout,
+		TLSCertFile: config.HTTPTLSCertFile,
+		TLSKeyFile:  config.HTTPTLSKeyFile,
 	}
 
 	slog.Info("serving", "shutdown_timeout", config.ShutdownTimeout.String())
@@ -300,7 +438,92 @@ func run(parent context.Context) error {
 		// returns once the current pass finishes, so errgroup.Wait below is what makes
 		// SIGTERM drain the rotator as well as the two servers.
 		func(c context.Context) error { rot.Run(c); return nil },
+		// The election campaign. Also never an error: a replica that cannot reach the
+		// database to campaign is a FOLLOWER, which is the safe answer — refusing to
+		// serve secrets because this process could not decide who runs the background
+		// work would turn a degradation into an outage. Run resigns on the way out,
+		// so SIGTERM releases the lock and a surviving replica is promoted
+		// immediately rather than after PostgreSQL notices a dead backend.
+		func(c context.Context) error {
+			if elector != nil {
+				elector.Run(c)
+			}
+			return nil
+		},
+		// Leader-only maintenance of the shared rate-limit table.
+		func(c context.Context) error {
+			runRateLimitPruner(c, leader.Wrap(elector), rateLimitStore, config.RateLimitWindow)
+			return nil
+		},
+		// The durable webhook re-drive loop, leader-gated through the SAME election the
+		// rotator and the pruner use — so a backlog is drained by one replica at a
+		// steady rate rather than by all of them at once.
+		//
+		// Correctness does not actually depend on the gate: the claim query is
+		// FOR UPDATE SKIP LOCKED and leases each row before attempting it, so the
+		// worker cannot double-post even with election disabled or misconfigured. The
+		// gate is about not multiplying the outbound request rate by the replica count.
+		func(c context.Context) error {
+			runWebhookRedrive(c, leader.Wrap(elector), redriver)
+			return nil
+		},
 	)
+}
+
+// runWebhookRedrive runs the durable webhook retry loop on the leader.
+//
+// It is wired through leader.RunPeriodic — the same helper the rate-limit pruner uses
+// — so the loop's operational contract (a recovered panic, a non-fatal error, a logged
+// leadership transition) is the shared one rather than a second hand-written ticker.
+func runWebhookRedrive(ctx context.Context, election leader.Election, redriver *webhook.Redriver) {
+	if redriver == nil || !redriver.Enabled() {
+		return
+	}
+	leader.RunPeriodic(ctx, election, "webhook-redrive", redriver.Interval(), redriver.Tick)
+}
+
+// rateLimitPrunerRetentionWindows is how many closed windows of bucket rows are kept
+// before the pruner deletes them.
+//
+// Ten rather than one, and the margin is the point: the limiter never reads a closed
+// window, so a kept row is pure waste — but DELETING a window some replica still
+// considers live would hand out its budget twice. Ten windows is far beyond any clock
+// skew worth worrying about and still bounds the table to minutes of history.
+const rateLimitPrunerRetentionWindows = 10
+
+// rateLimitPrunerMinInterval floors the pruning cadence, so a deployment running a
+// very short rate-limit window does not turn the pruner into a busy loop.
+const rateLimitPrunerMinInterval = 30 * time.Second
+
+// runRateLimitPruner deletes closed rate-limit windows, on the leader only.
+//
+// EVERY REPLICA COULD SAFELY RUN THIS — deleting expired rows is idempotent — so the
+// gate is not about correctness but about cost: N replicas issuing the same DELETE is
+// N times the write load and N times the vacuum churn for exactly one result. It is
+// wired through leader.RunPeriodic, which is the same helper any other background
+// worker in this service should adopt (webhook re-drive, a lease reaper, version
+// retention) to become multi-replica-safe.
+func runRateLimitPruner(ctx context.Context, election leader.Election, store *mw.PgReservationStore, window time.Duration) {
+	if store == nil {
+		// No shared store: no table, nothing to prune.
+		return
+	}
+	interval := 2 * window
+	if interval < rateLimitPrunerMinInterval {
+		interval = rateLimitPrunerMinInterval
+	}
+	retention := time.Duration(rateLimitPrunerRetentionWindows) * window
+
+	leader.RunPeriodic(ctx, election, "rate-limit-bucket-pruner", interval, func(c context.Context) error {
+		deleted, err := store.Prune(c, time.Now().Add(-retention))
+		if err != nil {
+			return err
+		}
+		if deleted > 0 {
+			slog.Debug("rate limit buckets pruned", "rows", deleted, "older_than", retention.String())
+		}
+		return nil
+	})
 }
 
 // logRunMode states, at boot, which world this instance is running in and — in

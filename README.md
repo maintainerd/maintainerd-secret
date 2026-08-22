@@ -88,16 +88,141 @@ Every version gets its **own DEK**. The DEK encrypts the payload; a **root key
 
 The key always comes from **outside** the database — a store cannot unlock itself.
 
-| Provider | Status | Notes |
+| Provider | Where the KEK lives | Settings it needs |
 |---|---|---|
-| `env` | built | 32 bytes from `SECRET_ROOT_KEY`, hex or base64, validated |
-| `file` | built | sealed key file; **refuses** a group/world-readable file |
-| `aws_kms` `gcp_kms` `azure_kv` | registered, not built | the interface is the seam; config for them validates today, construction fails with a clear message |
+| `env` | this process's memory, from `SECRET_ROOT_KEY` (32 bytes, hex or base64, validated) | `SECRET_ROOT_KEY` |
+| `file` | a sealed key file; **refuses** a group/world-readable file | `SECRET_ROOT_KEY_FILE` (mode `0600`) |
+| `aws_kms` | AWS KMS — the key material never leaves the service | `SECRET_KMS_AWS_KEY_ID`, `SECRET_KMS_AWS_REGION` |
+| `gcp_kms` | Google Cloud KMS | `SECRET_KMS_GCP_KEY_NAME` |
+| `azure_kv` | Azure Key Vault (RSA key, `RSA-OAEP-256`) | `SECRET_KMS_AZURE_VAULT_URL`, `SECRET_KMS_AZURE_KEY_NAME` |
 
 **Outside `APP_ENV=development` a missing or malformed root key is a boot error** —
 never a silently generated one. A generated key makes every secret written before the
 next restart permanently undecryptable, and the failure is invisible until it is far
 too late.
+
+The same rule applies to the cloud providers, and it is why they are checked **twice
+before the service serves a request**:
+
+1. **Config validation.** Selecting a provider without its settings is a boot error
+   naming every missing variable at once. A GCP key name is checked for shape (and a
+   `/cryptoKeyVersions/...` suffix is refused — `Encrypt` accepts one, `Decrypt` does
+   not, so a pinned version would wrap happily and fail every unwrap). An Azure vault
+   URL must be `https`.
+2. **A boot self-test.** Each cloud provider wraps and unwraps a throwaway probe
+   during construction, so it exercises **both halves of the grant**. An IAM policy
+   with encrypt but not decrypt is the failure this catches: without it the service
+   starts, accepts writes, and discovers on the first read that it cannot decrypt
+   anything it wrote. Cost: two KMS calls per process start.
+
+#### How a cloud root key is bound
+
+Each provider binds the wrap to **this service and this `kek_id`**, so a wrapped DEK
+cannot be presented as though a different key or a different service had produced it —
+the same property the AES providers get from GCM's AAD.
+
+| Provider | Binding | Nonce |
+|---|---|---|
+| `aws_kms` | `EncryptionContext` (`maintainerd_service`, `kek_id`) — KMS authenticates it, and it also shows up in CloudTrail. `Decrypt` additionally **pins `KeyId`**, so a blob naming some other key is refused instead of decrypted | none — KMS returns one self-describing blob |
+| `gcp_kms` | `AdditionalAuthenticatedData`, plus CRC32C checksums in both directions so a DEK corrupted in transit is refused rather than wrapped | none |
+| `azure_kv` | `RSA-OAEP-256` has **no AAD channel**, so the binding is framed into the wrapped plaintext and verified on unwrap. (Key Vault's `AdditionalAuthenticatedData` field applies only to the authenticated symmetric algorithms; setting it under RSA-OAEP would be silently ignored — which looks like a binding and is not one) | none |
+
+Every cloud call has a per-call deadline (`SECRET_KMS_TIMEOUT`, default `10s`) and
+retries **transient failures only** — a throttle or a 5xx, up to three attempts with
+jittered backoff. `AccessDenied`, `NotFound` and a failed decryption are not retried:
+they read the same on the third attempt, and retrying turns one clear error into three
+slow ones. No error from any provider carries a DEK or a wrapped blob, in any encoding.
+
+#### Least-privilege IAM
+
+Grant exactly these on the root key — nothing else is called.
+
+**AWS KMS** — a symmetric `ENCRYPT_DECRYPT` key. On the key policy (or the service's
+role), condition the grant on the encryption context so the key cannot be used for
+anything else:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["kms:Encrypt", "kms:Decrypt"],
+  "Resource": "arn:aws:kms:us-east-2:111122223333:key/<key-id>",
+  "Condition": {
+    "StringEquals": { "kms:EncryptionContext:maintainerd_service": "maintainerd-secret" }
+  }
+}
+```
+
+**GCP KMS** — on the CryptoKey, not the project. The two permissions are
+`cloudkms.cryptoKeyVersions.useToEncrypt` and
+`cloudkms.cryptoKeyVersions.useToDecrypt`, both carried by the predefined role:
+
+```bash
+gcloud kms keys add-iam-policy-binding root \
+  --location=us-east1 --keyring=secret \
+  --member="serviceAccount:maintainerd-secret@<project>.iam.gserviceaccount.com" \
+  --role=roles/cloudkms.cryptoKeyEncrypterDecrypter
+```
+
+**Azure Key Vault** — the data-plane operations are `wrapKey` and `unwrapKey` (not
+`encrypt`/`decrypt`, which would let this service encrypt arbitrary data):
+
+```bash
+# RBAC vaults: the built-in role that carries wrapKey/unwrapKey
+az role assignment create --assignee <principal-id> \
+  --role "Key Vault Crypto User" \
+  --scope "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.KeyVault/vaults/<vault>"
+
+# access-policy vaults: exactly the two operations
+az keyvault set-policy --name <vault> --object-id <principal-id> --key-permissions get wrapKey unwrapKey
+```
+
+#### Operator smoke test
+
+The unit suite proves the adapters against fakes; it cannot prove that *your* key
+exists and *your* principal can reach it. Run one of these before deploying — a
+failure here is the same failure the boot self-test would report, minus the outage.
+
+```bash
+# AWS — a real encrypt/decrypt round trip through the configured key
+CT=$(aws kms encrypt --region "$SECRET_KMS_AWS_REGION" --key-id "$SECRET_KMS_AWS_KEY_ID" \
+       --plaintext "$(openssl rand -base64 32)" --query CiphertextBlob --output text)
+aws kms decrypt --region "$SECRET_KMS_AWS_REGION" --key-id "$SECRET_KMS_AWS_KEY_ID" \
+  --ciphertext-blob "fileb://<(printf %s "$CT" | base64 -d)" --query Plaintext --output text >/dev/null && echo "aws_kms OK"
+
+# GCP — same, against the CryptoKey named by SECRET_KMS_GCP_KEY_NAME
+openssl rand 32 > /tmp/probe
+gcloud kms encrypt --key "$SECRET_KMS_GCP_KEY_NAME" \
+  --plaintext-file=/tmp/probe --ciphertext-file=/tmp/probe.enc
+gcloud kms decrypt --key "$SECRET_KMS_GCP_KEY_NAME" \
+  --ciphertext-file=/tmp/probe.enc --plaintext-file=/tmp/probe.out
+cmp /tmp/probe /tmp/probe.out && echo "gcp_kms OK"; shred -u /tmp/probe /tmp/probe.enc /tmp/probe.out
+
+# Azure — reachability and authentication. The az CLI has no wrap/unwrap verb, so the
+# wrapKey/unwrapKey grant itself is what the boot self-test confirms.
+az keyvault key show --vault-base-url "$SECRET_KMS_AZURE_VAULT_URL" \
+  --name "$SECRET_KMS_AZURE_KEY_NAME" --query "key.kty" -o tsv && echo "azure_kv reachable"
+```
+
+#### Rotating between providers
+
+Rotation re-wraps DEKs and **never rewrites ciphertext**, so moving the root of trust
+between any two providers — `env` → `aws_kms`, `aws_kms` → `gcp_kms`, anything → 
+anything — is an update of a few dozen bytes per version rather than a re-encryption
+of the store.
+
+1. Provision the new key and grant the two permissions above.
+2. Point `SECRET_ROOT_KEY_PROVIDER` (and the new provider's settings) at it, **keeping
+   the old provider's settings in place** — the old key must stay loadable until the
+   rewrap has drained it. Settings for an unselected provider are read and not
+   validated, precisely so both can coexist through a migration.
+3. Restart. The new key becomes the active write key and is registered in `root_keys`;
+   existing versions keep their recorded `kek_id` and stay readable through the
+   keyring.
+4. Run the rewrap. It is batched (`SECRET_REWRAP_BATCH_SIZE`), resumable — progress
+   lives in the data, so a crashed pass is resumed by running it again — and
+   idempotent. The old key is retired only once a `COUNT` proves no version still
+   references it; a key retired early would leave those rows permanently unreadable.
+5. Remove the old provider's settings once `root_keys` shows it retired.
 
 ## Lifecycle
 
@@ -654,6 +779,20 @@ about, not refused. The API answers 503 in the meantime.
 | `SECRET_ROOT_KEY_PROVIDER` | `env` | `env`\|`file`\|`aws_kms`\|`gcp_kms`\|`azure_kv` |
 | `SECRET_ROOT_KEY` | — | 32-byte AES-256 KEK as hex or base64. **Required outside development.** Never log it |
 | `SECRET_ROOT_KEY_FILE` | — | sealed key file for the `file` provider; must be `0600` |
+| `SECRET_KMS_TIMEOUT` | `10s` | bounds ONE cloud wrap or unwrap. The root key is on the read and write path of every secret, so an unbounded call would hold a request goroutine as long as the network allowed |
+| `SECRET_KMS_AWS_KEY_ID` | — | **required for `aws_kms`.** Key ARN, key id, `alias/...` name, or alias ARN of a symmetric `ENCRYPT_DECRYPT` key |
+| `SECRET_KMS_AWS_REGION` | — | **required for `aws_kms`** (falls back to `AWS_REGION`, then `AWS_DEFAULT_REGION`). Explicit because the region is part of the `kek_id`: an alias is region-scoped |
+| `SECRET_KMS_GCP_KEY_NAME` | — | **required for `gcp_kms`.** `projects/{p}/locations/{l}/keyRings/{r}/cryptoKeys/{k}`. A `/cryptoKeyVersions/...` suffix is refused at boot |
+| `SECRET_KMS_AZURE_VAULT_URL` | — | **required for `azure_kv`.** `https://{vault}.vault.azure.net/`; must be `https` |
+| `SECRET_KMS_AZURE_KEY_NAME` | — | **required for `azure_kv`.** The RSA key's name in that vault |
+| `SECRET_KMS_AZURE_KEY_VERSION` | — | optional; empty means the vault's current version, which is the normal choice |
+
+Only the **selected** provider's settings are required. Settings for the others are
+read and left unvalidated on purpose, so an operator mid-migration can keep both sets
+in place through the rewrap. Credentials are resolved by each cloud's own SDK chain —
+AWS: environment, instance role, web identity (IRSA), shared profile; GCP: Application
+Default Credentials; Azure: `DefaultAzureCredential` — this service reads none of them
+itself.
 
 ### Store policy
 | Var | Default | Purpose |
@@ -700,5 +839,96 @@ With **none** set:
 | `SECRET_DEFAULT_PROJECT` | `default` | " |
 | `SECRET_DEFAULT_ENVIRONMENT` | `default` | " |
 
+### Transport security
+
+Two listeners, two postures, and the asymmetry is deliberate.
+
+**gRPC** is the service-to-service and **control-plane** surface: it carries
+`SetupService`, through which maintainerd-core provisions this vault and records
+itself as controller. A bearer token *asserts* that a peer is core; a verified client
+certificate *proves* it. All three variables together, or none.
+
+| Var | Default | Purpose |
+|---|---|---|
+| `SECRET_GRPC_CERT_FILE` | — | this service's gRPC server certificate |
+| `SECRET_GRPC_KEY_FILE` | — | its private key |
+| `SECRET_GRPC_CA_FILE` | — | the CA whose **client** certificates this listener accepts. Its presence is what makes the listener mutual: `tls.RequireAndVerifyClientCert`, so an unverified peer never reaches an interceptor |
+
+When configured: **TLS 1.2 minimum**, and a cipher policy narrowed to suites that are
+both forward-secret (ECDHE) and AEAD (GCM or ChaCha20-Poly1305). No CBC suites, so
+none of the padding-oracle family; no static-RSA suites, so recorded traffic cannot be
+decrypted later from a leaked server key. TLS 1.3 is negotiated in preference whenever
+the peer supports it, and its suites are not configurable because all three are
+already AEAD and forward-secret.
+
+Fail-closed behaviour, by case:
+
+| Situation | Result |
+|---|---|
+| **Partial** set (one or two of the three) | **Boot error, in every environment** — including development. This is the case that looks configured: a cert and key with no CA is server-only TLS that accepts *any* client while the operator believes peers are verified |
+| None set, `MAINTAINERD_MODE=core`, outside development | **Boot error.** In core mode this listener is the control plane and is never served in the clear — no silent plaintext downgrade |
+| None set, `standalone`, outside development | **Loud warning, every boot.** Service-to-service traffic between workloads you already run, commonly with a mesh terminating mTLS below this process. Refusing would break those deployments to protect them from a risk they have already handled |
+| None set, `APP_ENV=development` | Plaintext. The laptop case the development degrade exists for |
+| Bad material (unreadable file, CA with no PEM, mismatched key) | **Boot error** naming the file. There is no path from bad material to a plaintext listener |
+
+**HTTP** is the REST API and the console's origin, and in every sanctioned deployment
+it sits behind a terminating proxy (nginx in the dev stack, an ingress in production).
+Direct TLS is therefore **optional** — offered for the operator who serves it
+directly, not mandated for the majority who do not.
+
+| Var | Default | Purpose |
+|---|---|---|
+| `SECRET_TLS_CERT_FILE` | — | serve the REST surface over TLS directly. Both or neither; one alone is a boot error |
+| `SECRET_TLS_KEY_FILE` | — | " |
+
+When set, the same TLS 1.2 floor and cipher policy apply. HSTS is unaffected either
+way: it is emitted in production when the request arrived over TLS directly *or*
+through a proxy that says so via `X-Forwarded-Proto`, so the terminating-proxy
+deployment is already covered.
+
+**gRPC reflection is registered only in development** and announces itself loudly when
+it is. Reflection enumerates every RPC and message — convenient with `grpcurl` on a
+laptop, a map of the vault's API handed to anyone who can open a socket in production.
+There is no pprof, expvar, or other debug surface in the binary at all.
+
+### Multi-replica (HA)
+
+Every request surface is safe on N replicas. The **background work** is not, so it is
+gated on a leader lock — a PostgreSQL **advisory lock**, chosen because it needs no
+new dependency and, being session-scoped, **dies with the connection**: a crashed
+leader frees the lock with no lease to expire and no reaper to run. See
+[`internal/leader`](internal/leader/leader.go) for the full contrast with a lease
+table.
+
+| Var | Default | Purpose |
+|---|---|---|
+| `SECRET_LEADER_ELECTION_ENABLED` | `true` | run the background workers (rotator, webhook re-drive, rate-limit pruning) on exactly one replica |
+| `SECRET_RATE_LIMIT_SHARED` | `true` | meter the rate-limit budgets through PostgreSQL so they span the replica set |
+
+**Both default on, because the failures they prevent are invisible.** Two replicas
+both rotating produce two versions and two webhook fan-outs for one secret — a
+consumer that re-read after the first notification is holding a value that is already
+superseded — and the service looks perfectly healthy doing it. A per-process rate
+limit on three replicas is a reveal budget of 3x the configured number, and the reveal
+budget is the exfiltration bound on a compromised token. An operator should have to
+opt *out* of correctness, not in; turning either off warns at boot rather than
+refusing, because both are legitimate for a single-replica deployment.
+
+The shared rate limiter **reserves** slices of the window's budget rather than
+counting per request, so it costs no database round trip on the hot path — and the
+trade-off is stated honestly in
+[`rate_limit.go`](internal/platform/middleware/rate_limit.go): a replica that reserves
+a slice and goes idle strands the unspent remainder for the rest of the window, so the
+fleet-wide ceiling holds exactly while the floor is slightly lower than a perfect
+global counter's. If the database is unreachable it **degrades to per-replica
+metering** — never to no limit, and never to refusing everything.
+
 A malformed numeric or boolean value is a **boot error**, not a silent fallback to the
 default — a typo in a retention setting is a configuration change nobody made.
+
+## Operations
+
+| Document | What it covers |
+|---|---|
+| [`docs/backup-restore.md`](docs/backup-restore.md) | The backup and restore runbook. **Start with its first paragraph:** the root key is not in the database, so a database backup alone is unrestorable. Covers what to capture per root-key provider, the `pg_dump`/`pg_restore` flags that matter, how the append-only triggers on `secret_versions` and `audit_log` interact with a restore, how to *prove* a restore worked, and why restoring across a root-key rotation is survivable |
+| [`docs/deployment.md`](docs/deployment.md) | The declared cpu/memory limits and workload hardening for a core-attached install, with the reasoning behind each number and what to re-tune if you raise the request limits |

@@ -88,8 +88,11 @@ Schema migrations are embedded and applied in-process on boot.
 | `HTTP_PORT` | `8092` | REST API. |
 | `GRPC_PORT` | `9092` | gRPC API. |
 | `DB_SSLMODE` | `disable` | `disable` is refused outside development. |
-| `SECRET_ROOT_KEY_PROVIDER` | `env` | `env` / `file` (built); `aws_kms` / `gcp_kms` / `azure_kv` (registered, not built). |
+| `SECRET_ROOT_KEY_PROVIDER` | `env` | `env` / `file` / `aws_kms` / `gcp_kms` / `azure_kv`. Selecting a cloud provider without its settings is a boot error, not a failure on the first write. |
 | `SECRET_ROOT_KEY_FILE` | — | Sealed key file for the `file` provider; must be `0600`. |
+| `SECRET_KMS_AWS_KEY_ID` / `SECRET_KMS_AWS_REGION` | — | Required for `aws_kms`. Needs `kms:Encrypt` + `kms:Decrypt` on the key. |
+| `SECRET_KMS_GCP_KEY_NAME` | — | Required for `gcp_kms`. Needs `roles/cloudkms.cryptoKeyEncrypterDecrypter` on the CryptoKey. |
+| `SECRET_KMS_AZURE_VAULT_URL` / `SECRET_KMS_AZURE_KEY_NAME` | — | Required for `azure_kv`. Needs `wrapKey` + `unwrapKey` on the key. |
 | `SECRET_KEEP_VERSIONS` | `10` | Versions retained per secret (min 1). |
 | `SECRET_RECOVERY_WINDOW` | `720h` | How long a deleted secret stays restorable; `0` refused outside development. |
 | `SECRET_ROTATION_ENABLED` | `true` | Background rotator. Turning it off preserves every policy. |

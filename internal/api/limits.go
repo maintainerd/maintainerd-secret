@@ -39,6 +39,20 @@ type Limits struct {
 	MaxWebhookTimeoutSeconds int
 	// MaxWebhookAttempts caps per-endpoint retries, for the same reason.
 	MaxWebhookAttempts int
+	// MaxTransitPlaintextBytes bounds one transit Encrypt.
+	//
+	// It is SMALLER than MaxSecretValueBytes on purpose. A secret write is an
+	// occasional administrative act; transit is a DATA PLANE that an application calls
+	// on every row it stores, so the same generous bound would turn one request into a
+	// megabyte-scale allocation plus an AES pass, repeatedly, from a caller that only
+	// needs to encrypt a column. A caller with genuinely large payloads should encrypt
+	// a data key here and use it locally, which is what transit is for.
+	MaxTransitPlaintextBytes int
+	// MaxDynamicLeaseTTLSeconds caps the lease TTL a caller may REQUEST, on top of the
+	// per-role ceiling. Two bounds rather than one because the role's ceiling is an
+	// operator's choice per database and this is the service's refusal to issue a
+	// long-lived credential at all.
+	MaxDynamicLeaseTTLSeconds int
 }
 
 // Defaults. Every one of these is a safe value on its own — the service is correct
@@ -52,6 +66,12 @@ const (
 	DefaultMaxDescriptionLength     = 500
 	DefaultMaxWebhookTimeoutSeconds = 30
 	DefaultMaxWebhookAttempts       = 10
+	// DefaultMaxTransitPlaintextBytes is 32 KiB — comfortably more than any column a
+	// caller encrypts, and less than the secret-value bound for the reason above.
+	DefaultMaxTransitPlaintextBytes = 32 << 10
+	// DefaultMaxDynamicLeaseTTLSeconds is 24 hours. A dynamic credential that outlives
+	// a working day has stopped being short-lived.
+	DefaultMaxDynamicLeaseTTLSeconds = 24 * 60 * 60
 )
 
 // MaxBatchSize is the compile-time ceiling on a configured MaxBatchItems.
@@ -72,6 +92,9 @@ func DefaultLimits() Limits {
 		MaxDescriptionLength:     DefaultMaxDescriptionLength,
 		MaxWebhookTimeoutSeconds: DefaultMaxWebhookTimeoutSeconds,
 		MaxWebhookAttempts:       DefaultMaxWebhookAttempts,
+
+		MaxTransitPlaintextBytes:  DefaultMaxTransitPlaintextBytes,
+		MaxDynamicLeaseTTLSeconds: DefaultMaxDynamicLeaseTTLSeconds,
 	}
 }
 
@@ -105,6 +128,12 @@ func (l Limits) normalized() Limits {
 	}
 	if l.MaxWebhookAttempts < 1 {
 		l.MaxWebhookAttempts = d.MaxWebhookAttempts
+	}
+	if l.MaxTransitPlaintextBytes < 1 {
+		l.MaxTransitPlaintextBytes = d.MaxTransitPlaintextBytes
+	}
+	if l.MaxDynamicLeaseTTLSeconds < 1 {
+		l.MaxDynamicLeaseTTLSeconds = d.MaxDynamicLeaseTTLSeconds
 	}
 	return l
 }

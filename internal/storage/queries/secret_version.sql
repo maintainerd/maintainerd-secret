@@ -37,6 +37,18 @@ LIMIT $2 OFFSET $3;
 -- name: CountSecretVersions :one
 SELECT count(*) FROM secret_versions WHERE secret_id = $1;
 
+-- GetSecretVersionValueType answers "is this secret a reference or a literal?" for
+-- ONE secret, which is what the single-secret metadata paths (describe, a metadata
+-- edit, a restore) need to fill SecretMeta.ValueType. The listing gets the same
+-- column from its own LATERAL join (secret.sql) so it never runs this per row.
+--
+-- It selects value_type ALONE. A describe that fetched the version row and discarded
+-- the payload would put ciphertext in a handler's locals for a metadata read, and
+-- would make the "describe never reaches secret_versions' payload" property something
+-- a reviewer has to trace rather than read.
+-- name: GetSecretVersionValueType :one
+SELECT value_type FROM secret_versions WHERE secret_id = $1 AND version = $2;
+
 -- ListVersionWrapsByKEK is the rewrap work queue: every version still wrapped
 -- under a given root key, oldest row first, in batches. It selects ONLY the
 -- wrapping columns — a rewrap never reads or writes ciphertext, which is the

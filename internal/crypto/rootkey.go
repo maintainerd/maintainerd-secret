@@ -62,20 +62,33 @@ const (
 // name itself. Everything a cloud KMS does differently — the network call, the IAM
 // grant, the fact that the key material never leaves the HSM — lives behind Wrap
 // and Unwrap, so aws_kms is a new implementation of these three methods and NOT a
-// change to the schema, the store, or the rewrap logic. That is why the KMS
-// providers are already registered (returning a clear not-built error) rather than
-// absent: the seam is finished even though the implementations are not.
+// change to the schema, the store, or the rewrap logic. The five built providers
+// (env, file, aws_kms, gcp_kms, azure_kv) are the evidence for that claim: adding
+// the cloud three touched this package and the config validator, and nothing else.
 //
 // KeyID must be STABLE for a given key: it is the value written into
 // secret_versions.kek_id, and a restart that produced a different id would orphan
 // every row the previous process wrote. Implementations derive it from the key
 // material (or from the KMS key ARN/resource name), never randomly.
+//
+// THERE IS NO CONTEXT PARAMETER, and that is deliberate rather than an oversight.
+// Wrap and Unwrap are called from Seal and Open, which are pure functions over bytes
+// with no request scope to inherit; threading a context through them would push one
+// into the envelope layer and the store for the benefit of three implementations out
+// of six. The cloud providers own their own per-call deadline instead — see
+// DefaultKMSTimeout.
 type RootKeyProvider interface {
 	// KeyID returns the stable fingerprint of this root key, prefixed with the
 	// provider name.
 	KeyID() string
 	// Wrap encrypts a DEK under the root key, returning the wrapped bytes and the
 	// nonce needed to reverse it.
+	//
+	// THE NONCE IS PROVIDER-OPTIONAL. The AES providers return a 12-byte GCM
+	// nonce. A cloud KMS returns one self-describing ciphertext blob that already
+	// carries whatever IV the service used, so those providers return an EMPTY
+	// (non-nil) nonce and refuse a non-empty one on the way back in. Callers store
+	// whatever they are handed and give it back unchanged.
 	Wrap(dek []byte) (wrapped, nonce []byte, err error)
 	// Unwrap recovers a DEK. The caller is responsible for zeroizing the result.
 	Unwrap(wrapped, nonce []byte) ([]byte, error)
@@ -92,6 +105,9 @@ type ProviderConfig struct {
 	Key string
 	// KeyFile is the sealed key file path for the file provider.
 	KeyFile string
+	// KMS carries the settings for the three cloud providers. Only the fields
+	// belonging to the selected Provider are read.
+	KMS KMSConfig
 }
 
 // EnvDevelopment is the one AppEnv value that permits an ephemeral key.
@@ -106,9 +122,9 @@ type providerFactory func(ProviderConfig) (RootKeyProvider, error)
 var registry = map[string]providerFactory{
 	ProviderEnv:     newEnvProvider,
 	ProviderFile:    newFileProvider,
-	ProviderAWSKMS:  notBuilt(ProviderAWSKMS, "AWS KMS"),
-	ProviderGCPKMS:  notBuilt(ProviderGCPKMS, "GCP KMS"),
-	ProviderAzureKV: notBuilt(ProviderAzureKV, "Azure Key Vault"),
+	ProviderAWSKMS:  newAWSKMSProvider,
+	ProviderGCPKMS:  newGCPKMSProvider,
+	ProviderAzureKV: newAzureKVProvider,
 }
 
 // KnownProviders returns the provider names the factory accepts, for config

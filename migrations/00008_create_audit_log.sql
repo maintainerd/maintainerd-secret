@@ -80,17 +80,51 @@ CREATE TRIGGER trg_audit_log_immutable
     BEFORE UPDATE OR DELETE ON audit_log
     FOR EACH ROW EXECUTE FUNCTION prevent_audit_log_mutation();
 
--- "what happened in this tenant, newest first" — the console's default read.
+-- "what happened in this tenant, newest first" — the console's default read, and
+-- the index the DATE-RANGE filter rides: a tenant-scoped BETWEEN on created_at is
+-- a range scan on the trailing column of this very index, so no separate index
+-- exists for `from`/`to`.
 CREATE INDEX IF NOT EXISTS idx_audit_log_tenant_created ON audit_log (tenant_id, created_at DESC);
 -- "who has touched THIS secret" — the incident timeline.
 CREATE INDEX IF NOT EXISTS idx_audit_log_secret ON audit_log (secret_id, created_at DESC) WHERE secret_id IS NOT NULL;
 -- "what has THIS principal been reading" — the compromised-credential review.
+-- These three are NOT tenant-scoped on purpose: they answer the cross-tenant
+-- platform question ("everything this subject ever did"), which is what an
+-- operator asks during an incident with a leaked credential.
 CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log (actor_subject, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log (action, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_log_outcome ON audit_log (outcome, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_log_resource_mrn ON audit_log (resource_mrn text_pattern_ops);
 CREATE INDEX IF NOT EXISTS idx_audit_log_request_id ON audit_log (request_id) WHERE request_id <> '';
 CREATE INDEX IF NOT EXISTS idx_audit_log_metadata ON audit_log USING GIN (metadata);
+
+-- THE FILTERED CONSOLE READ (ListAuditEventsFiltered).
+--
+-- Every filtered audit query is tenant-scoped FIRST — a caller may only ever read
+-- its own tenant's trail — so the four indexes above with a bare leading
+-- action/actor/outcome column cannot serve it: Postgres would have to choose
+-- between a scan of one action across every tenant or a scan of one tenant across
+-- every action. The composites below put tenant_id first and created_at last, so
+-- one filter plus the newest-first ordering is a single index scan with no sort.
+--
+-- Only ONE of these can be used per query, which is the honest bound on the
+-- feature: filtering by action AND outcome together uses the action index and
+-- filters the outcome as a recheck. A multi-column-per-filter design would need a
+-- combinatorial index set for a trail whose selective column is almost always
+-- action or actor.
+CREATE INDEX IF NOT EXISTS idx_audit_log_tenant_action_created
+    ON audit_log (tenant_id, action, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_tenant_outcome_created
+    ON audit_log (tenant_id, outcome, created_at DESC);
+-- The actor and resource filters are PREFIX matches (LIKE 'prefix%'), which is what
+-- an operator types: part of a subject, or an MRN down to a project or environment.
+-- A prefix match needs *_pattern_ops so the comparison is byte-wise and index-able
+-- under any database collation — the same reason idx_audit_log_resource_mrn above
+-- uses text_pattern_ops. actor_subject is VARCHAR, hence varchar_pattern_ops.
+CREATE INDEX IF NOT EXISTS idx_audit_log_tenant_actor_prefix
+    ON audit_log (tenant_id, actor_subject varchar_pattern_ops);
+CREATE INDEX IF NOT EXISTS idx_audit_log_tenant_resource_prefix
+    ON audit_log (tenant_id, resource_mrn text_pattern_ops);
 
 -- +goose Down
 DROP TRIGGER IF EXISTS trg_audit_log_immutable ON audit_log;

@@ -63,6 +63,37 @@ CREATE INDEX IF NOT EXISTS idx_webhook_endpoints_deleted_at ON webhook_endpoints
 -- consumer ever learn about that rotation" is answerable — which matters because
 -- a consumer that missed the notification is running on a credential that has
 -- been replaced.
+--
+-- IT IS ALSO THE RE-DRIVE QUEUE. The row is written BEFORE the first attempt, so a
+-- delivery that never landed is visible; `next_attempt_at` is what makes it
+-- RECOVERABLE rather than merely visible. The inline attempt sequence on the write
+-- path is bounded by a latency an operator will accept (a few hundred milliseconds
+-- of backoff — see internal/webhook), which is far too short for a receiver that is
+-- down for a deploy. So a delivery that fails inline is parked as 'retrying' with a
+-- next-attempt time, and a background worker picks it up later with exponential
+-- backoff until its budget is spent.
+--
+--   status = 'pending'   the row is open and the first attempt sequence is running.
+--            'success'   a receiver answered 2xx. Terminal.
+--            'retrying'  every attempt so far failed and the re-drive worker owns
+--                        it. next_attempt_at says when it may be tried again.
+--            'failed'    PERMANENTLY failed: the retry budget is spent, or the
+--                        endpoint was deleted underneath it. Terminal, and the row
+--                        an operator greps for.
+--
+--   next_attempt_at   when the worker may claim this row. It doubles as the CLAIM
+--                     LEASE: the worker pushes it forward before attempting, so a
+--                     replica that dies mid-attempt releases the row automatically
+--                     when the lease passes instead of stranding it. That is why the
+--                     claim needs no lock table and no leader election — see
+--                     ClaimWebhookDeliveriesForRedrive, which claims with
+--                     FOR UPDATE SKIP LOCKED and is therefore safe in every replica.
+--   redrive_attempts  attempts made by the WORKER, counted separately from
+--                     attempt_count (the total). Separate because the two budgets
+--                     answer different questions: attempt_count is "how hard did we
+--                     try", redrive_attempts is "how much of the durable budget is
+--                     left", and an endpoint whose inline max_attempts was raised
+--                     must not silently consume the durable one.
 CREATE TABLE IF NOT EXISTS webhook_deliveries (
     delivery_id     BIGSERIAL PRIMARY KEY,
     delivery_uuid   UUID NOT NULL UNIQUE DEFAULT gen_random_uuid(),
@@ -78,11 +109,25 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
     response_status INT,
     error           TEXT NOT NULL DEFAULT '',
     -- The exact JSON that was signed and sent. It is safe to persist BECAUSE it
-    -- contains no value — see the table comment above.
+    -- contains no value — see the table comment above. It is ALSO what the re-drive
+    -- worker replays: the body is re-signed with a fresh timestamp (the signature
+    -- covers the timestamp, so a receiver's replay window stays enforceable) but the
+    -- bytes are the ones recorded here, so a retry cannot silently deliver something
+    -- different from what the first attempt announced.
     payload         JSONB NOT NULL DEFAULT '{}',
+    -- The re-drive schedule. See the table comment.
+    next_attempt_at  TIMESTAMPTZ,
+    redrive_attempts INT NOT NULL DEFAULT 0,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT chk_webhook_deliveries_status CHECK (status IN ('pending', 'success', 'failed'))
+    CONSTRAINT chk_webhook_deliveries_status CHECK (status IN ('pending', 'success', 'retrying', 'failed')),
+    -- A scheduled next attempt on a TERMINAL row is a contradiction: it would either
+    -- be picked up (re-delivering a success) or ignored (a schedule that means
+    -- nothing). Only a 'retrying' row carries one.
+    CONSTRAINT chk_webhook_deliveries_next_attempt CHECK (
+        next_attempt_at IS NULL OR status = 'retrying'
+    ),
+    CONSTRAINT chk_webhook_deliveries_redrive_attempts CHECK (redrive_attempts >= 0)
 );
 
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_endpoint
@@ -93,6 +138,13 @@ CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_status
     ON webhook_deliveries (status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_resource_mrn
     ON webhook_deliveries (resource_mrn text_pattern_ops);
+-- The re-drive worker's claim: due rows, oldest due first. PARTIAL on the one status
+-- that can be claimed, so the index holds only the backlog — on a healthy service
+-- that is zero rows, and the worker's tick costs an empty index scan rather than a
+-- scan of every delivery ever made.
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_redrive_due
+    ON webhook_deliveries (next_attempt_at)
+    WHERE status = 'retrying' AND next_attempt_at IS NOT NULL;
 
 -- +goose Down
 DROP TABLE IF EXISTS webhook_deliveries;

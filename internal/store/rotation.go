@@ -167,5 +167,6 @@ func (s *Service) SetRotationPolicy(ctx context.Context, ref SecretRef, policy r
 		return nil, mapReadError(err, "secret")
 	}
 	out := secretRowToMeta(updated, addr.folder.Path, s.policy.KeepVersions)
+	out.ValueType = s.valueTypeFor(ctx, updated.SecretID, updated.CurrentVersion)
 	return &out, nil
 }

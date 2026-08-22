@@ -1,11 +1,11 @@
 import type { ColumnDef } from '@tanstack/react-table'
-import { Eye, Info, Pencil, Plus, Trash2 } from 'lucide-react'
+import { Eye, Info, Link2, Pencil, Plus, Trash2 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { DataTableColumnHeader, RowActions, type RowActionItem } from '@/components/data-table'
 import { StatusBadge } from '@/components/badges'
 import { formatDateTime, formatRelative, isExpired } from '@/lib/formatDate'
 import { normalizePath } from '@/lib/paths'
-import type { SecretMeta } from '@/services/api/types'
+import { VALUE_TYPE_REFERENCE, type SecretMeta } from '@/services/api/types'
 
 /**
  * The browse table's columns.
@@ -14,6 +14,13 @@ import type { SecretMeta } from '@/services/api/types'
  * structurally has no value field, so this file could not render one even if a
  * future edit tried to. Revealing is an explicit row action that goes through a
  * different endpoint, a different grant and its own audit row.
+ *
+ * `value_type` IS metadata and is one of them, which is what lets the `reference`
+ * badge live on the KEY column. It used to appear only in the detail dialog,
+ * because the listing type carried no value_type and finding out meant fetching
+ * each row's version history — one extra call per row. A reference is a POINTER,
+ * not a credential, and "this row is not what it looks like" belongs where the
+ * operator is scanning rather than two clicks in.
  *
  * Shaped like maintainerd-auth's per-page column modules: a factory taking the
  * page's handlers, sortable headers via `DataTableColumnHeader`, and a
@@ -39,7 +46,15 @@ export function buildSecretColumns(
       header: ({ column }) => <DataTableColumnHeader column={column} title="Key" />,
       cell: ({ row }) => (
         <div className="min-w-0 max-w-72">
-          <div className="truncate font-medium">{row.original.key}</div>
+          <div className="flex min-w-0 items-center gap-1.5">
+            <span className="truncate font-medium">{row.original.key}</span>
+            {row.original.value_type === VALUE_TYPE_REFERENCE && (
+              <Badge variant="secondary" className="gap-1 shrink-0">
+                <Link2 className="size-3" aria-hidden="true" />
+                reference
+              </Badge>
+            )}
+          </div>
           {row.original.description && (
             <div className="truncate text-xs text-muted-foreground">
               {row.original.description}

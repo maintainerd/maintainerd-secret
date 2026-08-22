@@ -94,6 +94,18 @@ type SecretMeta struct {
 	CurrentVersion int32          `json:"current_version"`
 	KeepVersions   int32          `json:"keep_versions"`
 	RotationPolicy map[string]any `json:"rotation_policy"`
+	// ValueType is the CURRENT version's declared type — opaque, json or reference.
+	//
+	// IT IS METADATA, NOT A VALUE, and it belongs here for a concrete reason: a
+	// `reference` is a POINTER (${project/environment/KEY}) rather than a credential,
+	// and that is the single most important thing to know about a row before you act
+	// on it. Without this field a console had to fetch each row's version history to
+	// find out — one extra call per row — so the distinction only appeared in a detail
+	// view, which is the one place the operator has already stopped scanning the list.
+	//
+	// It lives on secret_versions in the schema, so this is the current version's
+	// value projected up. Empty when the secret has no version yet.
+	ValueType string `json:"value_type"`
 	// MRNResourcePath is the parsed resource segment policy evaluation compares.
 	MRNResourcePath string `json:"mrn_resource_path"`
 	// MRN is the full presentation identifier. Audit rows and the console want the
@@ -234,6 +246,7 @@ func toSecretMeta(r storage.ListSecretMetaBySubtreeRow, defaultKeep int32) Secre
 		CurrentVersion:  r.CurrentVersion,
 		KeepVersions:    defaultKeep,
 		RotationPolicy:  decodeObject(r.RotationPolicy),
+		ValueType:       r.ValueType,
 		MRNResourcePath: r.MrnResourcePath,
 		MRN:             mrn(r.MrnTenant, r.MrnProject, r.MrnResourcePath),
 		CreatedAt:       r.CreatedAt,
@@ -249,6 +262,12 @@ func toSecretMeta(r storage.ListSecretMetaBySubtreeRow, defaultKeep int32) Secre
 
 // secretRowToMeta converts a full secrets row. folderPath is passed in because the
 // row carries only folder_id, and the caller resolved the path to get there.
+//
+// ValueType IS NOT SET HERE. A `secrets` row does not carry it — it lives on the
+// current VERSION — and this function does no IO, so the single-secret paths fill it
+// with Service.valueTypeFor after conversion. Leaving it blank here rather than
+// reaching into another table from a pure converter keeps "which functions touch
+// secret_versions" answerable by grep.
 func secretRowToMeta(r storage.Secret, folderPath string, defaultKeep int32) SecretMeta {
 	m := SecretMeta{
 		UUID:            r.SecretUuid,
