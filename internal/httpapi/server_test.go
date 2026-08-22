@@ -89,9 +89,32 @@ func TestEveryDocumentedRouteExistsAndIsGuarded(t *testing.T) {
 		{http.MethodPost, "/api/v1/secrets/delete"},
 		{http.MethodPost, "/api/v1/secrets/restore"},
 		{http.MethodPost, "/api/v1/secrets/destroy"},
+		{http.MethodGet, "/api/v1/secrets/lease-policy?project=billing&environment=prod&key=K"},
+		{http.MethodPost, "/api/v1/secrets/lease-policy"},
+		{http.MethodGet, "/api/v1/secrets/leases?project=billing&environment=prod&key=K"},
+		{http.MethodPost, "/api/v1/secrets/leases/revoke"},
 
 		{http.MethodPost, "/api/v1/bulk/get"},
 		{http.MethodPost, "/api/v1/bulk/put"},
+
+		{http.MethodGet, "/api/v1/transit?project=billing"},
+		{http.MethodPost, "/api/v1/transit"},
+		{http.MethodPatch, "/api/v1/transit"},
+		{http.MethodDelete, "/api/v1/transit?project=billing&name=pii"},
+		{http.MethodGet, "/api/v1/transit/describe?project=billing&name=pii"},
+		{http.MethodGet, "/api/v1/transit/versions?project=billing&name=pii"},
+		{http.MethodPost, "/api/v1/transit/rotate"},
+		{http.MethodPost, "/api/v1/transit/encrypt"},
+		{http.MethodPost, "/api/v1/transit/decrypt"},
+
+		{http.MethodGet, "/api/v1/dynamic?project=billing"},
+		{http.MethodPost, "/api/v1/dynamic"},
+		{http.MethodPatch, "/api/v1/dynamic"},
+		{http.MethodDelete, "/api/v1/dynamic?project=billing&name=reporting"},
+		{http.MethodGet, "/api/v1/dynamic/describe?project=billing&name=reporting"},
+		{http.MethodGet, "/api/v1/dynamic/leases?project=billing&name=reporting"},
+		{http.MethodPost, "/api/v1/dynamic/credentials"},
+		{http.MethodPost, "/api/v1/dynamic/credentials/revoke"},
 
 		{http.MethodGet, "/api/v1/webhooks?project=billing"},
 		{http.MethodPost, "/api/v1/webhooks"},
@@ -433,6 +456,15 @@ func TestServicePrincipalIsRefusedOnTheConsoleSurfaces(t *testing.T) {
 		{http.MethodPost, "/api/v1/secrets/restore", "restore is authorized at TENANT scope"},
 		{http.MethodPost, "/api/v1/secrets/destroy", "destroy is irreversible and tenant-scoped"},
 		{http.MethodGet, "/api/v1/audit", "the access trail is what an incident review reads"},
+		{http.MethodPost, "/api/v1/secrets/lease-policy", "deciding how often a credential may be read is a policy call"},
+		{http.MethodPost, "/api/v1/secrets/leases/revoke", "cutting a consumer off is an operator's control"},
+		{http.MethodPost, "/api/v1/transit", "a transit key decides what the data plane operates on"},
+		{http.MethodPatch, "/api/v1/transit", "raising the decrypt floor makes every token under a retired version unreadable"},
+		{http.MethodDelete, "/api/v1/transit?project=billing&name=pii", "and removing a key is the same kind of act"},
+		{http.MethodPost, "/api/v1/transit/rotate", "rotating key material is lifecycle management, not data-plane work"},
+		{http.MethodPost, "/api/v1/dynamic", "a role config writes the SQL that decides what every issued credential can do"},
+		{http.MethodPatch, "/api/v1/dynamic", "and editing it affects credentials already outstanding"},
+		{http.MethodDelete, "/api/v1/dynamic?project=billing&name=reporting", "deleting a config would strand the accounts it can no longer revoke"},
 	}
 
 	workload := admin(sdkauthz.ActorKindService)
@@ -482,6 +514,17 @@ func TestBothClassesReachTheWorkloadSurfaces(t *testing.T) {
 		{http.MethodGet, "/api/v1/projects"},
 		{http.MethodGet, "/api/v1/folders"},
 		{http.MethodGet, "/api/v1/webhooks"},
+		// The transit data plane and the dynamic-credential lifecycle. These are the
+		// two surfaces where a user-only constraint would not merely inconvenience a
+		// workload, it would leave the feature with no caller.
+		{http.MethodPost, "/api/v1/transit/encrypt"},
+		{http.MethodPost, "/api/v1/transit/decrypt"},
+		{http.MethodGet, "/api/v1/transit"},
+		{http.MethodPost, "/api/v1/dynamic/credentials"},
+		{http.MethodPost, "/api/v1/dynamic/credentials/revoke"},
+		{http.MethodGet, "/api/v1/dynamic"},
+		{http.MethodGet, "/api/v1/secrets/lease-policy"},
+		{http.MethodGet, "/api/v1/secrets/leases"},
 	}
 
 	for _, kind := range []string{sdkauthz.ActorKindService, sdkauthz.ActorKindUser} {

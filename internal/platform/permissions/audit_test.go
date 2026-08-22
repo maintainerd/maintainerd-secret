@@ -179,6 +179,121 @@ var restSpec = map[string]surfaceSpec{
 		why: "setting the policy administers the machinery — it decides when every FUTURE value is replaced",
 	},
 
+	// --- leases on static secrets ------------------------------------------
+	// The two verbs on /lease-policy are two rows on purpose. Read off the s.guard
+	// calls in internal/api/leases.go: GetSecretLeasePolicy demands ReadMetadata and
+	// SetSecretLeasePolicy demands ManageLease. A single row for the path — the shape
+	// /secrets used to have — would have been satisfied by whichever of the two is
+	// weaker, on the surface that decides how often a production credential may be read.
+	"GET /api/v1/secrets/lease-policy": {
+		permission: permissions.PermReadMetadata,
+		why: "a policy is metadata ABOUT how a value may be read and discloses nothing about " +
+			"the value; a consumer that can see the cap plans around it instead of meeting it " +
+			"as an unexplained 403 mid-incident",
+	},
+	"GET /api/v1/secrets/leases": {
+		permission: permissions.PermReadMetadata,
+		why: "lease rows are UUIDs, timestamps and read counts — and they are the only answer " +
+			"to \"who is currently able to read this credential\"",
+	},
+	"POST /api/v1/secrets/lease-policy": {
+		permission: permissions.PermManageLease, actor: sdkauthz.ActorUserOnly, mutates: true,
+		why: "deciding a credential may be read ten times an hour is a policy call, and it is " +
+			"checked against the SECRET's own MRN rather than the folder's — folder-wide " +
+			"management must not loosen the cap on the one credential inside it that mattered",
+	},
+	"POST /api/v1/secrets/leases/revoke": {
+		permission: permissions.PermManageLease, actor: sdkauthz.ActorUserOnly, mutates: true,
+		why: "the operator's cut-this-consumer-off control. It resets allowances rather than " +
+			"locking the secret, so it is administration and not a read",
+	},
+
+	// --- transit -----------------------------------------------------------
+	// THREE PERMISSIONS ON ONE SEGMENT is why every route here is its own row. A
+	// segment pair carries one read permission and one write permission, and could not
+	// distinguish an encrypt (secret:Encrypt) from a decrypt (secret:Decrypt) from a key
+	// retirement (secret:ManageTransitKey) — so either a write-only ingest path would be
+	// handed key management, or every service that writes an encrypted column could read
+	// every encrypted column.
+	"GET /api/v1/transit/":         {permission: permissions.PermReadMetadata, why: "store.TransitKey has no material field, so a listing cannot leak key bytes"},
+	"GET /api/v1/transit/describe": {permission: permissions.PermReadMetadata},
+	"GET /api/v1/transit/versions": {permission: permissions.PermReadMetadata, why: "version history is version numbers and root-key ids — never material"},
+	"POST /api/v1/transit/": {
+		permission: permissions.PermManageTransitKey, actor: sdkauthz.ActorUserOnly, mutates: true,
+		why: "authorized against the project's transit COLLECTION, because the key does not exist yet",
+	},
+	"PATCH /api/v1/transit/": {
+		permission: permissions.PermManageTransitKey, actor: sdkauthz.ActorUserOnly, mutates: true,
+		why: "raising min_decrypt_version makes every token under a retired version unreadable " +
+			"service-wide — a deliberate act when material is compromised and an outage by mistake",
+	},
+	"DELETE /api/v1/transit/": {
+		permission: permissions.PermManageTransitKey, actor: sdkauthz.ActorUserOnly, mutates: true,
+		why: "a soft delete; the versions survive, so no stored ciphertext is destroyed",
+	},
+	"POST /api/v1/transit/rotate": {
+		permission: permissions.PermManageTransitKey, actor: sdkauthz.ActorUserOnly, mutates: true,
+		why: "key lifecycle. Old versions keep decrypting, so this changes what the NEXT encrypt " +
+			"seals under and nothing about what is already stored",
+	},
+	"POST /api/v1/transit/encrypt": {
+		permission: permissions.PermEncrypt,
+		why: "NOT a mutation: it reads a key version and returns a token, writing nothing durable " +
+			"but the audit row every read here writes too. A POST because a plaintext belongs in a " +
+			"body. The permission is Encrypt and NOT Decrypt, so a write-only ingest path cannot " +
+			"read back what it wrote",
+	},
+	"POST /api/v1/transit/decrypt": {
+		permission: permissions.PermDecrypt,
+		why: "a reveal by another name: a POST because a ciphertext token belongs in a body rather " +
+			"than an access log, a DECRYPT permission because that is what it does, and NOT a " +
+			"mutation. api.TransitDecrypt authorizes against the key the TOKEN names, so a grant " +
+			"on one key cannot open every ciphertext in the project",
+	},
+
+	// --- dynamic secrets ---------------------------------------------------
+	"GET /api/v1/dynamic/": {permission: permissions.PermReadMetadata},
+	"GET /api/v1/dynamic/describe": {
+		permission: permissions.PermReadMetadata,
+		why: "the detail carries the SQL templates and the DSN REFERENCE — operator-authored SQL " +
+			"and an address. There is no field on store.DynamicRoleDetail that could hold the " +
+			"connection string itself",
+	},
+	"GET /api/v1/dynamic/leases": {
+		permission: permissions.PermReadMetadata,
+		why:        "store.DynamicLease has no password field and no column behind one",
+	},
+	"POST /api/v1/dynamic/": {
+		permission: permissions.PermManageDynamicRole, actor: sdkauthz.ActorUserOnly, mutates: true,
+		why: "configuring a role chooses which database is targeted and writes the SQL that decides " +
+			"what every credential issued from it can do — no validator can tell whether a GRANT is " +
+			"wider than its author intended, which is exactly why a human is the check",
+	},
+	"PATCH /api/v1/dynamic/": {
+		permission: permissions.PermManageDynamicRole, actor: sdkauthz.ActorUserOnly, mutates: true,
+		why: "editing the revocation template affects credentials ALREADY issued, because the reaper " +
+			"renders whatever the config currently says",
+	},
+	"DELETE /api/v1/dynamic/": {
+		permission: permissions.PermManageDynamicRole, actor: sdkauthz.ActorUserOnly, mutates: true,
+		why: "refused by the store while credentials are outstanding: the revocation template lives " +
+			"on the config, so deleting it would strand every issued account",
+	},
+	"POST /api/v1/dynamic/credentials": {
+		permission: permissions.PermIssueDynamicCredential, mutates: true,
+		why: "READ-SHAPED AND STILL A MUTATION: it creates a live PostgreSQL account and a lease row. " +
+			"ActorAny because a workload asking for its own database credential at boot IS the " +
+			"feature — requiring a human would push consumers back onto a shared static password — " +
+			"and the blast radius is bounded by the MRN grant and the role's creation template, not " +
+			"by the caller's class. It grants no ability to read the target DSN on any path",
+	},
+	"POST /api/v1/dynamic/credentials/revoke": {
+		permission: permissions.PermIssueDynamicCredential, mutates: true,
+		why: "the SAME grant as issuing, deliberately: behind the management grant no workload could " +
+			"return a credential, so credentials would be left to expire instead. Refusing a revoke " +
+			"is the wrong direction to fail",
+	},
+
 	// --- webhooks ----------------------------------------------------------
 	"GET /api/v1/webhooks/":                          {permission: permissions.PermReadMetadata},
 	"GET /api/v1/webhooks/{endpointUUID}/deliveries": {permission: permissions.PermReadMetadata},
@@ -945,6 +1060,28 @@ func TestTheWorkloadPathsAcceptBothClasses(t *testing.T) {
 		"GET /api/v1/folders/",
 		"GET /api/v1/imports/",
 		"GET /api/v1/webhooks/",
+		// THE TRANSIT DATA PLANE. An application calls encrypt on every row it stores
+		// and decrypt on every row it reads back; locking either to humans would leave
+		// transit with no caller at all.
+		"POST /api/v1/transit/encrypt",
+		"POST /api/v1/transit/decrypt",
+		"GET /api/v1/transit/",
+		"GET /api/v1/transit/describe",
+		"GET /api/v1/transit/versions",
+		// THE DYNAMIC-CREDENTIAL LIFECYCLE. A workload asking for its own short-lived
+		// database credential at boot is the whole feature, and returning it afterwards
+		// is the ordinary end of it — behind a user-only constraint, credentials would
+		// be left to expire instead of revoked.
+		"POST /api/v1/dynamic/credentials",
+		"POST /api/v1/dynamic/credentials/revoke",
+		"GET /api/v1/dynamic/",
+		"GET /api/v1/dynamic/describe",
+		"GET /api/v1/dynamic/leases",
+		// A consumer reading the cap it is subject to. Discovering a lease allowance as
+		// an unexplained 403 mid-incident is the outcome this read exists to prevent, so
+		// it has to be reachable by the consumer — which is usually a workload.
+		"GET /api/v1/secrets/lease-policy",
+		"GET /api/v1/secrets/leases",
 	}
 
 	m := permissions.Map()

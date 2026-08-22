@@ -550,13 +550,16 @@ Do all of this in **maintainerd-auth's console**, before starting secret.
    write it down: it becomes `AUTH_AUDIENCE`.
 
 3. **Register the permissions** on that resource API. Register **exactly** these
-   twelve, spelled exactly like this:
+   eighteen, spelled exactly like this:
 
    ```
    secret:ReadMetadata      secret:GetSecret         secret:PutSecret
    secret:DeleteSecret      secret:RotateSecret      secret:ListSecrets
    secret:ManageProject     secret:ManageEnvironment secret:ManageFolder
-   secret:ManageRotation    secret:ReadAudit         secret:Admin
+   secret:ManageRotation    secret:ReadAudit         secret:ManageLease
+   secret:ManageDynamicRole secret:IssueDynamicCredential
+   secret:Encrypt           secret:Decrypt           secret:ManageTransitKey
+   secret:Admin
    ```
 
    The list is not decorative and it is not a superset to trim. Secret's guard demands

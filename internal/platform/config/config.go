@@ -397,6 +397,30 @@ var (
 	// become a thousand writes in one tick.
 	RotationBatch int
 
+	// --- dynamic-credential reaper -----------------------------------------
+
+	// DynamicReaperEnabled (SECRET_DYNAMIC_REAPER_ENABLED, default true) revokes
+	// dynamic credentials whose leases have expired.
+	//
+	// WITHOUT IT A DYNAMIC CREDENTIAL'S TTL IS A COMMENT. Issuing one creates a real
+	// PostgreSQL role; the lease row records when it must stop existing, but a row
+	// expiring does not drop a role — this sweep is the only thing that does. An
+	// operator who turns it off is accepting that issued credentials outlive their
+	// leases, and the boot log says so in those words. It is a real switch because a
+	// reaper hammering an unreachable target database during an incident is a
+	// legitimate thing to stop; it is not one to leave off.
+	DynamicReaperEnabled bool
+
+	// DynamicReaperInterval (SECRET_DYNAMIC_REAPER_INTERVAL, default 1m) is how often
+	// the sweep runs. Finer than the rotator's because the overdue window here is the
+	// window in which a credential nobody is entitled to still works.
+	DynamicReaperInterval time.Duration
+
+	// DynamicReaperBatch (SECRET_DYNAMIC_REAPER_BATCH, default 100) bounds one pass,
+	// so a mass expiry does not become an unbounded run of DDL against a target
+	// database in a single tick.
+	DynamicReaperBatch int
+
 	// --- webhooks ----------------------------------------------------------
 
 	// WebhooksEnabled (SECRET_WEBHOOKS_ENABLED, default true) delivers change and
@@ -654,6 +678,16 @@ func Init() error {
 		return fmt.Errorf("config: SECRET_ROTATION_INTERVAL must be positive")
 	}
 	if RotationBatch, err = positiveInt("SECRET_ROTATION_BATCH", 50); err != nil {
+		return err
+	}
+	if DynamicReaperEnabled, err = boolEnv("SECRET_DYNAMIC_REAPER_ENABLED", true); err != nil {
+		return err
+	}
+	DynamicReaperInterval = kitconfig.GetDuration("SECRET_DYNAMIC_REAPER_INTERVAL", time.Minute)
+	if DynamicReaperInterval <= 0 {
+		return fmt.Errorf("config: SECRET_DYNAMIC_REAPER_INTERVAL must be positive")
+	}
+	if DynamicReaperBatch, err = positiveInt("SECRET_DYNAMIC_REAPER_BATCH", 100); err != nil {
 		return err
 	}
 	if WebhooksEnabled, err = boolEnv("SECRET_WEBHOOKS_ENABLED", true); err != nil {

@@ -135,14 +135,30 @@ type Config struct {
 // over-large page limit is: a caller that asked for 24 hours and silently got one will
 // discover the difference when its credential stops working mid-job, and will look
 // everywhere except at the request it made.
+//
+// THE ROLE'S OWN CEILING IS CLAMPED HERE, at issue time, and that is a different
+// decision from the one above. Validate refuses a config whose MaxTTL exceeds
+// MaxTTLCeiling, but Validate only runs when a config is PERSISTED — so a stored row
+// can carry a larger value than the current code would accept: it predates the ceiling,
+// or the ceiling was lowered in a later release, or somebody edited the row directly.
+// Trusting the row would let the "deliberately not configurable upward" bound be
+// exceeded by a config that never passes through Validate again. Clamping the ceiling
+// (rather than the request) keeps both properties: the hard bound holds, and a caller
+// asking for more than it can have is still told so instead of silently downgraded.
 func (c Config) ResolveTTL(requested time.Duration) (time.Duration, error) {
 	def := c.DefaultTTL
 	if def <= 0 {
 		def = DefaultTTL
 	}
+	if def > MaxTTLCeiling {
+		def = MaxTTLCeiling
+	}
 	ceiling := c.MaxTTL
 	if ceiling <= 0 {
 		ceiling = def
+	}
+	if ceiling > MaxTTLCeiling {
+		ceiling = MaxTTLCeiling
 	}
 	if requested <= 0 {
 		return def, nil
@@ -203,11 +219,54 @@ func (c *Config) Validate() error {
 	if !strings.Contains(c.CreationSQL, PlaceholderPassword) {
 		return fmt.Errorf("creation_sql must contain the %s placeholder: a role created without a password cannot be used to log in", PlaceholderPassword)
 	}
+	if err := refuseQuotedPlaceholder("creation_sql", c.CreationSQL); err != nil {
+		return err
+	}
 	if strings.Contains(c.RevocationSQL, PlaceholderPassword) {
 		// A revocation needs a name, never a password — and a template that asked for
 		// one would be a template whose author expects the password to have been
 		// stored, which it never is.
 		return fmt.Errorf("revocation_sql must not contain %s: revoking a credential needs its role name, not its password", PlaceholderPassword)
+	}
+	return nil
+}
+
+// refuseQuotedPlaceholder rejects a template that quotes {{password}} itself.
+//
+// THIS IS A SECRET-DISCLOSURE RULE, not a syntax rule, and the disclosure is the reason
+// it is refused at write time rather than left to fail at run time.
+//
+// Render substitutes the password as a properly quoted SQL literal, so an author who
+// writes '{{password}}' produces ”secret” — which PostgreSQL lexes as
+// empty-literal, BARE TOKEN secret, empty-literal. The password is then sitting OUTSIDE
+// any quoted run, and both redaction paths let it through:
+//
+//   - the provisioner's own scrubber elides quoted runs, so it removes the two empty
+//     literals and emits the token between them verbatim;
+//   - PostgreSQL's error is `syntax error at or near "secret"` — DOUBLE quotes, which
+//     the scrubber deliberately preserves because a double-quoted run is normally the
+//     role name, which is useful and not secret.
+//
+// So the credential reaches the logs and the append-only audit row, where it cannot be
+// deleted. The statement also fails, but a template that both breaks AND leaks must not
+// be storable: the failure is recoverable and the disclosure is not.
+func refuseQuotedPlaceholder(field, sql string) error {
+	for _, placeholder := range []string{PlaceholderPassword, PlaceholderExpiration} {
+		for i := 0; ; {
+			idx := strings.Index(sql[i:], placeholder)
+			if idx < 0 {
+				break
+			}
+			at := i + idx
+			before := at > 0 && sql[at-1] == '\''
+			afterAt := at + len(placeholder)
+			after := afterAt < len(sql) && sql[afterAt] == '\''
+			if before || after {
+				return fmt.Errorf("%s must not put quotes around %s: the value is substituted as an already-quoted SQL literal, so the extra quotes both break the statement and expose the value in error messages and the audit trail",
+					field, placeholder)
+			}
+			i = afterAt
+		}
 	}
 	return nil
 }
@@ -392,13 +451,25 @@ func NewPassword() (string, error) {
 // quoting is this function's job. A template that quoted it as well would produce
 // `PASSWORD ”abc”`, which is a syntax error rather than a vulnerability, so the
 // failure mode of getting this wrong is loud.
+//
+// THE SUBSTITUTION ORDER IS LOAD-BEARING, and it is the reason the password is
+// substituted LAST. Every earlier substitution rescans the whole string, so a value
+// injected by an earlier step is still subject to the later ones. The role name is
+// safe to go first because ValidateRoleName's allowlist admits no '{'. The expiration
+// is an RFC3339 instant, which contains none either. The password is the one value
+// this function cannot make that promise about — today's generator is alphanumeric,
+// but the doc above deliberately keeps quoteLiteral for a future generator or a
+// caller-supplied value, and such a value containing the literal `{{expiration}}`
+// would, if substituted before the expiration, be rescanned: its quoted literal would
+// be closed by the injected instant and the rest would become SQL. Substituting it
+// last means nothing scans it again.
 func Render(template, roleName, password string, expiresAt time.Time) (string, error) {
 	if err := ValidateRoleName(roleName); err != nil {
 		return "", err
 	}
 	out := strings.ReplaceAll(template, PlaceholderName, roleName)
-	out = strings.ReplaceAll(out, PlaceholderPassword, quoteLiteral(password))
 	out = strings.ReplaceAll(out, PlaceholderExpiration, quoteLiteral(expiresAt.UTC().Format(time.RFC3339)))
+	out = strings.ReplaceAll(out, PlaceholderPassword, quoteLiteral(password))
 	return out, nil
 }
 

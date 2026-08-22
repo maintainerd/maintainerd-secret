@@ -329,6 +329,83 @@ func Map() sdkauthz.Map {
 			// Setting the policy is administration of the machinery, not a rotation:
 			// it decides when and how every future value is replaced. Console work.
 			"POST /api/v1/secrets/rotation-policy": {Permission: PermManageRotation, Actor: sdkauthz.ActorUserOnly},
+
+			// --- leases on static secrets ------------------------------------------
+			// THE PERMISSION SPLIT IS THE THING TO GET RIGHT HERE, and it is why the two
+			// verbs on /lease-policy are two entries. Reading a cap is METADATA — a
+			// consumer that can see "this secret allows 10 reads an hour" plans around
+			// it instead of meeting it as an unexplained 403 mid-incident. MOVING the
+			// cap is administration of how a value may be read, so it needs
+			// secret:ManageLease and a human: deciding a credential may be read ten
+			// times an hour is a policy call, and a workload making it is the signal
+			// rather than the workflow.
+			//
+			// NOTE WHAT IS ABSENT: no route demands secret:ManageLease to READ a leased
+			// secret. That is still secret:GetSecret on /secrets/reveal, because a lease
+			// is not authorization — requiring both would make every leased secret
+			// unreadable by exactly the consumers the lease was written for.
+			"POST /api/v1/secrets/lease-policy":  {Permission: PermManageLease, Actor: sdkauthz.ActorUserOnly},
+			"GET /api/v1/secrets/lease-policy":   {Permission: PermReadMetadata},
+			"GET /api/v1/secrets/leases":         {Permission: PermReadMetadata},
+			"POST /api/v1/secrets/leases/revoke": {Permission: PermManageLease, Actor: sdkauthz.ActorUserOnly},
+
+			// --- transit -----------------------------------------------------------
+			// THREE PERMISSIONS ON ONE SEGMENT, which is the whole reason /transit is
+			// declared route by route and is NOT in Routes. A segment pair has one read
+			// permission and one write permission; it could not say that an encrypt
+			// needs secret:Encrypt, a decrypt needs secret:Decrypt and a key retirement
+			// needs secret:ManageTransitKey. Under a pair, either a write-only ingest
+			// path would be handed key management, or every service that writes an
+			// encrypted column could read every encrypted column.
+			//
+			// KEY LIFECYCLE IS USER-ONLY. It is administration of what the data plane
+			// operates on, and one of these operations — raising min_decrypt_version —
+			// makes every token under a retired version unreadable service-wide. A
+			// workload doing that is the signal rather than the workflow. (This service
+			// runs no automated transit-key rotator; if one is ever added it needs a
+			// deliberate decision here, not a widened default.)
+			"GET /api/v1/transit":          {Permission: PermReadMetadata},
+			"GET /api/v1/transit/describe": {Permission: PermReadMetadata},
+			"GET /api/v1/transit/versions": {Permission: PermReadMetadata},
+			"POST /api/v1/transit":         {Permission: PermManageTransitKey, Actor: sdkauthz.ActorUserOnly},
+			"PATCH /api/v1/transit":        {Permission: PermManageTransitKey, Actor: sdkauthz.ActorUserOnly},
+			"DELETE /api/v1/transit":       {Permission: PermManageTransitKey, Actor: sdkauthz.ActorUserOnly},
+			"POST /api/v1/transit/rotate":  {Permission: PermManageTransitKey, Actor: sdkauthz.ActorUserOnly},
+			// THE DATA PLANE IS ActorAny, and that is the point of the feature: an
+			// application calls encrypt on every row it stores and decrypt on every row
+			// it reads back. Restricting either to humans would leave transit with no
+			// caller. A decrypt is a POST carrying a read for the reason a reveal is —
+			// a ciphertext token belongs in a body, not in an access log — and it
+			// demands the DECRYPT permission because that is what it does.
+			"POST /api/v1/transit/encrypt": {Permission: PermEncrypt},
+			"POST /api/v1/transit/decrypt": {Permission: PermDecrypt},
+
+			// --- dynamic secrets ---------------------------------------------------
+			// THE SPLIT BETWEEN THE TWO PERMISSIONS IS THE SECURITY MODEL OF THIS
+			// FEATURE. Configuring a role means choosing which database is targeted and
+			// writing the SQL that decides what an issued credential can do — a
+			// privileged, reviewable, human act, so secret:ManageDynamicRole is
+			// user-only. Issuing means asking for the short-lived account that
+			// configuration already described.
+			//
+			// ISSUING AND REVOKING ARE ActorAny AND SHARE ONE PERMISSION. A workload
+			// asking for its own database credential at boot IS the feature; requiring a
+			// human would push consumers back onto a shared static password. Revocation
+			// carries the SAME grant deliberately — putting it behind the management
+			// grant would mean no workload could return a credential, so they would be
+			// left to expire instead. Refusing a revoke is the wrong direction to fail.
+			//
+			// The blast radius is bounded by the MRN grant (which roles) and by the
+			// role's creation template (what the credential can do), not by the caller's
+			// class. And a holder gains no ability to read the target DSN on any path.
+			"GET /api/v1/dynamic":                     {Permission: PermReadMetadata},
+			"GET /api/v1/dynamic/describe":            {Permission: PermReadMetadata},
+			"GET /api/v1/dynamic/leases":              {Permission: PermReadMetadata},
+			"POST /api/v1/dynamic":                    {Permission: PermManageDynamicRole, Actor: sdkauthz.ActorUserOnly},
+			"PATCH /api/v1/dynamic":                   {Permission: PermManageDynamicRole, Actor: sdkauthz.ActorUserOnly},
+			"DELETE /api/v1/dynamic":                  {Permission: PermManageDynamicRole, Actor: sdkauthz.ActorUserOnly},
+			"POST /api/v1/dynamic/credentials":        {Permission: PermIssueDynamicCredential},
+			"POST /api/v1/dynamic/credentials/revoke": {Permission: PermIssueDynamicCredential},
 		},
 
 		// SEGMENT PAIRS — kept for the segments that genuinely are "browse these,
@@ -480,40 +557,42 @@ func Map() sdkauthz.Map {
 		//	                  hop of a reference chain
 		//	PermDeleteSecret  deleting a folder (which deletes the secrets under it)
 		//
-		// The first two are also primary permissions on routes of their own, so they
-		// add nothing to DeclaredPermissions. They stay because the property this list
-		// encodes is "a permission this service can demand must be registered in
-		// Auth", and that must survive a future where one of them is enforced ONLY as
-		// a second check — otherwise the guard would demand something no token could
-		// ever carry.
+		// Both are also primary permissions on routes of their own, so they add nothing
+		// to DeclaredPermissions. They stay because the property this list encodes is
+		// "a permission this service can demand must be registered in Auth", and that
+		// must survive a future where one of them is enforced ONLY as a second check —
+		// otherwise the guard would demand something no token could ever carry.
 		//
-		// THE SIX BELOW THEM ARE THE CASE THAT PROPERTY WAS WRITTEN FOR. Dynamic
-		// secrets, transit and static-secret leases are enforced today ONLY inside
-		// internal/api — every one of their operations runs through s.guard against a
-		// concrete target MRN — because the transports have not mounted their routes
-		// and RPCs yet. Without these entries the permissions would be demandable by
-		// the api layer and registered nowhere in Auth, which is the exact silent,
-		// total failure the DeclaredPermissions doc below describes: a guard asking
-		// for something no token can hold, so every call answers 403 and nothing in
-		// any log says why.
+		// SIX MORE USED TO SIT HERE — the dynamic-secret, transit and lease
+		// permissions — precisely because no route or RPC demanded them: their
+		// operations existed in internal/api and no transport reached them, so without
+		// an entry here they would have been demandable by the api layer and registered
+		// nowhere in Auth. That is the silent, total failure the DeclaredPermissions doc
+		// below describes: a guard asking for something no token can hold, so every call
+		// answers 403 with nothing in any log saying why.
 		//
-		// They are listed here rather than in Exact/Methods deliberately: the surface
-		// allowlist must describe the surface that EXISTS. An Exact entry for a route
-		// nothing serves is a stale row, and audit_test.go's
-		// TestEveryMappedRouteSurfaceIsLive fails on it — correctly, because a
-		// hand-kept table that can describe imaginary routes has stopped being an
-		// allowlist. When the transports mount these surfaces, each one gains its
-		// Exact/Methods entry, its actor constraint and its spec row, and the entries
-		// here become redundant in the same harmless way the first two are.
+		// THE REST SURFACE NOW MOUNTS ALL SIX, so each one is the PRIMARY permission on
+		// at least one Exact route above and is declared from there. They are removed
+		// from this list rather than left as belt and braces, because the list's job is
+		// to name permissions the surface table CANNOT account for — a permission listed
+		// here and also mapped is a row a reader has to reconcile, and a stale row is
+		// how a hand-kept table stops being read. Each of the six kept its actor
+		// constraint and gained a restSpec row in audit_test.go on the way in.
+		//
+		// The entries were listed here rather than in Exact/Methods deliberately while
+		// they lasted: the surface allowlist must describe the surface that EXISTS. An
+		// Exact entry for a route nothing serves is a stale row, and audit_test.go's
+		// TestEveryMappedRouteSurfaceIsLive fails on it.
+		//
+		// NOTE FOR THE gRPC SIDE: transit, dynamic secrets and leases are REST-ONLY
+		// today — no RPC exists for them, so there is nothing to add to Methods and
+		// nothing for TestTheTwoTransportsAgree to pin. When the proto gains them, each
+		// needs its Methods entry, its MethodActors entry where the REST route is
+		// user-only, and a pair in that test; a permission enforced on one transport and
+		// not the other is no constraint at all.
 		OperationPermissions: []string{
 			PermGetSecret,
 			PermDeleteSecret,
-			PermManageDynamicRole,
-			PermIssueDynamicCredential,
-			PermEncrypt,
-			PermDecrypt,
-			PermManageTransitKey,
-			PermManageLease,
 		},
 
 		// secret:Admin covers every required action. It does NOT widen resource scope.

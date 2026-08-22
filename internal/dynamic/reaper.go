@@ -118,6 +118,20 @@ func NewReaper(engine ReapEngine, opts ReaperOptions) *Reaper {
 	return &Reaper{engine: engine, opts: opts.withDefaults()}
 }
 
+// Interval is the resolved sweep cadence. Exported so a caller driving Tick through a
+// shared scheduler (leader.RunPeriodic) uses the same cadence Run would have.
+func (r *Reaper) Interval() time.Duration {
+	if r == nil {
+		return DefaultReapInterval
+	}
+	return r.opts.Interval
+}
+
+// Enabled reports whether this reaper would do work. A nil engine counts as disabled:
+// there is nothing to sweep with, and reporting enabled would produce a worker that
+// logs a started line and then does nothing every interval forever.
+func (r *Reaper) Enabled() bool { return r != nil && r.engine != nil && r.opts.Enabled }
+
 // Run ticks until ctx is cancelled.
 //
 // The first pass runs IMMEDIATELY rather than after one interval, and here that

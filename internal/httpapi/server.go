@@ -8,11 +8,19 @@
 // ship without a check, because there is no check for it to omit.
 //
 // ROUTE SHAPE. Segments under /api/v1 are FLAT (/projects, /environments, /folders,
-// /secrets, /bulk, /imports, /webhooks, /audit, /setup) rather than nested
-// (/projects/{p}/environments/{e}/secrets/...). That is what makes the guard's
+// /secrets, /bulk, /imports, /webhooks, /transit, /dynamic, /audit, /setup) rather than
+// nested (/projects/{p}/environments/{e}/secrets/...). That is what makes the guard's
 // first-segment allowlist meaningful: with everything nested under /projects, one map
 // entry would cover the whole API and the allowlist would be a single row that says
 // "yes".
+//
+// AND, ON /secrets, /bulk, /transit AND /dynamic, THE PATHS ARE STATIC. The guard's
+// exact table is keyed by method + request path, so a route with a path parameter
+// cannot carry a per-route permission and falls back to the segment's read/write pair —
+// which is only ever as strong as the weakest route on the segment. Those four segments
+// carry operations with genuinely different privileges (a listing beside a reveal, an
+// encrypt beside a key retirement), so they address their target through query or body
+// fields and every route declares its own permission.
 //
 // READS THAT TAKE A BODY. Reveal and batch-get are POSTs despite being reads. A
 // secret's address in a URL ends up in access logs, proxy logs, browser history and
@@ -320,11 +328,69 @@ func (s *Server) Router() http.Handler {
 			g.With(write).Post("/delete", s.deleteSecret)
 			g.With(write).Post("/restore", s.restoreSecret)
 			g.With(write).Post("/destroy", s.destroySecret)
+			// LEASES ON STATIC SECRETS live on this segment because a lease has no
+			// resource path of its own: a policy governs reads of ONE secret and is
+			// authorized against that secret's MRN (see internal/store/resources.go).
+			// Read and write on /lease-policy are separate route entries with separate
+			// permissions — reading a cap is metadata, moving it is administration.
+			g.With(write).Post("/lease-policy", s.setLeasePolicy)
+			g.Get("/lease-policy", s.getLeasePolicy)
+			g.Get("/leases", s.listSecretLeases)
+			g.With(write).Post("/leases/revoke", s.revokeSecretLeases)
 		})
 
 		v1.Route("/bulk", func(g chi.Router) {
 			g.With(reveal).Post("/get", s.batchGet)
 			g.With(write).Post("/put", s.batchPut)
+		})
+
+		// TRANSIT — encryption as a service. Like /secrets and /bulk, this segment is
+		// NOT a segment pair in the permission map: every route below has its own exact
+		// entry, because one read permission and one write permission cannot express
+		// that encrypt needs secret:Encrypt, decrypt needs secret:Decrypt and the key
+		// lifecycle needs secret:ManageTransitKey. A key is addressed by query or body
+		// fields rather than by a path parameter precisely so an exact entry is possible
+		// — see handlers_transit.go.
+		v1.Route("/transit", func(g chi.Router) {
+			g.Get("/", s.listTransitKeys)
+			g.With(write).Post("/", s.createTransitKey)
+			g.With(write).Patch("/", s.updateTransitKey)
+			g.With(write).Delete("/", s.deleteTransitKey)
+			g.Get("/describe", s.describeTransitKey)
+			g.Get("/versions", s.listTransitKeyVersions)
+			g.With(write).Post("/rotate", s.rotateTransitKey)
+			// ENCRYPT CARRIES THE WRITE BUDGET AND DECRYPT THE REVEAL BUDGET, matching
+			// what each one is: transit is a data plane, and the exfiltration path
+			// through it is the decrypt. Metering them together would let a caller
+			// spend its whole allowance encrypting and lock itself out of reading, or
+			// (worse) let a decrypt loop hide inside a generous write budget.
+			//
+			// BOTH BUDGETS ARE SIZED FOR ADMINISTRATIVE SECRET TRAFFIC, which is a
+			// deliberately conservative starting point and not the right long-term
+			// answer: an application calls these per row, so transit should get its own
+			// budget class before it carries production data-plane volume. Sharing a
+			// budget refuses requests, which is the safe direction to be wrong in.
+			g.With(write).Post("/encrypt", s.transitEncrypt)
+			g.With(reveal).Post("/decrypt", s.transitDecrypt)
+		})
+
+		// DYNAMIC SECRETS — role configuration, and the credential lifecycle. Exact
+		// entries for the same reason: configuring a role is user-only administration
+		// and asking for a credential is a workload's ordinary call, and no segment
+		// pair can say both.
+		v1.Route("/dynamic", func(g chi.Router) {
+			g.Get("/", s.listDynamicRoles)
+			g.With(write).Post("/", s.createDynamicRole)
+			g.With(write).Patch("/", s.updateDynamicRole)
+			g.With(write).Delete("/", s.deleteDynamicRole)
+			g.Get("/describe", s.describeDynamicRole)
+			g.Get("/leases", s.listDynamicLeases)
+			// Issuing carries the REVEAL budget, not the write one. It is the surface
+			// that hands out a live database account, so it is metered with the other
+			// disclosure path rather than alongside ordinary writes; a revoke is metered
+			// as a write because refusing a revoke is the wrong direction to fail.
+			g.With(reveal).Post("/credentials", s.issueDynamicCredential)
+			g.With(write).Post("/credentials/revoke", s.revokeDynamicCredential)
 		})
 
 		v1.Route("/webhooks", func(g chi.Router) {

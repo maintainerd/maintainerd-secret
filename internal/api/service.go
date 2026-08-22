@@ -30,6 +30,7 @@ import (
 
 	sdkauthz "github.com/maintainerd/sdk/authz"
 	"github.com/maintainerd/secret/internal/audit"
+	"github.com/maintainerd/secret/internal/dynamic"
 	"github.com/maintainerd/secret/internal/platform/apperror"
 	"github.com/maintainerd/secret/internal/store"
 )
@@ -68,6 +69,20 @@ type Options struct {
 	// what makes a standalone install usable without every caller knowing a tenant
 	// slug.
 	DefaultTenant string
+	// Provisioner is the outbound seam dynamic secrets use to run a role config's
+	// rendered SQL against the TARGET PostgreSQL database (see internal/dynamic).
+	//
+	// A NIL PROVISIONER IS A DOCUMENTED, EXPLICIT UNAVAILABILITY, not a silent no-op:
+	// the store refuses to issue or revoke with a 503 naming the missing configuration,
+	// rather than recording a lease for an account it never created. It is optional
+	// because a deployment that does not use dynamic secrets must not need an outbound
+	// database path to boot, and because the role-configuration surfaces are useful
+	// before any target database is reachable.
+	//
+	// It lives on Options rather than as a constructor argument because it is optional
+	// in exactly the way the tuning fields are, and because a nil positional argument
+	// at every call site that does not use the feature reads as an oversight.
+	Provisioner dynamic.Provisioner
 }
 
 // DefaultReferenceMaxDepth is the fallback bound on reference chains.

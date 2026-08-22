@@ -49,6 +49,16 @@ type fakeRepo struct {
 	imports      map[int64]*storage.ScopeImport
 	auditLog     []storage.AuditLog
 
+	// The transit and dynamic-secret tables. Modelled in
+	// fixture_transit_dynamic_test.go, where the queries that read them live.
+	transitKeys     map[int64]*storage.TransitKey
+	transitVersions map[int64]*storage.TransitKeyVersion
+	dynamicRoles    map[int64]*storage.DynamicRole
+	dynamicLeases   map[int64]*storage.DynamicLease
+	// secretLeases are the read leases issued against static secrets. Modelled in
+	// leases_test.go; the POLICY itself lives on the secrets row.
+	secretLeases map[int64]*storage.SecretLease
+
 	// auditErr, when set, makes every audit append fail. It is how the "a reveal
 	// cannot succeed without an audit row" test removes the trail without removing
 	// the store.
@@ -65,6 +75,12 @@ func newFakeRepo() *fakeRepo {
 		secrets:      map[int64]*storage.Secret{},
 		versions:     map[int64]*storage.SecretVersion{},
 		imports:      map[int64]*storage.ScopeImport{},
+
+		transitKeys:     map[int64]*storage.TransitKey{},
+		transitVersions: map[int64]*storage.TransitKeyVersion{},
+		dynamicRoles:    map[int64]*storage.DynamicRole{},
+		dynamicLeases:   map[int64]*storage.DynamicLease{},
+		secretLeases:    map[int64]*storage.SecretLease{},
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -614,4 +615,160 @@ func must2(won bool, err error) bool {
 		panic(err)
 	}
 	return won
+}
+
+// ---------------------------------------------------------------------------
+// Gaps found while reviewing the existing coverage
+// ---------------------------------------------------------------------------
+
+// TestANilElectorIsSafeOnEveryMethod. cmd/secretd constructs the Elector
+// conditionally — election is opt-in — so a nil *Elector reaches these methods
+// whenever it is turned off. Every one of them has a nil guard; none of them was
+// covered, and a panic in any would take down a process at boot precisely when an
+// operator had DISABLED the feature that panicked.
+func TestANilElectorIsSafeOnEveryMethod(t *testing.T) {
+	var e *Elector
+
+	assert.False(t, e.IsLeader(), "a nil elector is not a leader")
+	assert.Zero(t, e.Promotions())
+	assert.NoError(t, e.Resign(context.Background()), "resigning what was never held is a no-op")
+	assert.NoError(t, e.Heartbeat(context.Background()), "there is no session to verify")
+
+	// Elect is the one that reports an error rather than a lost election: "nobody asked
+	// the database" is not the same answer as "another replica holds it", and the caller
+	// must not be able to read it as one.
+	won, err := e.Elect(context.Background())
+	require.Error(t, err)
+	assert.False(t, won)
+
+	// Run must return rather than spin against a nil receiver.
+	done := make(chan struct{})
+	go func() { e.Run(context.Background()); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Run on a nil elector must return immediately")
+	}
+}
+
+// TestHeartbeatOnAProcessThatNeverWonClearsTheFlag. The session == nil branch is what
+// makes Heartbeat safe to call unconditionally from the loop, and it must clear the
+// flag rather than leave a stale true: a process reporting leadership it does not hold
+// is the one state that produces duplicate background work.
+func TestHeartbeatOnAProcessThatNeverWonClearsTheFlag(t *testing.T) {
+	locks := newFakeLocks()
+	e := New(locks, Options{})
+
+	require.NoError(t, e.Heartbeat(context.Background()))
+	assert.False(t, e.IsLeader())
+
+	// And after a clean resign, the same path runs again with nothing to verify.
+	require.NoError(t, must(e.Elect(context.Background())))
+	require.NoError(t, e.Resign(context.Background()))
+	require.NoError(t, e.Heartbeat(context.Background()))
+	assert.False(t, e.IsLeader())
+}
+
+// TestALeaderCanBeReElectedAfterResigning. A replica that resigned (a drain that was
+// cancelled, a rolling deploy that put the pod back) must be able to campaign again
+// rather than being permanently stuck as a follower because its session field was
+// cleared.
+func TestALeaderCanBeReElectedAfterResigning(t *testing.T) {
+	locks := newFakeLocks()
+	e := New(locks, Options{})
+
+	require.NoError(t, must(e.Elect(context.Background())))
+	require.NoError(t, e.Resign(context.Background()))
+	require.False(t, e.IsLeader())
+
+	won, err := e.Elect(context.Background())
+	require.NoError(t, err)
+	assert.True(t, won, "a resigned replica must be able to win again")
+	assert.Equal(t, int64(2), e.Promotions(), "and the second win must be counted as one")
+}
+
+// TestElectIsNotAFencingTokenAndDoesNotPretendToBe pins the limitation the package
+// comment is explicit about, because it is the assumption every gated worker inherits.
+//
+// Between a leader's session dying and its next heartbeat, Elect returns true from the
+// CACHED session without asking the database — so for up to one heartbeat interval two
+// replicas can both believe they lead. That is why every leader-gated worker must
+// still be safe to run twice: the election reduces duplicate work from "always" to "a
+// heartbeat after an abrupt failure", it does not make it impossible.
+func TestElectIsNotAFencingTokenAndDoesNotPretendToBe(t *testing.T) {
+	locks := newFakeLocks()
+	a := New(locks, Options{})
+	b := New(locks, Options{})
+
+	require.NoError(t, must(a.Elect(context.Background())))
+	locks.holder(a.Key()).kill()
+
+	// B legitimately takes the lock the instant A's session dies.
+	won, err := b.Elect(context.Background())
+	require.NoError(t, err)
+	require.True(t, won)
+
+	// And A still says yes, from its cached session, until it heartbeats.
+	stillWon, err := a.Elect(context.Background())
+	require.NoError(t, err)
+	assert.True(t, stillWon, "the documented window: a dead session is not noticed until the heartbeat")
+	assert.True(t, a.IsLeader())
+
+	// The heartbeat is what closes the window.
+	require.Error(t, a.Heartbeat(context.Background()))
+	assert.False(t, a.IsLeader())
+	assert.True(t, b.IsLeader())
+}
+
+// TestRunPeriodicDoesNotBurstAtBoot. Unlike the rotator, maintenance work has no "it
+// might be overdue right now" property worth a burst at boot — and every replica
+// starting at once would otherwise put every first pass in the same instant, which is
+// the thundering herd the interval exists to spread.
+func TestRunPeriodicDoesNotBurstAtBoot(t *testing.T) {
+	var passes atomic.Int64
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go RunPeriodic(ctx, nil, "test-worker", 300*time.Millisecond, func(context.Context) error {
+		passes.Add(1)
+		return nil
+	})
+
+	// Well inside the first interval, nothing has run.
+	time.Sleep(50 * time.Millisecond)
+	assert.Zero(t, passes.Load(), "the first pass must wait out one interval")
+
+	// And it does run once the tick arrives, so this is a delay rather than a deadlock.
+	require.Eventually(t, func() bool { return passes.Load() > 0 }, 2*time.Second, 5*time.Millisecond)
+}
+
+// TestRunPeriodicDefaultsANonPositiveInterval. A zero interval would make
+// time.NewTicker panic, taking down the process from a config value of nothing.
+func TestRunPeriodicDefaultsANonPositiveInterval(t *testing.T) {
+	for _, interval := range []time.Duration{0, -time.Second} {
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		require.NotPanics(t, func() {
+			RunPeriodic(ctx, nil, "test-worker", interval, func(context.Context) error { return nil })
+		}, "an interval of %s must be defaulted, not passed to NewTicker", interval)
+		cancel()
+	}
+}
+
+// TestLockKeyIsNonNegativeAcrossManyNames. The top bit is cleared so a key never
+// renders with a sign next to a pg_locks row an operator is trying to match during an
+// incident. One name proves the mask is applied; a sweep proves it is applied to the
+// right half of the hash.
+func TestLockKeyIsNonNegativeAcrossManyNames(t *testing.T) {
+	seen := make(map[int64]string, 512)
+	for i := 0; i < 512; i++ {
+		name := "worker-" + strconv.Itoa(i)
+		key := LockKey(name)
+		require.GreaterOrEqual(t, key, int64(0), "LockKey(%q) is negative", name)
+
+		// A collision would mean two workers silently sharing one lock.
+		if other, dup := seen[key]; dup {
+			t.Fatalf("LockKey collision: %q and %q both hash to %d", name, other, key)
+		}
+		seen[key] = name
+	}
 }

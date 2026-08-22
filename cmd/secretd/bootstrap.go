@@ -21,6 +21,7 @@ import (
 	"github.com/maintainerd/secret/internal/api"
 	"github.com/maintainerd/secret/internal/audit"
 	"github.com/maintainerd/secret/internal/crypto"
+	"github.com/maintainerd/secret/internal/dynamic"
 	"github.com/maintainerd/secret/internal/grpcserver"
 	"github.com/maintainerd/secret/internal/httpapi"
 	"github.com/maintainerd/secret/internal/leader"
@@ -208,9 +209,47 @@ func run(parent context.Context) error {
 	appSvc, err := api.New(svc, auditor, notifier, api.Options{
 		ReferenceMaxDepth: config.ReferenceMaxDepth,
 		DefaultTenant:     config.DefaultTenant,
+		// The outbound seam dynamic credentials run their DDL through. Without it
+		// store.IssueDynamicLease has nothing to provision with and the issue surface
+		// answers 503 — which is the documented contract, but it means dynamic secrets
+		// are configurable and unusable, so the wiring is not optional.
+		//
+		// Zero timeouts take the package defaults, which are argued where they are
+		// declared (short, because provisioning is a handful of DDL statements against a
+		// database normally in the same network, and neither a request nor a reaper tick
+		// may be held open by a target that has gone away).
+		Provisioner: dynamic.NewPgProvisioner(0, 0),
 	})
 	if err != nil {
 		return err
+	}
+
+	// THE REAPER, which is what makes a dynamic credential actually short-lived.
+	//
+	// Issuing one creates a real PostgreSQL role. The lease row says when it must stop
+	// existing, but a row expiring does not drop a role — this loop is the only thing
+	// that does. Leaving it unwired is invisible: every issue and every read keeps
+	// working while abandoned accounts accumulate against the target database forever.
+	//
+	// Leader-gated like the rotator and the re-driver, and here the gate matters for a
+	// second reason beyond duplicated work: two replicas revoking the same lease means
+	// the loser runs a DROP ROLE for an account already gone and records a failure for
+	// a lease that was correctly closed, which is indistinguishable in the audit trail
+	// from a revocation that genuinely did not happen.
+	reaper := dynamic.NewReaper(appSvc, dynamic.ReaperOptions{
+		Enabled:  config.DynamicReaperEnabled,
+		Interval: config.DynamicReaperInterval,
+		Batch:    config.DynamicReaperBatch,
+	})
+	if config.DynamicReaperEnabled {
+		slog.Info("dynamic credential reaper enabled",
+			"interval", config.DynamicReaperInterval.String(),
+			"batch", config.DynamicReaperBatch,
+			"detail", "expired dynamic leases are revoked against their target database and closed")
+	} else {
+		slog.Warn("dynamic credential reaper is DISABLED — issued credentials will outlive their leases",
+			"effect", "an expired lease leaves a live PostgreSQL role that nothing will drop",
+			"variable", "SECRET_DYNAMIC_REAPER_ENABLED")
 	}
 
 	setupSvc, err := setup.New(svc, auditor, setup.Options{
@@ -467,7 +506,34 @@ func run(parent context.Context) error {
 			runWebhookRedrive(c, leader.Wrap(elector), redriver)
 			return nil
 		},
+		// The dynamic-credential reaper, on the leader only. Never an error, for the
+		// rotator's reason: a pass that could not reach a target database is an ordinary
+		// condition that retries next tick, and taking the vault down over it would turn
+		// one unreachable target into a total outage.
+		func(c context.Context) error {
+			runDynamicReaper(c, leader.Wrap(elector), reaper)
+			return nil
+		},
 	)
+}
+
+// runDynamicReaper revokes expired dynamic credentials on the leader.
+//
+// Wired through leader.RunPeriodic like the re-driver and the pruner, so the loop's
+// operational contract — a recovered panic, a non-fatal error, a logged leadership
+// transition — is the shared one rather than a fourth hand-written ticker. Reaper.Run
+// has its own ticker for standalone use; RunPeriodic is what adds the gate.
+func runDynamicReaper(ctx context.Context, election leader.Election, reaper *dynamic.Reaper) {
+	if reaper == nil || !reaper.Enabled() {
+		return
+	}
+	// Tick returns nothing: it already recovers its own panic and logs its own outcome,
+	// and there is no failure here that should stop the loop. The adapter says so
+	// explicitly rather than letting a future reader assume an error was dropped.
+	leader.RunPeriodic(ctx, election, "dynamic-reaper", reaper.Interval(), func(c context.Context) error {
+		reaper.Tick(c)
+		return nil
+	})
 }
 
 // runWebhookRedrive runs the durable webhook retry loop on the leader.
