@@ -11,6 +11,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"slices"
 	"strconv"
 	"strings"
@@ -83,10 +84,33 @@ var (
 	// interrupted.
 	RewrapBatchSize int
 
+	// --- authorization -----------------------------------------------------
+
+	// AuthJWKSURL (AUTH_JWKS_URL) is maintainerd-auth's public JWKS endpoint —
+	// where the keys that verify a caller's bearer token are fetched from.
+	//
+	// This variable and the two below are a SET: all three or none. A JWKS URL
+	// without an issuer and audience check accepts any token Auth ever signed,
+	// including tokens minted for a completely different service, so a partial
+	// configuration is treated as no configuration. With none of them set, the
+	// API is DISABLED outside development (REST answers 503, gRPC serves health
+	// only); in development it opens with a loud boot banner naming every guard
+	// that is off.
+	AuthJWKSURL string
+
+	// AuthIssuer (AUTH_ISSUER) is the `iss` a token must carry.
+	AuthIssuer string
+
+	// AuthAudience (AUTH_AUDIENCE) is the `aud` a token must carry — this
+	// service's resource-API identifier in Auth.
+	AuthAudience string
+
 	// --- setup -------------------------------------------------------------
 
-	// SetupBootstrapToken (SETUP_BOOTSTRAP_TOKEN) gates the one-time Setup RPC.
-	// Empty leaves setup open, which is refused outside development. Never log it.
+	// SetupBootstrapToken (SETUP_BOOTSTRAP_TOKEN) gates BOTH setup surfaces: the
+	// standalone REST wizard (X-Setup-Token header) and the controlled gRPC
+	// SetupService (x-setup-token metadata). Empty leaves setup open, which is
+	// refused outside development. Never log it.
 	SetupBootstrapToken string
 
 	// --- default scope (flat-key compatibility) ----------------------------
@@ -101,6 +125,42 @@ var (
 	DefaultTenant      string // SECRET_DEFAULT_TENANT; default "default"
 	DefaultProject     string // SECRET_DEFAULT_PROJECT; default "default"
 	DefaultEnvironment string // SECRET_DEFAULT_ENVIRONMENT; default "default"
+
+	// --- references --------------------------------------------------------
+
+	// ReferenceMaxDepth (SECRET_REFERENCE_MAX_DEPTH, default 8) bounds how many
+	// hops a reference chain may be followed. It is a correctness bound, not a
+	// tuning knob: the resolver detects cycles precisely, and this is the backstop
+	// for a chain that is legitimately shaped but unreasonably long.
+	ReferenceMaxDepth int
+
+	// --- rotation ----------------------------------------------------------
+
+	// RotationEnabled (SECRET_ROTATION_ENABLED, default true) runs the background
+	// rotator. Turning it off preserves every policy — an operator disabling
+	// rotation during an incident wants the schedules kept, not deleted.
+	RotationEnabled bool
+
+	// RotationInterval (SECRET_ROTATION_INTERVAL, default 5m) is how often the
+	// rotator scans for due secrets. Rotation intervals are measured in days, so
+	// this is two orders of magnitude finer than what it schedules.
+	RotationInterval time.Duration
+
+	// RotationBatch (SECRET_ROTATION_BATCH, default 50) bounds one pass, so a
+	// thousand secrets coming due at once (a policy applied in bulk) does not
+	// become a thousand writes in one tick.
+	RotationBatch int
+
+	// --- webhooks ----------------------------------------------------------
+
+	// WebhooksEnabled (SECRET_WEBHOOKS_ENABLED, default true) delivers change and
+	// rotation notifications. Deliveries never carry a value — only the MRN and
+	// the new version — so a consumer knows to re-read.
+	WebhooksEnabled bool
+
+	// WebhookConcurrency (SECRET_WEBHOOK_CONCURRENCY, default 4) bounds parallel
+	// deliveries for one event, so a slow endpoint cannot serialize the fan-out.
+	WebhookConcurrency int
 )
 
 // Init reads, validates and freezes the configuration. It returns an error rather
@@ -173,6 +233,43 @@ func Init() error {
 		return fmt.Errorf("config: SECRET_RECOVERY_WINDOW of 0 makes every delete immediately unrecoverable; not allowed outside %s", EnvDevelopment)
 	}
 
+	AuthJWKSURL = strings.TrimSpace(kitconfig.GetEnv("AUTH_JWKS_URL", ""))
+	AuthIssuer = strings.TrimSpace(kitconfig.GetEnv("AUTH_ISSUER", ""))
+	AuthAudience = strings.TrimSpace(kitconfig.GetEnv("AUTH_AUDIENCE", ""))
+	// A PARTIAL auth configuration is a boot error rather than a silent
+	// degradation. Setting only AUTH_JWKS_URL is the mistake that matters: it looks
+	// configured, and it accepts any token Auth ever signed. Refusing here means an
+	// operator who set two of three learns it now instead of after an incident.
+	if authSet := boolCount(AuthJWKSURL != "", AuthIssuer != "", AuthAudience != ""); authSet != 0 && authSet != 3 {
+		return fmt.Errorf(
+			"config: AUTH_JWKS_URL, AUTH_ISSUER and AUTH_AUDIENCE must be set together or not at all; " +
+				"a JWKS URL without an issuer and audience check accepts tokens minted for other services")
+	}
+	if authSet := boolCount(AuthJWKSURL != "", AuthIssuer != "", AuthAudience != ""); authSet == 0 && !IsDevelopment() {
+		slog.Warn("config: no auth configuration — the API will answer 503 and gRPC will serve health only",
+			"missing", "AUTH_JWKS_URL, AUTH_ISSUER, AUTH_AUDIENCE")
+	}
+
+	if ReferenceMaxDepth, err = positiveInt("SECRET_REFERENCE_MAX_DEPTH", 8); err != nil {
+		return err
+	}
+	if RotationEnabled, err = boolEnv("SECRET_ROTATION_ENABLED", true); err != nil {
+		return err
+	}
+	RotationInterval = kitconfig.GetDuration("SECRET_ROTATION_INTERVAL", 5*time.Minute)
+	if RotationInterval <= 0 {
+		return fmt.Errorf("config: SECRET_ROTATION_INTERVAL must be positive")
+	}
+	if RotationBatch, err = positiveInt("SECRET_ROTATION_BATCH", 50); err != nil {
+		return err
+	}
+	if WebhooksEnabled, err = boolEnv("SECRET_WEBHOOKS_ENABLED", true); err != nil {
+		return err
+	}
+	if WebhookConcurrency, err = positiveInt("SECRET_WEBHOOK_CONCURRENCY", 4); err != nil {
+		return err
+	}
+
 	SetupBootstrapToken = kitconfig.GetEnv("SETUP_BOOTSTRAP_TOKEN", "")
 	if SetupBootstrapToken == "" && !IsDevelopment() {
 		return fmt.Errorf("config: SETUP_BOOTSTRAP_TOKEN is required outside %s — an empty token leaves the one-time setup window open to anyone", EnvDevelopment)
@@ -229,6 +326,18 @@ func positiveInt(key string, def int) (int, error) {
 		return 0, fmt.Errorf("config: %s must be at least 1, got %d", key, n)
 	}
 	return n, nil
+}
+
+// boolCount counts how many of the flags are set, used for the all-or-nothing
+// variable groups.
+func boolCount(flags ...bool) int {
+	n := 0
+	for _, f := range flags {
+		if f {
+			n++
+		}
+	}
+	return n
 }
 
 func boolEnv(key string, def bool) (bool, error) {

@@ -566,6 +566,96 @@ func (q *Queries) ListSecretsDueForDestruction(ctx context.Context, limit int32)
 	return items, nil
 }
 
+const listSecretsWithRotationPolicy = `-- name: ListSecretsWithRotationPolicy :many
+SELECT s.secret_id, s.secret_uuid, t.tenant_uuid, p.slug AS project_slug,
+       e.slug AS environment_slug, f.path AS folder_path, s.key,
+       s.current_version, s.rotation_policy, s.rotated_at, s.created_at,
+       s.mrn_tenant, s.mrn_project, s.mrn_resource_path
+FROM secrets s
+JOIN tenants t ON t.tenant_id = s.tenant_id
+JOIN projects p ON p.project_id = s.project_id
+JOIN environments e ON e.environment_id = s.environment_id
+JOIN folders f ON f.folder_id = s.folder_id
+WHERE s.deleted_at IS NULL
+  AND t.deleted_at IS NULL
+  AND p.deleted_at IS NULL
+  AND e.deleted_at IS NULL
+  AND f.deleted_at IS NULL
+  AND s.rotation_policy ->> 'enabled' = 'true'
+ORDER BY s.secret_id
+LIMIT $2 OFFSET $1
+`
+
+type ListSecretsWithRotationPolicyParams struct {
+	RowOffset int32 `json:"row_offset"`
+	RowLimit  int32 `json:"row_limit"`
+}
+
+type ListSecretsWithRotationPolicyRow struct {
+	SecretID        int64              `json:"secret_id"`
+	SecretUuid      uuid.UUID          `json:"secret_uuid"`
+	TenantUuid      uuid.UUID          `json:"tenant_uuid"`
+	ProjectSlug     string             `json:"project_slug"`
+	EnvironmentSlug string             `json:"environment_slug"`
+	FolderPath      string             `json:"folder_path"`
+	Key             string             `json:"key"`
+	CurrentVersion  int32              `json:"current_version"`
+	RotationPolicy  []byte             `json:"rotation_policy"`
+	RotatedAt       pgtype.Timestamptz `json:"rotated_at"`
+	CreatedAt       time.Time          `json:"created_at"`
+	MrnTenant       string             `json:"mrn_tenant"`
+	MrnProject      string             `json:"mrn_project"`
+	MrnResourcePath string             `json:"mrn_resource_path"`
+}
+
+// ListSecretsWithRotationPolicy is the background rotator's work queue: every live
+// secret whose rotation_policy declares itself enabled, with the addressing columns
+// the rotator needs to write a new version.
+//
+// WHETHER A SECRET IS *DUE* IS DECIDED IN GO, NOT HERE. Expressing "rotated_at +
+// interval <= now()" in SQL means parsing a Go duration string inside Postgres, and
+// an interval this query mis-parses is either a credential that silently stops
+// rotating or one that rotates every tick. The filter that belongs in SQL is the
+// cheap, unambiguous one (enabled, live); the arithmetic belongs next to the parser
+// that owns the format, where it is unit-testable without a database.
+//
+// The select list is metadata plus addressing — no ciphertext. The rotator generates
+// a NEW value, so it never needs to read the current one.
+func (q *Queries) ListSecretsWithRotationPolicy(ctx context.Context, arg ListSecretsWithRotationPolicyParams) ([]ListSecretsWithRotationPolicyRow, error) {
+	rows, err := q.db.Query(ctx, listSecretsWithRotationPolicy, arg.RowOffset, arg.RowLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListSecretsWithRotationPolicyRow{}
+	for rows.Next() {
+		var i ListSecretsWithRotationPolicyRow
+		if err := rows.Scan(
+			&i.SecretID,
+			&i.SecretUuid,
+			&i.TenantUuid,
+			&i.ProjectSlug,
+			&i.EnvironmentSlug,
+			&i.FolderPath,
+			&i.Key,
+			&i.CurrentVersion,
+			&i.RotationPolicy,
+			&i.RotatedAt,
+			&i.CreatedAt,
+			&i.MrnTenant,
+			&i.MrnProject,
+			&i.MrnResourcePath,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const refreshSecretMrnPathsInSubtree = `-- name: RefreshSecretMrnPathsInSubtree :execrows
 UPDATE secrets s
 SET mrn_resource_path = 'secret/' || e.slug || CASE WHEN f.path = '/' THEN '/' ELSE f.path || '/' END || s.key,

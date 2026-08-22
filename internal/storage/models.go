@@ -88,6 +88,22 @@ type RootKey struct {
 	RetiredAt   pgtype.Timestamptz `json:"retired_at"`
 }
 
+type ScopeImport struct {
+	ImportUuid          uuid.UUID          `json:"import_uuid"`
+	ImportID            int64              `json:"import_id"`
+	TenantID            int64              `json:"tenant_id"`
+	EnvironmentID       int64              `json:"environment_id"`
+	FolderID            int64              `json:"folder_id"`
+	SourceEnvironmentID int64              `json:"source_environment_id"`
+	SourceFolderID      int64              `json:"source_folder_id"`
+	Position            int32              `json:"position"`
+	Enabled             bool               `json:"enabled"`
+	Metadata            []byte             `json:"metadata"`
+	CreatedAt           time.Time          `json:"created_at"`
+	UpdatedAt           time.Time          `json:"updated_at"`
+	DeletedAt           pgtype.Timestamptz `json:"deleted_at"`
+}
+
 type Secret struct {
 	SecretID        int64              `json:"secret_id"`
 	SecretUuid      uuid.UUID          `json:"secret_uuid"`
@@ -155,4 +171,44 @@ type Tenant struct {
 	CreatedAt      time.Time          `json:"created_at"`
 	UpdatedAt      time.Time          `json:"updated_at"`
 	DeletedAt      pgtype.Timestamptz `json:"deleted_at"`
+}
+
+type WebhookDelivery struct {
+	DeliveryID     int64       `json:"delivery_id"`
+	DeliveryUuid   uuid.UUID   `json:"delivery_uuid"`
+	EndpointID     int64       `json:"endpoint_id"`
+	TenantID       int64       `json:"tenant_id"`
+	EventType      string      `json:"event_type"`
+	ResourceMrn    string      `json:"resource_mrn"`
+	Version        pgtype.Int4 `json:"version"`
+	AttemptCount   int32       `json:"attempt_count"`
+	Status         string      `json:"status"`
+	ResponseStatus pgtype.Int4 `json:"response_status"`
+	Error          string      `json:"error"`
+	Payload        []byte      `json:"payload"`
+	CreatedAt      time.Time   `json:"created_at"`
+	UpdatedAt      time.Time   `json:"updated_at"`
+}
+
+type WebhookEndpoint struct {
+	EndpointID       int64              `json:"endpoint_id"`
+	EndpointUuid     uuid.UUID          `json:"endpoint_uuid"`
+	TenantID         int64              `json:"tenant_id"`
+	ProjectID        int64              `json:"project_id"`
+	Url              string             `json:"url"`
+	Description      string             `json:"description"`
+	SecretCiphertext []byte             `json:"secret_ciphertext"`
+	SecretNonce      []byte             `json:"secret_nonce"`
+	SecretDekWrapped []byte             `json:"secret_dek_wrapped"`
+	SecretDekNonce   []byte             `json:"secret_dek_nonce"`
+	KekID            string             `json:"kek_id"`
+	Events           []byte             `json:"events"`
+	Status           string             `json:"status"`
+	TimeoutSeconds   int32              `json:"timeout_seconds"`
+	MaxAttempts      int32              `json:"max_attempts"`
+	LastTriggeredAt  pgtype.Timestamptz `json:"last_triggered_at"`
+	Metadata         []byte             `json:"metadata"`
+	CreatedAt        time.Time          `json:"created_at"`
+	UpdatedAt        time.Time          `json:"updated_at"`
+	DeletedAt        pgtype.Timestamptz `json:"deleted_at"`
 }

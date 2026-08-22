@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -204,4 +205,86 @@ func TestRootKeyIsNotValidatedByConfig(t *testing.T) {
 	t.Setenv("SECRET_ROOT_KEY", key)
 	require.NoError(t, Init())
 	assert.Equal(t, key, RootKey)
+}
+
+// ---------------------------------------------------------------------------
+// Authorization, rotation and webhook settings (wave 2)
+// ---------------------------------------------------------------------------
+
+// TestAuthVariablesAreAllOrNothing is the one that matters. Setting only
+// AUTH_JWKS_URL LOOKS configured and accepts any token Auth ever signed, including
+// tokens minted for a completely different service — so a partial configuration is a
+// boot error rather than a silent degradation an operator discovers after an incident.
+func TestAuthVariablesAreAllOrNothing(t *testing.T) {
+	partials := []map[string]string{
+		{"AUTH_JWKS_URL": "https://auth.example/.well-known/jwks.json"},
+		{"AUTH_ISSUER": "https://auth.example/"},
+		{"AUTH_AUDIENCE": "maintainerd-secret"},
+		{"AUTH_JWKS_URL": "https://auth.example/.well-known/jwks.json", "AUTH_ISSUER": "https://auth.example/"},
+	}
+	// Each case runs as a SUBTEST because t.Setenv only restores at the end of the
+	// test that called it: in a flat loop the second iteration would inherit the
+	// first's variable and quietly become a complete configuration.
+	for i, partial := range partials {
+		t.Run(fmt.Sprintf("case-%d", i), func(t *testing.T) {
+			setRequiredEnv(t)
+			for k, v := range partial {
+				t.Setenv(k, v)
+			}
+			err := Init()
+			require.Error(t, err, "partial auth configuration %v must be refused", partial)
+			assert.Contains(t, err.Error(), "must be set together")
+		})
+	}
+}
+
+func TestCompleteAuthConfigurationIsAccepted(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("AUTH_JWKS_URL", "https://auth.example/.well-known/jwks.json")
+	t.Setenv("AUTH_ISSUER", "https://auth.example/")
+	t.Setenv("AUTH_AUDIENCE", "maintainerd-secret")
+	require.NoError(t, Init())
+	assert.Equal(t, "https://auth.example/.well-known/jwks.json", AuthJWKSURL)
+	assert.Equal(t, "https://auth.example/", AuthIssuer)
+	assert.Equal(t, "maintainerd-secret", AuthAudience)
+}
+
+// TestNoAuthConfigurationIsPermittedAndDisablesTheAPI. Booting is allowed so an
+// unprovisioned instance can still be reached on its setup surface; the guard, not
+// config, is what refuses the API.
+func TestNoAuthConfigurationIsPermitted(t *testing.T) {
+	setRequiredEnv(t)
+	require.NoError(t, Init())
+	assert.Empty(t, AuthJWKSURL)
+	assert.Empty(t, AuthIssuer)
+	assert.Empty(t, AuthAudience)
+}
+
+func TestRotationAndWebhookDefaults(t *testing.T) {
+	setRequiredEnv(t)
+	require.NoError(t, Init())
+	assert.True(t, RotationEnabled)
+	assert.Equal(t, 5*time.Minute, RotationInterval)
+	assert.Equal(t, 50, RotationBatch)
+	assert.True(t, WebhooksEnabled)
+	assert.Equal(t, 4, WebhookConcurrency)
+	assert.Equal(t, 8, ReferenceMaxDepth)
+}
+
+func TestRotationCanBeDisabledWithoutRemovingPolicies(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("SECRET_ROTATION_ENABLED", "false")
+	require.NoError(t, Init())
+	assert.False(t, RotationEnabled)
+}
+
+// TestMalformedNumericSettingsAreRefused rather than silently defaulted: a typo in a
+// batch or depth setting that becomes the default is a configuration change nobody
+// made.
+func TestMalformedNumericSettingsAreRefused(t *testing.T) {
+	for _, key := range []string{"SECRET_ROTATION_BATCH", "SECRET_REFERENCE_MAX_DEPTH", "SECRET_WEBHOOK_CONCURRENCY"} {
+		setRequiredEnv(t)
+		t.Setenv(key, "lots")
+		require.Error(t, Init(), "%s must refuse a non-integer", key)
+	}
 }

@@ -28,12 +28,42 @@ const (
 	ActionDestroy = "secret.destroy"
 	ActionList    = "secret.list"
 
+	// ActionRollback is recorded separately from ActionWrite even though a rollback
+	// IS a write. The distinction is the point of having it: "the value was set to
+	// something new" and "the value was reverted to what it used to be" are
+	// different events to an incident reviewer, and only one of them means somebody
+	// decided the current value was wrong.
+	ActionRollback = "secret.rollback"
+	// ActionReferenceResolve records one HOP of a reference chain. A reveal of a
+	// reference therefore produces a reveal row plus one row per hop, which is what
+	// makes "who actually saw the underlying value" answerable — the caller revealed
+	// a pointer, but the value it pointed at was decrypted too.
+	ActionReferenceResolve = "secret.reference"
+
 	ActionProjectCreate     = "project.create"
+	ActionProjectUpdate     = "project.update"
+	ActionProjectDelete     = "project.delete"
 	ActionEnvironmentCreate = "environment.create"
+	ActionEnvironmentUpdate = "environment.update"
+	ActionEnvironmentDelete = "environment.delete"
 	ActionFolderCreate      = "folder.create"
 	ActionFolderMove        = "folder.move"
+	ActionFolderDelete      = "folder.delete"
+	ActionImportCreate      = "import.create"
+	ActionImportUpdate      = "import.update"
+	ActionImportDelete      = "import.delete"
+	ActionWebhookCreate     = "webhook.create"
+	ActionWebhookUpdate     = "webhook.update"
+	ActionWebhookDelete     = "webhook.delete"
+	ActionWebhookDeliver    = "webhook.deliver"
+	ActionMetadataUpdate    = "secret.metadata"
+	ActionAuditRead         = "audit.read"
 	ActionRootKeyRotate     = "rootkey.rotate"
+	ActionSetupProvision    = "setup.provision"
 	ActionSetupComplete     = "setup.complete"
+	ActionSetupStatusRead   = "setup.status"
+	ActionRotationPolicySet = "rotation.policy"
+	ActionRotationScheduled = "rotation.scheduled"
 )
 
 // Actor kinds.

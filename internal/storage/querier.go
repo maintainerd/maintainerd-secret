@@ -44,6 +44,8 @@ type Querier interface {
 	// CountVersionsByKEK is the retirement proof: a root key may only be retired when
 	// this returns zero.
 	CountVersionsByKEK(ctx context.Context, kekID string) (int64, error)
+	CountWebhookDeliveriesByEndpoint(ctx context.Context, arg CountWebhookDeliveriesByEndpointParams) (int64, error)
+	CountWebhookEndpointsByProject(ctx context.Context, arg CountWebhookEndpointsByProjectParams) (int64, error)
 	// Environments. The table has no tenant_id column (it hangs off a project), so
 	// tenant scoping is applied with a project subquery rather than a join — that
 	// keeps the select list a plain `*` (so sqlc returns the Environment struct) while
@@ -63,6 +65,12 @@ type Querier interface {
 	// Projects. Every read carries tenant_id in the WHERE clause — see the note in
 	// secret.sql on why tenant scoping lives in the query and not in the service.
 	CreateProject(ctx context.Context, arg CreateProjectParams) (Project, error)
+	// Scope imports: "this folder inherits that folder's secrets".
+	//
+	// Tenant scoping is in the WHERE clause of every statement, same rule as the rest
+	// of this directory. The table carries tenant_id of its own (rather than reaching
+	// it through folders) precisely so that rule costs nothing here.
+	CreateScopeImport(ctx context.Context, arg CreateScopeImportParams) (ScopeImport, error)
 	// Secrets: identity and metadata. NO QUERY IN THIS FILE RETURNS A VALUE, because
 	// the secrets table has no value column at all — payloads live only in
 	// secret_versions (see secret_version.sql).
@@ -91,10 +99,25 @@ type Querier interface {
 	// subject string, and it is recorded where it belongs, in audit_log.actor_subject.
 	// The BIGINT audit columns are kept for schema parity with core.
 	CreateTenant(ctx context.Context, arg CreateTenantParams) (Tenant, error)
+	CreateWebhookDelivery(ctx context.Context, arg CreateWebhookDeliveryParams) (WebhookDelivery, error)
+	// Webhook endpoints and their delivery log.
+	//
+	// The signing-key columns are selected explicitly nowhere except the two reads
+	// that actually need to sign a delivery. Everything a console or an API response
+	// renders goes through the *Meta shapes below, which do not select the key at all —
+	// the same belt-and-braces rule the secret listing follows.
+	// CreateWebhookEndpoint takes endpoint_uuid from the CALLER rather than letting the
+	// column default supply it. That is not a style preference: the signing key is
+	// sealed with the endpoint's UUID bound in as additional authenticated data (so a
+	// ciphertext moved between endpoint rows fails to open), and AAD has to be known
+	// before the seal — which is before the INSERT. A DB-generated UUID would force
+	// either an insert-then-update dance or an AAD that binds nothing row-specific.
+	CreateWebhookEndpoint(ctx context.Context, arg CreateWebhookEndpointParams) (WebhookEndpoint, error)
 	DeleteAuditEventsBefore(ctx context.Context, createdAt time.Time) (int64, error)
 	DeleteSecretVersion(ctx context.Context, versionID int64) (int64, error)
 	// The durable one-shot setup lock.
 	EnsureSetupState(ctx context.Context) error
+	FinishWebhookDelivery(ctx context.Context, arg FinishWebhookDeliveryParams) (WebhookDelivery, error)
 	GetActiveRootKey(ctx context.Context) (RootKey, error)
 	GetDeletedSecretByUUID(ctx context.Context, arg GetDeletedSecretByUUIDParams) (Secret, error)
 	GetEnvironmentByID(ctx context.Context, arg GetEnvironmentByIDParams) (Environment, error)
@@ -112,6 +135,7 @@ type Querier interface {
 	GetProjectBySlug(ctx context.Context, arg GetProjectBySlugParams) (Project, error)
 	GetProjectByUUID(ctx context.Context, arg GetProjectByUUIDParams) (Project, error)
 	GetRootKey(ctx context.Context, kekID string) (RootKey, error)
+	GetScopeImportByUUID(ctx context.Context, arg GetScopeImportByUUIDParams) (ScopeImport, error)
 	GetSecretByAddress(ctx context.Context, arg GetSecretByAddressParams) (Secret, error)
 	// GetSecretByAddressForUpdate takes a row lock for the write path. Two concurrent
 	// writes to one secret must serialize: both would otherwise read the same
@@ -125,6 +149,7 @@ type Querier interface {
 	GetTenantByID(ctx context.Context, tenantID int64) (Tenant, error)
 	GetTenantByName(ctx context.Context, name string) (Tenant, error)
 	GetTenantByUUID(ctx context.Context, tenantUuid uuid.UUID) (Tenant, error)
+	GetWebhookEndpointByUUID(ctx context.Context, arg GetWebhookEndpointByUUIDParams) (WebhookEndpoint, error)
 	// HardDeleteSecret is irreversible. The recovery-window guard is IN THE QUERY and
 	// reads now() from the database rather than trusting a timestamp from the caller:
 	// destruction inside the window would be unrecoverable data loss, so the check has
@@ -133,6 +158,9 @@ type Querier interface {
 	// maintainerd.allow_secret_version_delete GUC to be set to 'secret_destroy' in
 	// the same transaction.
 	HardDeleteSecret(ctx context.Context, arg HardDeleteSecretParams) (int64, error)
+	// ListActiveWebhookEndpointsByProject IS the delivery read, so it does select the
+	// wrapped signing key — the notifier needs it to compute the HMAC.
+	ListActiveWebhookEndpointsByProject(ctx context.Context, arg ListActiveWebhookEndpointsByProjectParams) ([]WebhookEndpoint, error)
 	ListAuditEventsByActor(ctx context.Context, arg ListAuditEventsByActorParams) ([]AuditLog, error)
 	ListAuditEventsBySecret(ctx context.Context, arg ListAuditEventsBySecretParams) ([]AuditLog, error)
 	ListAuditEventsByTenant(ctx context.Context, arg ListAuditEventsByTenantParams) ([]AuditLog, error)
@@ -150,6 +178,17 @@ type Querier interface {
 	ListPrunableVersions(ctx context.Context, arg ListPrunableVersionsParams) ([]ListPrunableVersionsRow, error)
 	ListRootKeys(ctx context.Context) ([]RootKey, error)
 	ListRootKeysByState(ctx context.Context, state string) ([]RootKey, error)
+	ListScopeImportsByEnvironment(ctx context.Context, arg ListScopeImportsByEnvironmentParams) ([]ListScopeImportsByEnvironmentRow, error)
+	// ListScopeImportsBySource answers "what imports me", which is what the cycle
+	// check walks and what the console shows before letting an operator delete a
+	// folder other environments depend on.
+	ListScopeImportsBySource(ctx context.Context, arg ListScopeImportsBySourceParams) ([]ScopeImport, error)
+	// ListScopeImportsByTarget is the resolver's read: the enabled imports of one
+	// folder, in precedence order. `position, import_id` rather than `position` alone
+	// so two imports written at the same position still resolve deterministically —
+	// a resolution order that varies between replicas would make "which value did we
+	// get" unanswerable.
+	ListScopeImportsByTarget(ctx context.Context, arg ListScopeImportsByTargetParams) ([]ListScopeImportsByTargetRow, error)
 	// ListSecretMetaBySubtree is the hierarchical listing: everything at or under a
 	// folder path, in one environment, for one tenant.
 	//
@@ -166,6 +205,20 @@ type Querier interface {
 	// ever held.
 	ListSecretVersionMeta(ctx context.Context, arg ListSecretVersionMetaParams) ([]ListSecretVersionMetaRow, error)
 	ListSecretsDueForDestruction(ctx context.Context, limit int32) ([]ListSecretsDueForDestructionRow, error)
+	// ListSecretsWithRotationPolicy is the background rotator's work queue: every live
+	// secret whose rotation_policy declares itself enabled, with the addressing columns
+	// the rotator needs to write a new version.
+	//
+	// WHETHER A SECRET IS *DUE* IS DECIDED IN GO, NOT HERE. Expressing "rotated_at +
+	// interval <= now()" in SQL means parsing a Go duration string inside Postgres, and
+	// an interval this query mis-parses is either a credential that silently stops
+	// rotating or one that rotates every tick. The filter that belongs in SQL is the
+	// cheap, unambiguous one (enabled, live); the arithmetic belongs next to the parser
+	// that owns the format, where it is unit-testable without a database.
+	//
+	// The select list is metadata plus addressing — no ciphertext. The rotator generates
+	// a NEW value, so it never needs to read the current one.
+	ListSecretsWithRotationPolicy(ctx context.Context, arg ListSecretsWithRotationPolicyParams) ([]ListSecretsWithRotationPolicyRow, error)
 	ListTenants(ctx context.Context, arg ListTenantsParams) ([]Tenant, error)
 	// ListVersionWrapsByKEK is the rewrap work queue: every version still wrapped
 	// under a given root key, oldest row first, in batches. It selects ONLY the
@@ -174,6 +227,11 @@ type Querier interface {
 	// makes the rewrap resumable: a crashed rotation restarts by asking the same
 	// question again, and rows already re-wrapped no longer match.
 	ListVersionWrapsByKEK(ctx context.Context, arg ListVersionWrapsByKEKParams) ([]ListVersionWrapsByKEKRow, error)
+	ListWebhookDeliveriesByEndpoint(ctx context.Context, arg ListWebhookDeliveriesByEndpointParams) ([]WebhookDelivery, error)
+	// ListWebhookEndpointMetaByProject is the API/console read. The select list omits
+	// every signing-key column: an endpoint listing must never be a way to obtain the
+	// key that authenticates deliveries to that endpoint.
+	ListWebhookEndpointMetaByProject(ctx context.Context, arg ListWebhookEndpointMetaByProjectParams) ([]ListWebhookEndpointMetaByProjectRow, error)
 	// The KEK registry. No key material passes through these queries — only the
 	// fingerprint that says which key wrapped what.
 	// MarkOtherRootKeysRetiring must run BEFORE UpsertActiveRootKey in the same
@@ -215,6 +273,7 @@ type Querier interface {
 	// the trigger additionally verifies that ciphertext, nonce, version, checksum and
 	// created_at came through untouched.
 	RewrapSecretVersion(ctx context.Context, arg RewrapSecretVersionParams) (int64, error)
+	SetScopeImportEnabled(ctx context.Context, arg SetScopeImportEnabledParams) (ScopeImport, error)
 	// SetSecretCurrentVersion publishes a newly written version.
 	//
 	// current_version only ever moves forward. mark_rotated is false for the very
@@ -225,16 +284,20 @@ type Querier interface {
 	SoftDeleteEnvironment(ctx context.Context, arg SoftDeleteEnvironmentParams) (int64, error)
 	SoftDeleteFolderSubtree(ctx context.Context, arg SoftDeleteFolderSubtreeParams) (int64, error)
 	SoftDeleteProject(ctx context.Context, arg SoftDeleteProjectParams) (int64, error)
+	SoftDeleteScopeImport(ctx context.Context, arg SoftDeleteScopeImportParams) (int64, error)
 	// SoftDeleteSecret starts the recovery window. destroy_after is when the row
 	// becomes unrecoverable; until then RestoreSecret puts it back untouched, versions
 	// and all.
 	SoftDeleteSecret(ctx context.Context, arg SoftDeleteSecretParams) (Secret, error)
 	SoftDeleteSecretsInFolderSubtree(ctx context.Context, arg SoftDeleteSecretsInFolderSubtreeParams) (int64, error)
 	SoftDeleteTenant(ctx context.Context, tenantUuid uuid.UUID) (int64, error)
+	SoftDeleteWebhookEndpoint(ctx context.Context, arg SoftDeleteWebhookEndpointParams) (int64, error)
+	TouchWebhookEndpoint(ctx context.Context, endpointID int64) (int64, error)
 	UpdateEnvironment(ctx context.Context, arg UpdateEnvironmentParams) (Environment, error)
 	UpdateProject(ctx context.Context, arg UpdateProjectParams) (Project, error)
 	UpdateSecretMeta(ctx context.Context, arg UpdateSecretMetaParams) (Secret, error)
 	UpdateTenant(ctx context.Context, arg UpdateTenantParams) (Tenant, error)
+	UpdateWebhookEndpoint(ctx context.Context, arg UpdateWebhookEndpointParams) (WebhookEndpoint, error)
 	UpsertActiveRootKey(ctx context.Context, arg UpsertActiveRootKeyParams) (RootKey, error)
 }
 

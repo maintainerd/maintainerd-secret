@@ -128,7 +128,7 @@ func TestMigrationsAreCreateOnly(t *testing.T) {
 		assert.NotContains(t, strings.ToUpper(sql), "ALTER TABLE",
 			"migration %s contains ALTER TABLE; edit the create migration in place instead", name)
 	}
-	assert.Len(t, files, 9, "the schema is nine create migrations; update this count deliberately")
+	assert.Len(t, files, 11, "the schema is eleven create migrations; update this count deliberately")
 }
 
 // TestDownSectionsDropWhatTheyCreated is a cheap symmetry check: a Down that

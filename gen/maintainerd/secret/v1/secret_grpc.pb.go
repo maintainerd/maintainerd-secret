@@ -5,8 +5,24 @@
 // source: maintainerd/secret/v1/secret.proto
 
 // SecretService is a standalone, encrypted secret store — its own product. It
-// runs alone, or Core attaches to it via Setup (registering as controller); once
-// set up, the Setup endpoint locks (the one-time setup pattern).
+// runs alone, or Core attaches to it via SetupService (registering as
+// controller); once set up, the setup surface locks (the one-time setup pattern).
+//
+// AUTHENTICATION AND SCOPE ARE CARRIED IN METADATA, not in the messages:
+//
+//   authorization: Bearer <token>      an Auth-minted token; required on every
+//                                      RPC except grpc.health.v1.Health
+//   x-maintainerd-tenant: <slug>       selects the tenant the request addresses.
+//                                      Optional; defaults to the token's tenant
+//                                      claim and then to the configured default.
+//                                      It is a SELECTOR, never an authorization —
+//                                      naming a tenant gets you an MRN in it, and
+//                                      the grant check then decides.
+//   x-setup-token: <token>             the bootstrap token, on SetupService only.
+//
+// EVERY RPC IS AUTHORIZED AGAINST THE TARGET'S MRN and every one writes an audit
+// row, including the reads. Metadata browsing (secret:ReadMetadata) and value
+// reveal (secret:GetSecret) are DIFFERENT grants.
 
 package secretv1
 
@@ -23,25 +39,129 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	SecretService_Ping_FullMethodName   = "/maintainerd.secret.v1.SecretService/Ping"
-	SecretService_Setup_FullMethodName  = "/maintainerd.secret.v1.SecretService/Setup"
-	SecretService_Put_FullMethodName    = "/maintainerd.secret.v1.SecretService/Put"
-	SecretService_Get_FullMethodName    = "/maintainerd.secret.v1.SecretService/Get"
-	SecretService_List_FullMethodName   = "/maintainerd.secret.v1.SecretService/List"
-	SecretService_Delete_FullMethodName = "/maintainerd.secret.v1.SecretService/Delete"
+	SecretService_Ping_FullMethodName                  = "/maintainerd.secret.v1.SecretService/Ping"
+	SecretService_Setup_FullMethodName                 = "/maintainerd.secret.v1.SecretService/Setup"
+	SecretService_Put_FullMethodName                   = "/maintainerd.secret.v1.SecretService/Put"
+	SecretService_Get_FullMethodName                   = "/maintainerd.secret.v1.SecretService/Get"
+	SecretService_List_FullMethodName                  = "/maintainerd.secret.v1.SecretService/List"
+	SecretService_Delete_FullMethodName                = "/maintainerd.secret.v1.SecretService/Delete"
+	SecretService_CreateProject_FullMethodName         = "/maintainerd.secret.v1.SecretService/CreateProject"
+	SecretService_ListProjects_FullMethodName          = "/maintainerd.secret.v1.SecretService/ListProjects"
+	SecretService_GetProject_FullMethodName            = "/maintainerd.secret.v1.SecretService/GetProject"
+	SecretService_UpdateProject_FullMethodName         = "/maintainerd.secret.v1.SecretService/UpdateProject"
+	SecretService_DeleteProject_FullMethodName         = "/maintainerd.secret.v1.SecretService/DeleteProject"
+	SecretService_CreateEnvironment_FullMethodName     = "/maintainerd.secret.v1.SecretService/CreateEnvironment"
+	SecretService_ListEnvironments_FullMethodName      = "/maintainerd.secret.v1.SecretService/ListEnvironments"
+	SecretService_GetEnvironment_FullMethodName        = "/maintainerd.secret.v1.SecretService/GetEnvironment"
+	SecretService_UpdateEnvironment_FullMethodName     = "/maintainerd.secret.v1.SecretService/UpdateEnvironment"
+	SecretService_DeleteEnvironment_FullMethodName     = "/maintainerd.secret.v1.SecretService/DeleteEnvironment"
+	SecretService_CreateFolder_FullMethodName          = "/maintainerd.secret.v1.SecretService/CreateFolder"
+	SecretService_ListFolders_FullMethodName           = "/maintainerd.secret.v1.SecretService/ListFolders"
+	SecretService_MoveFolder_FullMethodName            = "/maintainerd.secret.v1.SecretService/MoveFolder"
+	SecretService_DeleteFolder_FullMethodName          = "/maintainerd.secret.v1.SecretService/DeleteFolder"
+	SecretService_CreateImport_FullMethodName          = "/maintainerd.secret.v1.SecretService/CreateImport"
+	SecretService_ListImports_FullMethodName           = "/maintainerd.secret.v1.SecretService/ListImports"
+	SecretService_UpdateImport_FullMethodName          = "/maintainerd.secret.v1.SecretService/UpdateImport"
+	SecretService_DeleteImport_FullMethodName          = "/maintainerd.secret.v1.SecretService/DeleteImport"
+	SecretService_GetSecret_FullMethodName             = "/maintainerd.secret.v1.SecretService/GetSecret"
+	SecretService_DescribeSecret_FullMethodName        = "/maintainerd.secret.v1.SecretService/DescribeSecret"
+	SecretService_ListSecrets_FullMethodName           = "/maintainerd.secret.v1.SecretService/ListSecrets"
+	SecretService_PutSecret_FullMethodName             = "/maintainerd.secret.v1.SecretService/PutSecret"
+	SecretService_UpdateSecretMetadata_FullMethodName  = "/maintainerd.secret.v1.SecretService/UpdateSecretMetadata"
+	SecretService_ListSecretVersions_FullMethodName    = "/maintainerd.secret.v1.SecretService/ListSecretVersions"
+	SecretService_RollbackSecret_FullMethodName        = "/maintainerd.secret.v1.SecretService/RollbackSecret"
+	SecretService_RotateSecret_FullMethodName          = "/maintainerd.secret.v1.SecretService/RotateSecret"
+	SecretService_SetRotationPolicy_FullMethodName     = "/maintainerd.secret.v1.SecretService/SetRotationPolicy"
+	SecretService_DeleteSecret_FullMethodName          = "/maintainerd.secret.v1.SecretService/DeleteSecret"
+	SecretService_ListDeletedSecrets_FullMethodName    = "/maintainerd.secret.v1.SecretService/ListDeletedSecrets"
+	SecretService_RestoreSecret_FullMethodName         = "/maintainerd.secret.v1.SecretService/RestoreSecret"
+	SecretService_DestroySecret_FullMethodName         = "/maintainerd.secret.v1.SecretService/DestroySecret"
+	SecretService_BatchGetSecrets_FullMethodName       = "/maintainerd.secret.v1.SecretService/BatchGetSecrets"
+	SecretService_BatchPutSecrets_FullMethodName       = "/maintainerd.secret.v1.SecretService/BatchPutSecrets"
+	SecretService_CreateWebhookEndpoint_FullMethodName = "/maintainerd.secret.v1.SecretService/CreateWebhookEndpoint"
+	SecretService_ListWebhookEndpoints_FullMethodName  = "/maintainerd.secret.v1.SecretService/ListWebhookEndpoints"
+	SecretService_UpdateWebhookEndpoint_FullMethodName = "/maintainerd.secret.v1.SecretService/UpdateWebhookEndpoint"
+	SecretService_DeleteWebhookEndpoint_FullMethodName = "/maintainerd.secret.v1.SecretService/DeleteWebhookEndpoint"
+	SecretService_ListWebhookDeliveries_FullMethodName = "/maintainerd.secret.v1.SecretService/ListWebhookDeliveries"
+	SecretService_ListAuditEvents_FullMethodName       = "/maintainerd.secret.v1.SecretService/ListAuditEvents"
 )
 
 // SecretServiceClient is the client API for SecretService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// SecretService is the full hierarchy + secrets surface.
 type SecretServiceClient interface {
 	Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error)
-	// Setup registers a controller (Core) one time; it locks afterward.
+	// ---- Legacy flat-key surface ------------------------------------------
+	// These five are the kit secret-provider client's contract (see
+	// maintainerd-kit secret/ and maintainerd-sdk secret/). They are KEPT, and
+	// they are now thin wrappers over the hierarchical operations below: a flat
+	// key maps onto the default scope's hierarchy (store.FlatRef), so a secret
+	// written through Put is an ordinary secret — versioned, audited, and
+	// addressable by the hierarchical RPCs. Do not remove them; consumers depend
+	// on them.
 	Setup(ctx context.Context, in *SetupRequest, opts ...grpc.CallOption) (*SetupResponse, error)
 	Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*PutResponse, error)
 	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error)
 	List(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (*ListResponse, error)
 	Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error)
+	// ---- Projects ----------------------------------------------------------
+	CreateProject(ctx context.Context, in *CreateProjectRequest, opts ...grpc.CallOption) (*CreateProjectResponse, error)
+	ListProjects(ctx context.Context, in *ListProjectsRequest, opts ...grpc.CallOption) (*ListProjectsResponse, error)
+	GetProject(ctx context.Context, in *GetProjectRequest, opts ...grpc.CallOption) (*GetProjectResponse, error)
+	UpdateProject(ctx context.Context, in *UpdateProjectRequest, opts ...grpc.CallOption) (*UpdateProjectResponse, error)
+	DeleteProject(ctx context.Context, in *DeleteProjectRequest, opts ...grpc.CallOption) (*DeleteProjectResponse, error)
+	// ---- Environments ------------------------------------------------------
+	CreateEnvironment(ctx context.Context, in *CreateEnvironmentRequest, opts ...grpc.CallOption) (*CreateEnvironmentResponse, error)
+	ListEnvironments(ctx context.Context, in *ListEnvironmentsRequest, opts ...grpc.CallOption) (*ListEnvironmentsResponse, error)
+	GetEnvironment(ctx context.Context, in *GetEnvironmentRequest, opts ...grpc.CallOption) (*GetEnvironmentResponse, error)
+	UpdateEnvironment(ctx context.Context, in *UpdateEnvironmentRequest, opts ...grpc.CallOption) (*UpdateEnvironmentResponse, error)
+	DeleteEnvironment(ctx context.Context, in *DeleteEnvironmentRequest, opts ...grpc.CallOption) (*DeleteEnvironmentResponse, error)
+	// ---- Folders -----------------------------------------------------------
+	CreateFolder(ctx context.Context, in *CreateFolderRequest, opts ...grpc.CallOption) (*CreateFolderResponse, error)
+	ListFolders(ctx context.Context, in *ListFoldersRequest, opts ...grpc.CallOption) (*ListFoldersResponse, error)
+	// MoveFolder recomputes the materialized paths of the whole subtree AND the
+	// MRNs derived from them, in one transaction.
+	MoveFolder(ctx context.Context, in *MoveFolderRequest, opts ...grpc.CallOption) (*MoveFolderResponse, error)
+	DeleteFolder(ctx context.Context, in *DeleteFolderRequest, opts ...grpc.CallOption) (*DeleteFolderResponse, error)
+	// ---- Scope imports -----------------------------------------------------
+	CreateImport(ctx context.Context, in *CreateImportRequest, opts ...grpc.CallOption) (*CreateImportResponse, error)
+	ListImports(ctx context.Context, in *ListImportsRequest, opts ...grpc.CallOption) (*ListImportsResponse, error)
+	UpdateImport(ctx context.Context, in *UpdateImportRequest, opts ...grpc.CallOption) (*UpdateImportResponse, error)
+	DeleteImport(ctx context.Context, in *DeleteImportRequest, opts ...grpc.CallOption) (*DeleteImportResponse, error)
+	// ---- Secrets -----------------------------------------------------------
+	// GetSecret is the REVEAL: it returns a decrypted value and requires
+	// secret:GetSecret, a distinct grant from secret:ReadMetadata.
+	GetSecret(ctx context.Context, in *GetSecretRequest, opts ...grpc.CallOption) (*GetSecretResponse, error)
+	// DescribeSecret returns metadata only and never a value.
+	DescribeSecret(ctx context.Context, in *DescribeSecretRequest, opts ...grpc.CallOption) (*DescribeSecretResponse, error)
+	// ListSecrets returns metadata only, scoped to a path prefix.
+	ListSecrets(ctx context.Context, in *ListSecretsRequest, opts ...grpc.CallOption) (*ListSecretsResponse, error)
+	PutSecret(ctx context.Context, in *PutSecretRequest, opts ...grpc.CallOption) (*PutSecretResponse, error)
+	UpdateSecretMetadata(ctx context.Context, in *UpdateSecretMetadataRequest, opts ...grpc.CallOption) (*UpdateSecretMetadataResponse, error)
+	ListSecretVersions(ctx context.Context, in *ListSecretVersionsRequest, opts ...grpc.CallOption) (*ListSecretVersionsResponse, error)
+	// RollbackSecret writes a NEW version carrying an older version's value.
+	// History is never mutated.
+	RollbackSecret(ctx context.Context, in *RollbackSecretRequest, opts ...grpc.CallOption) (*RollbackSecretResponse, error)
+	RotateSecret(ctx context.Context, in *RotateSecretRequest, opts ...grpc.CallOption) (*RotateSecretResponse, error)
+	SetRotationPolicy(ctx context.Context, in *SetRotationPolicyRequest, opts ...grpc.CallOption) (*SetRotationPolicyResponse, error)
+	DeleteSecret(ctx context.Context, in *DeleteSecretRequest, opts ...grpc.CallOption) (*DeleteSecretResponse, error)
+	ListDeletedSecrets(ctx context.Context, in *ListDeletedSecretsRequest, opts ...grpc.CallOption) (*ListDeletedSecretsResponse, error)
+	RestoreSecret(ctx context.Context, in *RestoreSecretRequest, opts ...grpc.CallOption) (*RestoreSecretResponse, error)
+	DestroySecret(ctx context.Context, in *DestroySecretRequest, opts ...grpc.CallOption) (*DestroySecretResponse, error)
+	// ---- Bulk --------------------------------------------------------------
+	// Both are per-item authorized and per-item audited: a batch is a transport
+	// optimisation, never a permission one.
+	BatchGetSecrets(ctx context.Context, in *BatchGetSecretsRequest, opts ...grpc.CallOption) (*BatchGetSecretsResponse, error)
+	BatchPutSecrets(ctx context.Context, in *BatchPutSecretsRequest, opts ...grpc.CallOption) (*BatchPutSecretsResponse, error)
+	// ---- Webhooks + audit --------------------------------------------------
+	CreateWebhookEndpoint(ctx context.Context, in *CreateWebhookEndpointRequest, opts ...grpc.CallOption) (*CreateWebhookEndpointResponse, error)
+	ListWebhookEndpoints(ctx context.Context, in *ListWebhookEndpointsRequest, opts ...grpc.CallOption) (*ListWebhookEndpointsResponse, error)
+	UpdateWebhookEndpoint(ctx context.Context, in *UpdateWebhookEndpointRequest, opts ...grpc.CallOption) (*UpdateWebhookEndpointResponse, error)
+	DeleteWebhookEndpoint(ctx context.Context, in *DeleteWebhookEndpointRequest, opts ...grpc.CallOption) (*DeleteWebhookEndpointResponse, error)
+	ListWebhookDeliveries(ctx context.Context, in *ListWebhookDeliveriesRequest, opts ...grpc.CallOption) (*ListWebhookDeliveriesResponse, error)
+	ListAuditEvents(ctx context.Context, in *ListAuditEventsRequest, opts ...grpc.CallOption) (*ListAuditEventsResponse, error)
 }
 
 type secretServiceClient struct {
@@ -112,17 +232,472 @@ func (c *secretServiceClient) Delete(ctx context.Context, in *DeleteRequest, opt
 	return out, nil
 }
 
+func (c *secretServiceClient) CreateProject(ctx context.Context, in *CreateProjectRequest, opts ...grpc.CallOption) (*CreateProjectResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CreateProjectResponse)
+	err := c.cc.Invoke(ctx, SecretService_CreateProject_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) ListProjects(ctx context.Context, in *ListProjectsRequest, opts ...grpc.CallOption) (*ListProjectsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListProjectsResponse)
+	err := c.cc.Invoke(ctx, SecretService_ListProjects_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) GetProject(ctx context.Context, in *GetProjectRequest, opts ...grpc.CallOption) (*GetProjectResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetProjectResponse)
+	err := c.cc.Invoke(ctx, SecretService_GetProject_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) UpdateProject(ctx context.Context, in *UpdateProjectRequest, opts ...grpc.CallOption) (*UpdateProjectResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpdateProjectResponse)
+	err := c.cc.Invoke(ctx, SecretService_UpdateProject_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) DeleteProject(ctx context.Context, in *DeleteProjectRequest, opts ...grpc.CallOption) (*DeleteProjectResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteProjectResponse)
+	err := c.cc.Invoke(ctx, SecretService_DeleteProject_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) CreateEnvironment(ctx context.Context, in *CreateEnvironmentRequest, opts ...grpc.CallOption) (*CreateEnvironmentResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CreateEnvironmentResponse)
+	err := c.cc.Invoke(ctx, SecretService_CreateEnvironment_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) ListEnvironments(ctx context.Context, in *ListEnvironmentsRequest, opts ...grpc.CallOption) (*ListEnvironmentsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListEnvironmentsResponse)
+	err := c.cc.Invoke(ctx, SecretService_ListEnvironments_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) GetEnvironment(ctx context.Context, in *GetEnvironmentRequest, opts ...grpc.CallOption) (*GetEnvironmentResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetEnvironmentResponse)
+	err := c.cc.Invoke(ctx, SecretService_GetEnvironment_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) UpdateEnvironment(ctx context.Context, in *UpdateEnvironmentRequest, opts ...grpc.CallOption) (*UpdateEnvironmentResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpdateEnvironmentResponse)
+	err := c.cc.Invoke(ctx, SecretService_UpdateEnvironment_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) DeleteEnvironment(ctx context.Context, in *DeleteEnvironmentRequest, opts ...grpc.CallOption) (*DeleteEnvironmentResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteEnvironmentResponse)
+	err := c.cc.Invoke(ctx, SecretService_DeleteEnvironment_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) CreateFolder(ctx context.Context, in *CreateFolderRequest, opts ...grpc.CallOption) (*CreateFolderResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CreateFolderResponse)
+	err := c.cc.Invoke(ctx, SecretService_CreateFolder_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) ListFolders(ctx context.Context, in *ListFoldersRequest, opts ...grpc.CallOption) (*ListFoldersResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListFoldersResponse)
+	err := c.cc.Invoke(ctx, SecretService_ListFolders_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) MoveFolder(ctx context.Context, in *MoveFolderRequest, opts ...grpc.CallOption) (*MoveFolderResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MoveFolderResponse)
+	err := c.cc.Invoke(ctx, SecretService_MoveFolder_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) DeleteFolder(ctx context.Context, in *DeleteFolderRequest, opts ...grpc.CallOption) (*DeleteFolderResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteFolderResponse)
+	err := c.cc.Invoke(ctx, SecretService_DeleteFolder_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) CreateImport(ctx context.Context, in *CreateImportRequest, opts ...grpc.CallOption) (*CreateImportResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CreateImportResponse)
+	err := c.cc.Invoke(ctx, SecretService_CreateImport_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) ListImports(ctx context.Context, in *ListImportsRequest, opts ...grpc.CallOption) (*ListImportsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListImportsResponse)
+	err := c.cc.Invoke(ctx, SecretService_ListImports_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) UpdateImport(ctx context.Context, in *UpdateImportRequest, opts ...grpc.CallOption) (*UpdateImportResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpdateImportResponse)
+	err := c.cc.Invoke(ctx, SecretService_UpdateImport_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) DeleteImport(ctx context.Context, in *DeleteImportRequest, opts ...grpc.CallOption) (*DeleteImportResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteImportResponse)
+	err := c.cc.Invoke(ctx, SecretService_DeleteImport_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) GetSecret(ctx context.Context, in *GetSecretRequest, opts ...grpc.CallOption) (*GetSecretResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetSecretResponse)
+	err := c.cc.Invoke(ctx, SecretService_GetSecret_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) DescribeSecret(ctx context.Context, in *DescribeSecretRequest, opts ...grpc.CallOption) (*DescribeSecretResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DescribeSecretResponse)
+	err := c.cc.Invoke(ctx, SecretService_DescribeSecret_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) ListSecrets(ctx context.Context, in *ListSecretsRequest, opts ...grpc.CallOption) (*ListSecretsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListSecretsResponse)
+	err := c.cc.Invoke(ctx, SecretService_ListSecrets_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) PutSecret(ctx context.Context, in *PutSecretRequest, opts ...grpc.CallOption) (*PutSecretResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PutSecretResponse)
+	err := c.cc.Invoke(ctx, SecretService_PutSecret_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) UpdateSecretMetadata(ctx context.Context, in *UpdateSecretMetadataRequest, opts ...grpc.CallOption) (*UpdateSecretMetadataResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpdateSecretMetadataResponse)
+	err := c.cc.Invoke(ctx, SecretService_UpdateSecretMetadata_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) ListSecretVersions(ctx context.Context, in *ListSecretVersionsRequest, opts ...grpc.CallOption) (*ListSecretVersionsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListSecretVersionsResponse)
+	err := c.cc.Invoke(ctx, SecretService_ListSecretVersions_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) RollbackSecret(ctx context.Context, in *RollbackSecretRequest, opts ...grpc.CallOption) (*RollbackSecretResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RollbackSecretResponse)
+	err := c.cc.Invoke(ctx, SecretService_RollbackSecret_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) RotateSecret(ctx context.Context, in *RotateSecretRequest, opts ...grpc.CallOption) (*RotateSecretResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RotateSecretResponse)
+	err := c.cc.Invoke(ctx, SecretService_RotateSecret_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) SetRotationPolicy(ctx context.Context, in *SetRotationPolicyRequest, opts ...grpc.CallOption) (*SetRotationPolicyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetRotationPolicyResponse)
+	err := c.cc.Invoke(ctx, SecretService_SetRotationPolicy_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) DeleteSecret(ctx context.Context, in *DeleteSecretRequest, opts ...grpc.CallOption) (*DeleteSecretResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteSecretResponse)
+	err := c.cc.Invoke(ctx, SecretService_DeleteSecret_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) ListDeletedSecrets(ctx context.Context, in *ListDeletedSecretsRequest, opts ...grpc.CallOption) (*ListDeletedSecretsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListDeletedSecretsResponse)
+	err := c.cc.Invoke(ctx, SecretService_ListDeletedSecrets_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) RestoreSecret(ctx context.Context, in *RestoreSecretRequest, opts ...grpc.CallOption) (*RestoreSecretResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RestoreSecretResponse)
+	err := c.cc.Invoke(ctx, SecretService_RestoreSecret_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) DestroySecret(ctx context.Context, in *DestroySecretRequest, opts ...grpc.CallOption) (*DestroySecretResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DestroySecretResponse)
+	err := c.cc.Invoke(ctx, SecretService_DestroySecret_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) BatchGetSecrets(ctx context.Context, in *BatchGetSecretsRequest, opts ...grpc.CallOption) (*BatchGetSecretsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BatchGetSecretsResponse)
+	err := c.cc.Invoke(ctx, SecretService_BatchGetSecrets_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) BatchPutSecrets(ctx context.Context, in *BatchPutSecretsRequest, opts ...grpc.CallOption) (*BatchPutSecretsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BatchPutSecretsResponse)
+	err := c.cc.Invoke(ctx, SecretService_BatchPutSecrets_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) CreateWebhookEndpoint(ctx context.Context, in *CreateWebhookEndpointRequest, opts ...grpc.CallOption) (*CreateWebhookEndpointResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CreateWebhookEndpointResponse)
+	err := c.cc.Invoke(ctx, SecretService_CreateWebhookEndpoint_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) ListWebhookEndpoints(ctx context.Context, in *ListWebhookEndpointsRequest, opts ...grpc.CallOption) (*ListWebhookEndpointsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListWebhookEndpointsResponse)
+	err := c.cc.Invoke(ctx, SecretService_ListWebhookEndpoints_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) UpdateWebhookEndpoint(ctx context.Context, in *UpdateWebhookEndpointRequest, opts ...grpc.CallOption) (*UpdateWebhookEndpointResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpdateWebhookEndpointResponse)
+	err := c.cc.Invoke(ctx, SecretService_UpdateWebhookEndpoint_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) DeleteWebhookEndpoint(ctx context.Context, in *DeleteWebhookEndpointRequest, opts ...grpc.CallOption) (*DeleteWebhookEndpointResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteWebhookEndpointResponse)
+	err := c.cc.Invoke(ctx, SecretService_DeleteWebhookEndpoint_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) ListWebhookDeliveries(ctx context.Context, in *ListWebhookDeliveriesRequest, opts ...grpc.CallOption) (*ListWebhookDeliveriesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListWebhookDeliveriesResponse)
+	err := c.cc.Invoke(ctx, SecretService_ListWebhookDeliveries_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *secretServiceClient) ListAuditEvents(ctx context.Context, in *ListAuditEventsRequest, opts ...grpc.CallOption) (*ListAuditEventsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListAuditEventsResponse)
+	err := c.cc.Invoke(ctx, SecretService_ListAuditEvents_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // SecretServiceServer is the server API for SecretService service.
 // All implementations must embed UnimplementedSecretServiceServer
 // for forward compatibility.
+//
+// SecretService is the full hierarchy + secrets surface.
 type SecretServiceServer interface {
 	Ping(context.Context, *PingRequest) (*PingResponse, error)
-	// Setup registers a controller (Core) one time; it locks afterward.
+	// ---- Legacy flat-key surface ------------------------------------------
+	// These five are the kit secret-provider client's contract (see
+	// maintainerd-kit secret/ and maintainerd-sdk secret/). They are KEPT, and
+	// they are now thin wrappers over the hierarchical operations below: a flat
+	// key maps onto the default scope's hierarchy (store.FlatRef), so a secret
+	// written through Put is an ordinary secret — versioned, audited, and
+	// addressable by the hierarchical RPCs. Do not remove them; consumers depend
+	// on them.
 	Setup(context.Context, *SetupRequest) (*SetupResponse, error)
 	Put(context.Context, *PutRequest) (*PutResponse, error)
 	Get(context.Context, *GetRequest) (*GetResponse, error)
 	List(context.Context, *ListRequest) (*ListResponse, error)
 	Delete(context.Context, *DeleteRequest) (*DeleteResponse, error)
+	// ---- Projects ----------------------------------------------------------
+	CreateProject(context.Context, *CreateProjectRequest) (*CreateProjectResponse, error)
+	ListProjects(context.Context, *ListProjectsRequest) (*ListProjectsResponse, error)
+	GetProject(context.Context, *GetProjectRequest) (*GetProjectResponse, error)
+	UpdateProject(context.Context, *UpdateProjectRequest) (*UpdateProjectResponse, error)
+	DeleteProject(context.Context, *DeleteProjectRequest) (*DeleteProjectResponse, error)
+	// ---- Environments ------------------------------------------------------
+	CreateEnvironment(context.Context, *CreateEnvironmentRequest) (*CreateEnvironmentResponse, error)
+	ListEnvironments(context.Context, *ListEnvironmentsRequest) (*ListEnvironmentsResponse, error)
+	GetEnvironment(context.Context, *GetEnvironmentRequest) (*GetEnvironmentResponse, error)
+	UpdateEnvironment(context.Context, *UpdateEnvironmentRequest) (*UpdateEnvironmentResponse, error)
+	DeleteEnvironment(context.Context, *DeleteEnvironmentRequest) (*DeleteEnvironmentResponse, error)
+	// ---- Folders -----------------------------------------------------------
+	CreateFolder(context.Context, *CreateFolderRequest) (*CreateFolderResponse, error)
+	ListFolders(context.Context, *ListFoldersRequest) (*ListFoldersResponse, error)
+	// MoveFolder recomputes the materialized paths of the whole subtree AND the
+	// MRNs derived from them, in one transaction.
+	MoveFolder(context.Context, *MoveFolderRequest) (*MoveFolderResponse, error)
+	DeleteFolder(context.Context, *DeleteFolderRequest) (*DeleteFolderResponse, error)
+	// ---- Scope imports -----------------------------------------------------
+	CreateImport(context.Context, *CreateImportRequest) (*CreateImportResponse, error)
+	ListImports(context.Context, *ListImportsRequest) (*ListImportsResponse, error)
+	UpdateImport(context.Context, *UpdateImportRequest) (*UpdateImportResponse, error)
+	DeleteImport(context.Context, *DeleteImportRequest) (*DeleteImportResponse, error)
+	// ---- Secrets -----------------------------------------------------------
+	// GetSecret is the REVEAL: it returns a decrypted value and requires
+	// secret:GetSecret, a distinct grant from secret:ReadMetadata.
+	GetSecret(context.Context, *GetSecretRequest) (*GetSecretResponse, error)
+	// DescribeSecret returns metadata only and never a value.
+	DescribeSecret(context.Context, *DescribeSecretRequest) (*DescribeSecretResponse, error)
+	// ListSecrets returns metadata only, scoped to a path prefix.
+	ListSecrets(context.Context, *ListSecretsRequest) (*ListSecretsResponse, error)
+	PutSecret(context.Context, *PutSecretRequest) (*PutSecretResponse, error)
+	UpdateSecretMetadata(context.Context, *UpdateSecretMetadataRequest) (*UpdateSecretMetadataResponse, error)
+	ListSecretVersions(context.Context, *ListSecretVersionsRequest) (*ListSecretVersionsResponse, error)
+	// RollbackSecret writes a NEW version carrying an older version's value.
+	// History is never mutated.
+	RollbackSecret(context.Context, *RollbackSecretRequest) (*RollbackSecretResponse, error)
+	RotateSecret(context.Context, *RotateSecretRequest) (*RotateSecretResponse, error)
+	SetRotationPolicy(context.Context, *SetRotationPolicyRequest) (*SetRotationPolicyResponse, error)
+	DeleteSecret(context.Context, *DeleteSecretRequest) (*DeleteSecretResponse, error)
+	ListDeletedSecrets(context.Context, *ListDeletedSecretsRequest) (*ListDeletedSecretsResponse, error)
+	RestoreSecret(context.Context, *RestoreSecretRequest) (*RestoreSecretResponse, error)
+	DestroySecret(context.Context, *DestroySecretRequest) (*DestroySecretResponse, error)
+	// ---- Bulk --------------------------------------------------------------
+	// Both are per-item authorized and per-item audited: a batch is a transport
+	// optimisation, never a permission one.
+	BatchGetSecrets(context.Context, *BatchGetSecretsRequest) (*BatchGetSecretsResponse, error)
+	BatchPutSecrets(context.Context, *BatchPutSecretsRequest) (*BatchPutSecretsResponse, error)
+	// ---- Webhooks + audit --------------------------------------------------
+	CreateWebhookEndpoint(context.Context, *CreateWebhookEndpointRequest) (*CreateWebhookEndpointResponse, error)
+	ListWebhookEndpoints(context.Context, *ListWebhookEndpointsRequest) (*ListWebhookEndpointsResponse, error)
+	UpdateWebhookEndpoint(context.Context, *UpdateWebhookEndpointRequest) (*UpdateWebhookEndpointResponse, error)
+	DeleteWebhookEndpoint(context.Context, *DeleteWebhookEndpointRequest) (*DeleteWebhookEndpointResponse, error)
+	ListWebhookDeliveries(context.Context, *ListWebhookDeliveriesRequest) (*ListWebhookDeliveriesResponse, error)
+	ListAuditEvents(context.Context, *ListAuditEventsRequest) (*ListAuditEventsResponse, error)
 	mustEmbedUnimplementedSecretServiceServer()
 }
 
@@ -150,6 +725,123 @@ func (UnimplementedSecretServiceServer) List(context.Context, *ListRequest) (*Li
 }
 func (UnimplementedSecretServiceServer) Delete(context.Context, *DeleteRequest) (*DeleteResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Delete not implemented")
+}
+func (UnimplementedSecretServiceServer) CreateProject(context.Context, *CreateProjectRequest) (*CreateProjectResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateProject not implemented")
+}
+func (UnimplementedSecretServiceServer) ListProjects(context.Context, *ListProjectsRequest) (*ListProjectsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListProjects not implemented")
+}
+func (UnimplementedSecretServiceServer) GetProject(context.Context, *GetProjectRequest) (*GetProjectResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetProject not implemented")
+}
+func (UnimplementedSecretServiceServer) UpdateProject(context.Context, *UpdateProjectRequest) (*UpdateProjectResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdateProject not implemented")
+}
+func (UnimplementedSecretServiceServer) DeleteProject(context.Context, *DeleteProjectRequest) (*DeleteProjectResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteProject not implemented")
+}
+func (UnimplementedSecretServiceServer) CreateEnvironment(context.Context, *CreateEnvironmentRequest) (*CreateEnvironmentResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateEnvironment not implemented")
+}
+func (UnimplementedSecretServiceServer) ListEnvironments(context.Context, *ListEnvironmentsRequest) (*ListEnvironmentsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListEnvironments not implemented")
+}
+func (UnimplementedSecretServiceServer) GetEnvironment(context.Context, *GetEnvironmentRequest) (*GetEnvironmentResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetEnvironment not implemented")
+}
+func (UnimplementedSecretServiceServer) UpdateEnvironment(context.Context, *UpdateEnvironmentRequest) (*UpdateEnvironmentResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdateEnvironment not implemented")
+}
+func (UnimplementedSecretServiceServer) DeleteEnvironment(context.Context, *DeleteEnvironmentRequest) (*DeleteEnvironmentResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteEnvironment not implemented")
+}
+func (UnimplementedSecretServiceServer) CreateFolder(context.Context, *CreateFolderRequest) (*CreateFolderResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateFolder not implemented")
+}
+func (UnimplementedSecretServiceServer) ListFolders(context.Context, *ListFoldersRequest) (*ListFoldersResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListFolders not implemented")
+}
+func (UnimplementedSecretServiceServer) MoveFolder(context.Context, *MoveFolderRequest) (*MoveFolderResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method MoveFolder not implemented")
+}
+func (UnimplementedSecretServiceServer) DeleteFolder(context.Context, *DeleteFolderRequest) (*DeleteFolderResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteFolder not implemented")
+}
+func (UnimplementedSecretServiceServer) CreateImport(context.Context, *CreateImportRequest) (*CreateImportResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateImport not implemented")
+}
+func (UnimplementedSecretServiceServer) ListImports(context.Context, *ListImportsRequest) (*ListImportsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListImports not implemented")
+}
+func (UnimplementedSecretServiceServer) UpdateImport(context.Context, *UpdateImportRequest) (*UpdateImportResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdateImport not implemented")
+}
+func (UnimplementedSecretServiceServer) DeleteImport(context.Context, *DeleteImportRequest) (*DeleteImportResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteImport not implemented")
+}
+func (UnimplementedSecretServiceServer) GetSecret(context.Context, *GetSecretRequest) (*GetSecretResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSecret not implemented")
+}
+func (UnimplementedSecretServiceServer) DescribeSecret(context.Context, *DescribeSecretRequest) (*DescribeSecretResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DescribeSecret not implemented")
+}
+func (UnimplementedSecretServiceServer) ListSecrets(context.Context, *ListSecretsRequest) (*ListSecretsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListSecrets not implemented")
+}
+func (UnimplementedSecretServiceServer) PutSecret(context.Context, *PutSecretRequest) (*PutSecretResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PutSecret not implemented")
+}
+func (UnimplementedSecretServiceServer) UpdateSecretMetadata(context.Context, *UpdateSecretMetadataRequest) (*UpdateSecretMetadataResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdateSecretMetadata not implemented")
+}
+func (UnimplementedSecretServiceServer) ListSecretVersions(context.Context, *ListSecretVersionsRequest) (*ListSecretVersionsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListSecretVersions not implemented")
+}
+func (UnimplementedSecretServiceServer) RollbackSecret(context.Context, *RollbackSecretRequest) (*RollbackSecretResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RollbackSecret not implemented")
+}
+func (UnimplementedSecretServiceServer) RotateSecret(context.Context, *RotateSecretRequest) (*RotateSecretResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RotateSecret not implemented")
+}
+func (UnimplementedSecretServiceServer) SetRotationPolicy(context.Context, *SetRotationPolicyRequest) (*SetRotationPolicyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetRotationPolicy not implemented")
+}
+func (UnimplementedSecretServiceServer) DeleteSecret(context.Context, *DeleteSecretRequest) (*DeleteSecretResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteSecret not implemented")
+}
+func (UnimplementedSecretServiceServer) ListDeletedSecrets(context.Context, *ListDeletedSecretsRequest) (*ListDeletedSecretsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListDeletedSecrets not implemented")
+}
+func (UnimplementedSecretServiceServer) RestoreSecret(context.Context, *RestoreSecretRequest) (*RestoreSecretResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RestoreSecret not implemented")
+}
+func (UnimplementedSecretServiceServer) DestroySecret(context.Context, *DestroySecretRequest) (*DestroySecretResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DestroySecret not implemented")
+}
+func (UnimplementedSecretServiceServer) BatchGetSecrets(context.Context, *BatchGetSecretsRequest) (*BatchGetSecretsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method BatchGetSecrets not implemented")
+}
+func (UnimplementedSecretServiceServer) BatchPutSecrets(context.Context, *BatchPutSecretsRequest) (*BatchPutSecretsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method BatchPutSecrets not implemented")
+}
+func (UnimplementedSecretServiceServer) CreateWebhookEndpoint(context.Context, *CreateWebhookEndpointRequest) (*CreateWebhookEndpointResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateWebhookEndpoint not implemented")
+}
+func (UnimplementedSecretServiceServer) ListWebhookEndpoints(context.Context, *ListWebhookEndpointsRequest) (*ListWebhookEndpointsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListWebhookEndpoints not implemented")
+}
+func (UnimplementedSecretServiceServer) UpdateWebhookEndpoint(context.Context, *UpdateWebhookEndpointRequest) (*UpdateWebhookEndpointResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdateWebhookEndpoint not implemented")
+}
+func (UnimplementedSecretServiceServer) DeleteWebhookEndpoint(context.Context, *DeleteWebhookEndpointRequest) (*DeleteWebhookEndpointResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteWebhookEndpoint not implemented")
+}
+func (UnimplementedSecretServiceServer) ListWebhookDeliveries(context.Context, *ListWebhookDeliveriesRequest) (*ListWebhookDeliveriesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListWebhookDeliveries not implemented")
+}
+func (UnimplementedSecretServiceServer) ListAuditEvents(context.Context, *ListAuditEventsRequest) (*ListAuditEventsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListAuditEvents not implemented")
 }
 func (UnimplementedSecretServiceServer) mustEmbedUnimplementedSecretServiceServer() {}
 func (UnimplementedSecretServiceServer) testEmbeddedByValue()                       {}
@@ -280,6 +972,708 @@ func _SecretService_Delete_Handler(srv interface{}, ctx context.Context, dec fun
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SecretService_CreateProject_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateProjectRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).CreateProject(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_CreateProject_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).CreateProject(ctx, req.(*CreateProjectRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_ListProjects_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListProjectsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).ListProjects(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_ListProjects_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).ListProjects(ctx, req.(*ListProjectsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_GetProject_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetProjectRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).GetProject(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_GetProject_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).GetProject(ctx, req.(*GetProjectRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_UpdateProject_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateProjectRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).UpdateProject(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_UpdateProject_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).UpdateProject(ctx, req.(*UpdateProjectRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_DeleteProject_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteProjectRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).DeleteProject(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_DeleteProject_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).DeleteProject(ctx, req.(*DeleteProjectRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_CreateEnvironment_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateEnvironmentRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).CreateEnvironment(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_CreateEnvironment_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).CreateEnvironment(ctx, req.(*CreateEnvironmentRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_ListEnvironments_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListEnvironmentsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).ListEnvironments(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_ListEnvironments_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).ListEnvironments(ctx, req.(*ListEnvironmentsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_GetEnvironment_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetEnvironmentRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).GetEnvironment(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_GetEnvironment_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).GetEnvironment(ctx, req.(*GetEnvironmentRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_UpdateEnvironment_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateEnvironmentRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).UpdateEnvironment(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_UpdateEnvironment_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).UpdateEnvironment(ctx, req.(*UpdateEnvironmentRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_DeleteEnvironment_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteEnvironmentRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).DeleteEnvironment(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_DeleteEnvironment_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).DeleteEnvironment(ctx, req.(*DeleteEnvironmentRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_CreateFolder_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateFolderRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).CreateFolder(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_CreateFolder_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).CreateFolder(ctx, req.(*CreateFolderRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_ListFolders_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListFoldersRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).ListFolders(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_ListFolders_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).ListFolders(ctx, req.(*ListFoldersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_MoveFolder_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MoveFolderRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).MoveFolder(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_MoveFolder_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).MoveFolder(ctx, req.(*MoveFolderRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_DeleteFolder_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteFolderRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).DeleteFolder(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_DeleteFolder_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).DeleteFolder(ctx, req.(*DeleteFolderRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_CreateImport_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateImportRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).CreateImport(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_CreateImport_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).CreateImport(ctx, req.(*CreateImportRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_ListImports_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListImportsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).ListImports(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_ListImports_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).ListImports(ctx, req.(*ListImportsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_UpdateImport_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateImportRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).UpdateImport(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_UpdateImport_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).UpdateImport(ctx, req.(*UpdateImportRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_DeleteImport_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteImportRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).DeleteImport(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_DeleteImport_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).DeleteImport(ctx, req.(*DeleteImportRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_GetSecret_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSecretRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).GetSecret(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_GetSecret_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).GetSecret(ctx, req.(*GetSecretRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_DescribeSecret_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DescribeSecretRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).DescribeSecret(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_DescribeSecret_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).DescribeSecret(ctx, req.(*DescribeSecretRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_ListSecrets_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListSecretsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).ListSecrets(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_ListSecrets_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).ListSecrets(ctx, req.(*ListSecretsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_PutSecret_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PutSecretRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).PutSecret(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_PutSecret_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).PutSecret(ctx, req.(*PutSecretRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_UpdateSecretMetadata_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateSecretMetadataRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).UpdateSecretMetadata(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_UpdateSecretMetadata_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).UpdateSecretMetadata(ctx, req.(*UpdateSecretMetadataRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_ListSecretVersions_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListSecretVersionsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).ListSecretVersions(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_ListSecretVersions_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).ListSecretVersions(ctx, req.(*ListSecretVersionsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_RollbackSecret_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RollbackSecretRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).RollbackSecret(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_RollbackSecret_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).RollbackSecret(ctx, req.(*RollbackSecretRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_RotateSecret_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RotateSecretRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).RotateSecret(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_RotateSecret_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).RotateSecret(ctx, req.(*RotateSecretRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_SetRotationPolicy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetRotationPolicyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).SetRotationPolicy(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_SetRotationPolicy_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).SetRotationPolicy(ctx, req.(*SetRotationPolicyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_DeleteSecret_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteSecretRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).DeleteSecret(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_DeleteSecret_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).DeleteSecret(ctx, req.(*DeleteSecretRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_ListDeletedSecrets_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListDeletedSecretsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).ListDeletedSecrets(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_ListDeletedSecrets_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).ListDeletedSecrets(ctx, req.(*ListDeletedSecretsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_RestoreSecret_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RestoreSecretRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).RestoreSecret(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_RestoreSecret_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).RestoreSecret(ctx, req.(*RestoreSecretRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_DestroySecret_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DestroySecretRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).DestroySecret(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_DestroySecret_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).DestroySecret(ctx, req.(*DestroySecretRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_BatchGetSecrets_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BatchGetSecretsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).BatchGetSecrets(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_BatchGetSecrets_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).BatchGetSecrets(ctx, req.(*BatchGetSecretsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_BatchPutSecrets_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BatchPutSecretsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).BatchPutSecrets(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_BatchPutSecrets_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).BatchPutSecrets(ctx, req.(*BatchPutSecretsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_CreateWebhookEndpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateWebhookEndpointRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).CreateWebhookEndpoint(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_CreateWebhookEndpoint_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).CreateWebhookEndpoint(ctx, req.(*CreateWebhookEndpointRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_ListWebhookEndpoints_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListWebhookEndpointsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).ListWebhookEndpoints(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_ListWebhookEndpoints_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).ListWebhookEndpoints(ctx, req.(*ListWebhookEndpointsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_UpdateWebhookEndpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateWebhookEndpointRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).UpdateWebhookEndpoint(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_UpdateWebhookEndpoint_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).UpdateWebhookEndpoint(ctx, req.(*UpdateWebhookEndpointRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_DeleteWebhookEndpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteWebhookEndpointRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).DeleteWebhookEndpoint(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_DeleteWebhookEndpoint_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).DeleteWebhookEndpoint(ctx, req.(*DeleteWebhookEndpointRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_ListWebhookDeliveries_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListWebhookDeliveriesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).ListWebhookDeliveries(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_ListWebhookDeliveries_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).ListWebhookDeliveries(ctx, req.(*ListWebhookDeliveriesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SecretService_ListAuditEvents_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListAuditEventsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SecretServiceServer).ListAuditEvents(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SecretService_ListAuditEvents_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SecretServiceServer).ListAuditEvents(ctx, req.(*ListAuditEventsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // SecretService_ServiceDesc is the grpc.ServiceDesc for SecretService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -310,6 +1704,356 @@ var SecretService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Delete",
 			Handler:    _SecretService_Delete_Handler,
+		},
+		{
+			MethodName: "CreateProject",
+			Handler:    _SecretService_CreateProject_Handler,
+		},
+		{
+			MethodName: "ListProjects",
+			Handler:    _SecretService_ListProjects_Handler,
+		},
+		{
+			MethodName: "GetProject",
+			Handler:    _SecretService_GetProject_Handler,
+		},
+		{
+			MethodName: "UpdateProject",
+			Handler:    _SecretService_UpdateProject_Handler,
+		},
+		{
+			MethodName: "DeleteProject",
+			Handler:    _SecretService_DeleteProject_Handler,
+		},
+		{
+			MethodName: "CreateEnvironment",
+			Handler:    _SecretService_CreateEnvironment_Handler,
+		},
+		{
+			MethodName: "ListEnvironments",
+			Handler:    _SecretService_ListEnvironments_Handler,
+		},
+		{
+			MethodName: "GetEnvironment",
+			Handler:    _SecretService_GetEnvironment_Handler,
+		},
+		{
+			MethodName: "UpdateEnvironment",
+			Handler:    _SecretService_UpdateEnvironment_Handler,
+		},
+		{
+			MethodName: "DeleteEnvironment",
+			Handler:    _SecretService_DeleteEnvironment_Handler,
+		},
+		{
+			MethodName: "CreateFolder",
+			Handler:    _SecretService_CreateFolder_Handler,
+		},
+		{
+			MethodName: "ListFolders",
+			Handler:    _SecretService_ListFolders_Handler,
+		},
+		{
+			MethodName: "MoveFolder",
+			Handler:    _SecretService_MoveFolder_Handler,
+		},
+		{
+			MethodName: "DeleteFolder",
+			Handler:    _SecretService_DeleteFolder_Handler,
+		},
+		{
+			MethodName: "CreateImport",
+			Handler:    _SecretService_CreateImport_Handler,
+		},
+		{
+			MethodName: "ListImports",
+			Handler:    _SecretService_ListImports_Handler,
+		},
+		{
+			MethodName: "UpdateImport",
+			Handler:    _SecretService_UpdateImport_Handler,
+		},
+		{
+			MethodName: "DeleteImport",
+			Handler:    _SecretService_DeleteImport_Handler,
+		},
+		{
+			MethodName: "GetSecret",
+			Handler:    _SecretService_GetSecret_Handler,
+		},
+		{
+			MethodName: "DescribeSecret",
+			Handler:    _SecretService_DescribeSecret_Handler,
+		},
+		{
+			MethodName: "ListSecrets",
+			Handler:    _SecretService_ListSecrets_Handler,
+		},
+		{
+			MethodName: "PutSecret",
+			Handler:    _SecretService_PutSecret_Handler,
+		},
+		{
+			MethodName: "UpdateSecretMetadata",
+			Handler:    _SecretService_UpdateSecretMetadata_Handler,
+		},
+		{
+			MethodName: "ListSecretVersions",
+			Handler:    _SecretService_ListSecretVersions_Handler,
+		},
+		{
+			MethodName: "RollbackSecret",
+			Handler:    _SecretService_RollbackSecret_Handler,
+		},
+		{
+			MethodName: "RotateSecret",
+			Handler:    _SecretService_RotateSecret_Handler,
+		},
+		{
+			MethodName: "SetRotationPolicy",
+			Handler:    _SecretService_SetRotationPolicy_Handler,
+		},
+		{
+			MethodName: "DeleteSecret",
+			Handler:    _SecretService_DeleteSecret_Handler,
+		},
+		{
+			MethodName: "ListDeletedSecrets",
+			Handler:    _SecretService_ListDeletedSecrets_Handler,
+		},
+		{
+			MethodName: "RestoreSecret",
+			Handler:    _SecretService_RestoreSecret_Handler,
+		},
+		{
+			MethodName: "DestroySecret",
+			Handler:    _SecretService_DestroySecret_Handler,
+		},
+		{
+			MethodName: "BatchGetSecrets",
+			Handler:    _SecretService_BatchGetSecrets_Handler,
+		},
+		{
+			MethodName: "BatchPutSecrets",
+			Handler:    _SecretService_BatchPutSecrets_Handler,
+		},
+		{
+			MethodName: "CreateWebhookEndpoint",
+			Handler:    _SecretService_CreateWebhookEndpoint_Handler,
+		},
+		{
+			MethodName: "ListWebhookEndpoints",
+			Handler:    _SecretService_ListWebhookEndpoints_Handler,
+		},
+		{
+			MethodName: "UpdateWebhookEndpoint",
+			Handler:    _SecretService_UpdateWebhookEndpoint_Handler,
+		},
+		{
+			MethodName: "DeleteWebhookEndpoint",
+			Handler:    _SecretService_DeleteWebhookEndpoint_Handler,
+		},
+		{
+			MethodName: "ListWebhookDeliveries",
+			Handler:    _SecretService_ListWebhookDeliveries_Handler,
+		},
+		{
+			MethodName: "ListAuditEvents",
+			Handler:    _SecretService_ListAuditEvents_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "maintainerd/secret/v1/secret.proto",
+}
+
+const (
+	SetupService_GetSetupStatus_FullMethodName = "/maintainerd.secret.v1.SetupService/GetSetupStatus"
+	SetupService_Setup_FullMethodName          = "/maintainerd.secret.v1.SetupService/Setup"
+	SetupService_CompleteSetup_FullMethodName  = "/maintainerd.secret.v1.SetupService/CompleteSetup"
+)
+
+// SetupServiceClient is the client API for SetupService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// SetupService is the CONTROLLED setup path: a controller (Core) drives it with
+// the bootstrap token in the x-setup-token metadata header. Once it has completed
+// setup, the REST wizard refuses — an instance has exactly one setup path.
+type SetupServiceClient interface {
+	GetSetupStatus(ctx context.Context, in *GetSetupStatusRequest, opts ...grpc.CallOption) (*GetSetupStatusResponse, error)
+	// Setup creates the tenant mirror plus the default project and environment. It
+	// is idempotent: a retry after a lost response converges instead of reporting a
+	// conflict that reads as "somebody else claimed this instance".
+	Setup(ctx context.Context, in *SetupServiceSetupRequest, opts ...grpc.CallOption) (*SetupServiceSetupResponse, error)
+	// CompleteSetup closes the one-time window permanently.
+	CompleteSetup(ctx context.Context, in *CompleteSetupRequest, opts ...grpc.CallOption) (*CompleteSetupResponse, error)
+}
+
+type setupServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewSetupServiceClient(cc grpc.ClientConnInterface) SetupServiceClient {
+	return &setupServiceClient{cc}
+}
+
+func (c *setupServiceClient) GetSetupStatus(ctx context.Context, in *GetSetupStatusRequest, opts ...grpc.CallOption) (*GetSetupStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetSetupStatusResponse)
+	err := c.cc.Invoke(ctx, SetupService_GetSetupStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *setupServiceClient) Setup(ctx context.Context, in *SetupServiceSetupRequest, opts ...grpc.CallOption) (*SetupServiceSetupResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetupServiceSetupResponse)
+	err := c.cc.Invoke(ctx, SetupService_Setup_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *setupServiceClient) CompleteSetup(ctx context.Context, in *CompleteSetupRequest, opts ...grpc.CallOption) (*CompleteSetupResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CompleteSetupResponse)
+	err := c.cc.Invoke(ctx, SetupService_CompleteSetup_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SetupServiceServer is the server API for SetupService service.
+// All implementations must embed UnimplementedSetupServiceServer
+// for forward compatibility.
+//
+// SetupService is the CONTROLLED setup path: a controller (Core) drives it with
+// the bootstrap token in the x-setup-token metadata header. Once it has completed
+// setup, the REST wizard refuses — an instance has exactly one setup path.
+type SetupServiceServer interface {
+	GetSetupStatus(context.Context, *GetSetupStatusRequest) (*GetSetupStatusResponse, error)
+	// Setup creates the tenant mirror plus the default project and environment. It
+	// is idempotent: a retry after a lost response converges instead of reporting a
+	// conflict that reads as "somebody else claimed this instance".
+	Setup(context.Context, *SetupServiceSetupRequest) (*SetupServiceSetupResponse, error)
+	// CompleteSetup closes the one-time window permanently.
+	CompleteSetup(context.Context, *CompleteSetupRequest) (*CompleteSetupResponse, error)
+	mustEmbedUnimplementedSetupServiceServer()
+}
+
+// UnimplementedSetupServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedSetupServiceServer struct{}
+
+func (UnimplementedSetupServiceServer) GetSetupStatus(context.Context, *GetSetupStatusRequest) (*GetSetupStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSetupStatus not implemented")
+}
+func (UnimplementedSetupServiceServer) Setup(context.Context, *SetupServiceSetupRequest) (*SetupServiceSetupResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Setup not implemented")
+}
+func (UnimplementedSetupServiceServer) CompleteSetup(context.Context, *CompleteSetupRequest) (*CompleteSetupResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CompleteSetup not implemented")
+}
+func (UnimplementedSetupServiceServer) mustEmbedUnimplementedSetupServiceServer() {}
+func (UnimplementedSetupServiceServer) testEmbeddedByValue()                      {}
+
+// UnsafeSetupServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to SetupServiceServer will
+// result in compilation errors.
+type UnsafeSetupServiceServer interface {
+	mustEmbedUnimplementedSetupServiceServer()
+}
+
+func RegisterSetupServiceServer(s grpc.ServiceRegistrar, srv SetupServiceServer) {
+	// If the following call panics, it indicates UnimplementedSetupServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&SetupService_ServiceDesc, srv)
+}
+
+func _SetupService_GetSetupStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSetupStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SetupServiceServer).GetSetupStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SetupService_GetSetupStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SetupServiceServer).GetSetupStatus(ctx, req.(*GetSetupStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SetupService_Setup_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetupServiceSetupRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SetupServiceServer).Setup(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SetupService_Setup_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SetupServiceServer).Setup(ctx, req.(*SetupServiceSetupRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SetupService_CompleteSetup_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CompleteSetupRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SetupServiceServer).CompleteSetup(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SetupService_CompleteSetup_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SetupServiceServer).CompleteSetup(ctx, req.(*CompleteSetupRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// SetupService_ServiceDesc is the grpc.ServiceDesc for SetupService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var SetupService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "maintainerd.secret.v1.SetupService",
+	HandlerType: (*SetupServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "GetSetupStatus",
+			Handler:    _SetupService_GetSetupStatus_Handler,
+		},
+		{
+			MethodName: "Setup",
+			Handler:    _SetupService_Setup_Handler,
+		},
+		{
+			MethodName: "CompleteSetup",
+			Handler:    _SetupService_CompleteSetup_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

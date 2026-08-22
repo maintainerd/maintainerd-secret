@@ -4,22 +4,31 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/reflection"
 
 	"github.com/maintainerd/kit/log"
 	"github.com/maintainerd/kit/server"
 
 	secretv1 "github.com/maintainerd/secret/gen/maintainerd/secret/v1"
+	"github.com/maintainerd/secret/internal/api"
+	"github.com/maintainerd/secret/internal/audit"
 	"github.com/maintainerd/secret/internal/crypto"
 	"github.com/maintainerd/secret/internal/grpcserver"
+	"github.com/maintainerd/secret/internal/httpapi"
+	"github.com/maintainerd/secret/internal/platform/authz"
 	"github.com/maintainerd/secret/internal/platform/config"
 	"github.com/maintainerd/secret/internal/platform/database"
+	"github.com/maintainerd/secret/internal/rotator"
+	"github.com/maintainerd/secret/internal/setup"
 	"github.com/maintainerd/secret/internal/store"
+	"github.com/maintainerd/secret/internal/webhook"
 )
 
 // run boots the secret service.
@@ -99,14 +108,83 @@ func run(parent context.Context) error {
 		}
 	}
 
-	api := grpcserver.New(svc, config.SetupBootstrapToken, config.IsDevelopment())
-	gs := server.NewGRPC(func(g *grpc.Server) { secretv1.RegisterSecretServiceServer(g, api) })
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", server.Healthz())
+	// The auth posture is resolved BEFORE any surface is built, and its banner is
+	// printed immediately, so the last thing in the boot log before the service
+	// starts answering is what is or is not guarding it.
+	guard, err := authz.Resolve(ctx, authz.Config{
+		JWKSURL:     config.AuthJWKSURL,
+		Issuer:      config.AuthIssuer,
+		Audience:    config.AuthAudience,
+		Development: config.IsDevelopment(),
+	})
+	if err != nil {
+		return fmt.Errorf("resolve authorization: %w", err)
+	}
+	guard.LogBanner()
+
+	auditor, err := audit.New(svc)
+	if err != nil {
+		return err
+	}
+
+	var notifier api.Notifier
+	if config.WebhooksEnabled {
+		notifier = webhook.New(svc, webhook.Options{
+			Enabled:     true,
+			Concurrency: config.WebhookConcurrency,
+		})
+	}
+
+	appSvc, err := api.New(svc, auditor, notifier, api.Options{
+		ReferenceMaxDepth: config.ReferenceMaxDepth,
+		DefaultTenant:     config.DefaultTenant,
+	})
+	if err != nil {
+		return err
+	}
+
+	setupSvc, err := setup.New(svc, auditor, setup.Options{
+		BootstrapToken:      config.SetupBootstrapToken,
+		Development:         config.IsDevelopment(),
+		DefaultTenant:       config.DefaultTenant,
+		DefaultProject:      config.DefaultProject,
+		DefaultEnvironment:  config.DefaultEnvironment,
+		DeclaredPermissions: authz.DeclaredPermissions(),
+	})
+	if err != nil {
+		return err
+	}
+
+	secretAPI := grpcserver.New(appSvc, setupSvc, config.SetupBootstrapToken, config.IsDevelopment(), config.DefaultTenant)
+	setupAPI := grpcserver.NewSetupServer(setupSvc)
+	// The gRPC server is built here rather than through kit's server.NewGRPC for two
+	// reasons the kit helper cannot express: this service needs an auth interceptor
+	// on every RPC, and it must register reflection ONLY in development. Reflection
+	// enumerates every RPC and message — convenient with grpcurl on a laptop, a map
+	// of the vault's API handed to anyone who can open a socket in production.
+	gs := grpc.NewServer(grpc.UnaryInterceptor(grpcserver.AuthUnaryInterceptor(guard)))
+	secretv1.RegisterSecretServiceServer(gs, secretAPI)
+	secretv1.RegisterSetupServiceServer(gs, setupAPI)
+	healthpb.RegisterHealthServer(gs, health.NewServer())
+	if config.IsDevelopment() {
+		reflection.Register(gs)
+	}
+
+	rot := rotator.New(appSvc, rotator.Options{
+		Enabled:  config.RotationEnabled,
+		Interval: config.RotationInterval,
+		Batch:    config.RotationBatch,
+	})
+
+	restServer := httpapi.NewServer(appSvc, setupSvc, guard)
 
 	return server.Run(ctx,
 		func(c context.Context) error { return server.ServeGRPC(c, config.GRPCAddr, gs) },
-		func(c context.Context) error { return server.ServeHTTP(c, config.HTTPAddr, mux) },
+		func(c context.Context) error { return server.ServeHTTP(c, config.HTTPAddr, restServer.Router()) },
+		// The rotator runs alongside the servers and never returns an error: a
+		// failing rotation pass is an ordinary condition, and taking the vault down
+		// because a scheduled rotation had a bad tick would be self-defeating.
+		func(c context.Context) error { rot.Run(c); return nil },
 	)
 }
 

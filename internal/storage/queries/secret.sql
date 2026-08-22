@@ -178,6 +178,38 @@ WHERE deleted_at IS NOT NULL AND destroy_after IS NOT NULL AND destroy_after <= 
 ORDER BY destroy_after
 LIMIT $1;
 
+-- ListSecretsWithRotationPolicy is the background rotator's work queue: every live
+-- secret whose rotation_policy declares itself enabled, with the addressing columns
+-- the rotator needs to write a new version.
+--
+-- WHETHER A SECRET IS *DUE* IS DECIDED IN GO, NOT HERE. Expressing "rotated_at +
+-- interval <= now()" in SQL means parsing a Go duration string inside Postgres, and
+-- an interval this query mis-parses is either a credential that silently stops
+-- rotating or one that rotates every tick. The filter that belongs in SQL is the
+-- cheap, unambiguous one (enabled, live); the arithmetic belongs next to the parser
+-- that owns the format, where it is unit-testable without a database.
+--
+-- The select list is metadata plus addressing — no ciphertext. The rotator generates
+-- a NEW value, so it never needs to read the current one.
+-- name: ListSecretsWithRotationPolicy :many
+SELECT s.secret_id, s.secret_uuid, t.tenant_uuid, p.slug AS project_slug,
+       e.slug AS environment_slug, f.path AS folder_path, s.key,
+       s.current_version, s.rotation_policy, s.rotated_at, s.created_at,
+       s.mrn_tenant, s.mrn_project, s.mrn_resource_path
+FROM secrets s
+JOIN tenants t ON t.tenant_id = s.tenant_id
+JOIN projects p ON p.project_id = s.project_id
+JOIN environments e ON e.environment_id = s.environment_id
+JOIN folders f ON f.folder_id = s.folder_id
+WHERE s.deleted_at IS NULL
+  AND t.deleted_at IS NULL
+  AND p.deleted_at IS NULL
+  AND e.deleted_at IS NULL
+  AND f.deleted_at IS NULL
+  AND s.rotation_policy ->> 'enabled' = 'true'
+ORDER BY s.secret_id
+LIMIT sqlc.arg(row_limit) OFFSET sqlc.arg(row_offset);
+
 -- name: SoftDeleteSecretsInFolderSubtree :execrows
 UPDATE secrets
 SET deleted_at    = now(),

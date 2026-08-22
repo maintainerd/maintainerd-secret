@@ -310,6 +310,34 @@ func toSetupState(r storage.SetupState) SetupState {
 // Small pgtype / JSONB helpers
 // ---------------------------------------------------------------------------
 
+func toAuditEntry(r storage.AuditLog) AuditEntry {
+	e := AuditEntry{
+		UUID:         r.EventUuid,
+		ActorSubject: r.ActorSubject,
+		ActorKind:    r.ActorKind,
+		Action:       r.Action,
+		ResourceMRN:  r.ResourceMrn,
+		Outcome:      r.Outcome,
+		Reason:       r.Reason,
+		UserAgent:    r.UserAgent,
+		RequestID:    r.RequestID,
+		Metadata:     decodeObject(r.Metadata),
+		CreatedAt:    r.CreatedAt,
+	}
+	if r.Version.Valid {
+		v := r.Version.Int32
+		e.Version = &v
+	}
+	if r.IpAddress != nil {
+		e.IPAddress = r.IpAddress.String()
+	}
+	return e
+}
+
+func pgInt8(v int64) pgtype.Int8 { return pgtype.Int8{Int64: v, Valid: true} }
+
+func pgInt4(v int32) pgtype.Int4 { return pgtype.Int4{Int32: v, Valid: true} }
+
 func timePtr(ts pgtype.Timestamptz) *time.Time {
 	if !ts.Valid {
 		return nil
