@@ -18,10 +18,21 @@ permissions:
 jobs:
   dockerhub-description:
     runs-on: ubuntu-latest
+    # Skip cleanly until the Docker Hub credentials exist. Publishing the image
+    # page is optional plumbing, so a repo not yet wired to Docker Hub should
+    # report a skipped step, not a red X — a workflow that always fails for a
+    # known, benign reason is a workflow nobody reads.
+    #
+    # The check is hoisted into `env` deliberately: the `secrets` context is NOT
+    # available in a job-level `if`, but job-level `env` may read secrets and
+    # `env` IS available to a step-level `if`.
+    env:
+      HAS_DOCKERHUB_CREDS: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Sync README + short description to Docker Hub
+        if: env.HAS_DOCKERHUB_CREDS == 'true'
         uses: peter-evans/dockerhub-description@432a30c9e07499fd01da9f8a49f0faf9e0ca5b77 # v4.0.2
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
