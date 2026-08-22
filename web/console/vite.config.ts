@@ -24,15 +24,15 @@ export default defineConfig({
       output: {
         manualChunks: {
           'react-vendor': ['react', 'react-dom', 'react-router-dom'],
-          'data-vendor': ['@tanstack/react-query', 'axios'],
+          'data-vendor': ['@tanstack/react-query', '@tanstack/react-table', 'axios'],
           'form-vendor': ['react-hook-form', '@hookform/resolvers', 'zod'],
           'ui-vendor': [
-            '@radix-ui/react-checkbox', '@radix-ui/react-dialog',
+            '@radix-ui/react-avatar', '@radix-ui/react-checkbox', '@radix-ui/react-dialog',
             '@radix-ui/react-dropdown-menu', '@radix-ui/react-label',
             '@radix-ui/react-popover', '@radix-ui/react-select',
             '@radix-ui/react-separator', '@radix-ui/react-slot',
             '@radix-ui/react-switch', '@radix-ui/react-tabs',
-            '@radix-ui/react-tooltip', 'lucide-react',
+            '@radix-ui/react-tooltip', 'cmdk', 'lucide-react',
           ],
           'util-vendor': ['date-fns', 'clsx', 'tailwind-merge', 'class-variance-authority'],
         },

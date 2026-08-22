@@ -1,16 +1,13 @@
 import { useEffect, useState } from 'react'
-import { RefreshCw } from 'lucide-react'
+import { RefreshCw, Timer } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { Switch } from '@/components/ui/switch'
+import { InformationCard } from '@/components/card'
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
+  FormInputField,
+  FormPasswordField,
+  FormSelectField,
+  FormSwitchField,
+} from '@/components/form'
 import { ConfirmDialog } from '@/components/ConfirmDialog'
 import { useRotateSecret, useSetRotationPolicy } from '@/hooks/useSecrets'
 import { encodeUtf8ToBase64 } from '@/lib/base64'
@@ -26,6 +23,10 @@ import {
 /**
  * Rotation: the stored policy, and rotate-now.
  *
+ * Composed from maintainerd-auth's `InformationCard` plus its field components,
+ * so this reads like auth's own configuration surfaces (MFA config, token
+ * config) rather than a bespoke panel.
+ *
  * TWO THINGS THE UI HAS TO KEEP STRAIGHT, because the service enforces both:
  *
  *  1. A STORED POLICY MUST NOT CARRY A VALUE. The policy lives in readable
@@ -38,6 +39,11 @@ import {
  */
 
 const DEFAULT_CHARSET = ''
+
+const GENERATOR_OPTIONS = [
+  { value: GENERATOR_RANDOM, label: 'random' },
+  { value: GENERATOR_SUPPLIED, label: 'supplied' },
+]
 
 function readPolicy(meta: SecretMeta | undefined): RotationPolicy {
   const raw = meta?.rotation_policy
@@ -108,105 +114,90 @@ export function RotationPanel({
 
   return (
     <div className="space-y-6">
-      <section className="space-y-4">
-        <div className="flex items-center justify-between gap-4">
-          <div>
-            <h3 className="text-sm font-medium">Rotation policy</h3>
-            <p className="text-xs text-muted-foreground">
-              Last rotated {formatRelative(meta?.rotated_at)}.
-            </p>
-          </div>
-          <div className="flex items-center gap-2">
-            <Switch
-              id="rotation-enabled"
-              checked={enabled}
-              onCheckedChange={setEnabled}
-              aria-label="Enable scheduled rotation"
-            />
-            <Label htmlFor="rotation-enabled" className="text-sm">
-              {enabled ? 'Enabled' : 'Disabled'}
-            </Label>
-          </div>
-        </div>
+      <InformationCard
+        title="Rotation policy"
+        icon={Timer}
+        description={`Last rotated ${formatRelative(meta?.rotated_at)}.`}
+      >
+        <div className="space-y-5">
+          <FormSwitchField
+            id="rotation-enabled"
+            label="Scheduled rotation"
+            description="When on, the service rotates this secret on the interval below."
+            checked={enabled}
+            onCheckedChange={setEnabled}
+          />
 
-        <div className="grid gap-4 sm:grid-cols-3">
-          <div className="space-y-1.5">
-            <Label htmlFor="rotation-interval">Interval</Label>
-            <Input
+          <div className="grid gap-5 sm:grid-cols-3">
+            <FormInputField
               id="rotation-interval"
+              label="Interval"
               value={interval}
               onChange={(event) => setIntervalValue(event.target.value)}
               placeholder="720h"
               autoComplete="off"
+              description="A duration, e.g. 720h for 30 days."
             />
-            <p className="text-xs text-muted-foreground">A duration, e.g. 720h for 30 days.</p>
-          </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="rotation-length">Generated length</Label>
-            <Input
+            <FormInputField
               id="rotation-length"
+              label="Generated length"
               type="number"
               min={1}
               value={length}
               onChange={(event) => setLength(event.target.value)}
             />
-          </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="rotation-charset">Charset</Label>
-            <Input
+            <FormInputField
               id="rotation-charset"
+              label="Charset"
               value={charset}
               onChange={(event) => setCharset(event.target.value)}
               placeholder="service default"
               autoComplete="off"
             />
           </div>
+
+          <p className="text-xs text-muted-foreground">
+            A stored policy generates a new random value. It cannot carry a supplied value — the
+            policy is readable metadata, and a value in it would be a credential in a metadata
+            field.
+          </p>
+
+          <Button size="sm" onClick={() => void savePolicy()} disabled={setPolicy.isPending}>
+            {setPolicy.isPending ? 'Saving…' : 'Save policy'}
+          </Button>
         </div>
+      </InformationCard>
 
-        <p className="text-xs text-muted-foreground">
-          A stored policy generates a new random value. It cannot carry a supplied value — the
-          policy is readable metadata, and a value in it would be a credential in a metadata field.
-        </p>
-
-        <Button size="sm" onClick={() => void savePolicy()} disabled={setPolicy.isPending}>
-          {setPolicy.isPending ? 'Saving…' : 'Save policy'}
-        </Button>
-      </section>
-
-      <section className="space-y-3 border-t pt-6">
-        <h3 className="text-sm font-medium">Rotate now</h3>
-        <div className="grid gap-4 sm:grid-cols-2">
-          <div className="space-y-1.5">
-            <Label htmlFor="rotate-generator">Generator</Label>
-            <Select value={rotateType} onValueChange={setRotateType}>
-              <SelectTrigger id="rotate-generator" className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={GENERATOR_RANDOM}>random</SelectItem>
-                <SelectItem value={GENERATOR_SUPPLIED}>supplied</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-          {rotateType === GENERATOR_SUPPLIED ? (
-            <div className="space-y-1.5">
-              <Label htmlFor="rotate-supplied">New value</Label>
-              <Input
+      <InformationCard
+        title="Rotate now"
+        icon={RefreshCw}
+        description="Writes a new version immediately. The new value is not returned — reading it is a separate, audited reveal."
+      >
+        <div className="space-y-5">
+          <div className="grid gap-5 sm:grid-cols-2">
+            <FormSelectField
+              id="rotate-generator"
+              label="Generator"
+              options={GENERATOR_OPTIONS}
+              value={rotateType}
+              onValueChange={setRotateType}
+            />
+            {rotateType === GENERATOR_SUPPLIED && (
+              <FormPasswordField
                 id="rotate-supplied"
-                type="password"
-                autoComplete="off"
+                label="New value"
                 spellCheck={false}
                 value={suppliedValue}
                 onChange={(event) => setSuppliedValue(event.target.value)}
               />
-            </div>
-          ) : null}
+            )}
+          </div>
+          <Button variant="outline" size="sm" onClick={() => setRotateOpen(true)}>
+            <RefreshCw className="size-4" aria-hidden="true" />
+            Rotate now
+          </Button>
         </div>
-        <Button variant="outline" size="sm" onClick={() => setRotateOpen(true)}>
-          <RefreshCw className="size-4" aria-hidden="true" />
-          Rotate now
-        </Button>
-      </section>
+      </InformationCard>
 
       <ConfirmDialog
         open={rotateOpen}
@@ -221,9 +212,7 @@ export function RotationPanel({
               This writes a new version immediately. Anything still using the current value will
               keep working only until it re-reads.
             </p>
-            <p>
-              The new value is not returned here — reading it is a separate, audited reveal.
-            </p>
+            <p>The new value is not returned here — reading it is a separate, audited reveal.</p>
           </>
         }
       />

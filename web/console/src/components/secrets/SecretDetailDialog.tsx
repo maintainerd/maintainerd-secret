@@ -1,5 +1,15 @@
 import { useMemo, useState } from 'react'
-import { Eye, History, Link2, Undo2 } from 'lucide-react'
+import {
+  CalendarClock,
+  Eye,
+  FileText,
+  History,
+  Layers,
+  Link2,
+  RotateCw,
+  Tag,
+  Undo2,
+} from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -9,17 +19,19 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table'
+  DetailTabs,
+  EmptyState,
+  ListingItemCard,
+  ListingItemMeta,
+  ListSkeleton,
+} from '@/components/details'
+import { StatusBadge } from '@/components/badges'
+import { CopyableCode } from '@/components/inputs'
 import { ConfirmDialog } from '@/components/ConfirmDialog'
-import { ErrorState, InlineLoading } from '@/components/layout/states'
+import { ErrorState } from '@/components/layout/states'
 import { RevealDialog } from './RevealDialog'
 import { RotationPanel } from './RotationPanel'
 import { useRollbackSecret, useSecretMeta, useSecretVersions } from '@/hooks/useSecrets'
@@ -31,10 +43,39 @@ import { VALUE_TYPE_REFERENCE, type SecretAddress } from '@/services/api/types'
  *
  * IT IS A DIALOG, NOT A ROUTE, and that is a security decision rather than a
  * layout preference: a route would put the secret's address in the URL, and an
- * address in a URL lands in browser history, the referer header, and every
- * proxy and access log between here and the vault. The same reasoning is why the
+ * address in a URL lands in browser history, the referer header, and every proxy
+ * and access log between here and the vault. The same reasoning is why the
  * service made reveal a POST.
+ *
+ * Inside, it is composed exactly like one of maintainerd-auth's detail pages —
+ * an attribute grid, `DetailTabs`, and `ListingItemCard` rows — just hosted in a
+ * dialog instead of a route. `DetailHeaderCard` itself is not used: it renders
+ * its own `<h1>`, which would be a second top-level heading inside a dialog that
+ * already has a `DialogTitle`.
  */
+
+interface Attribute {
+  icon: typeof Layers
+  label: string
+  value: React.ReactNode
+}
+
+function AttributeGrid({ attributes }: { attributes: Attribute[] }) {
+  return (
+    <div className="grid grid-cols-1 gap-x-8 gap-y-4 sm:grid-cols-2 lg:grid-cols-3">
+      {attributes.map(({ icon: Icon, label, value }) => (
+        <div key={label} className="flex flex-col gap-1">
+          <div className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            <Icon className="size-3.5" aria-hidden="true" />
+            {label}
+          </div>
+          <div className="text-sm text-foreground">{value}</div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 export function SecretDetailDialog({
   address,
   open,
@@ -73,168 +114,175 @@ export function SecretDetailDialog({
     await metaQuery.refetch()
   }
 
+  const attributes: Attribute[] = meta
+    ? [
+        { icon: Layers, label: 'Current version', value: `v${meta.current_version}` },
+        { icon: History, label: 'Versions retained', value: meta.keep_versions },
+        { icon: RotateCw, label: 'Rotated', value: formatRelative(meta.rotated_at) },
+        {
+          icon: CalendarClock,
+          label: 'Expires',
+          value: meta.expires_at ? (
+            isExpired(meta.expires_at) ? (
+              <StatusBadge status="expired" label={`expired ${formatRelative(meta.expires_at)}`} />
+            ) : (
+              formatDateTime(meta.expires_at)
+            )
+          ) : (
+            '—'
+          ),
+        },
+        {
+          icon: FileText,
+          label: 'Description',
+          value: meta.description || <span className="text-muted-foreground">—</span>,
+        },
+        {
+          icon: Tag,
+          label: 'Tags',
+          value:
+            meta.tags.length > 0 ? (
+              <div className="flex flex-wrap gap-1">
+                {meta.tags.map((tag) => (
+                  <Badge key={tag} variant="outline" className="text-xs">
+                    {tag}
+                  </Badge>
+                ))}
+              </div>
+            ) : (
+              <span className="text-muted-foreground">—</span>
+            ),
+        },
+      ]
+    : []
+
   return (
     <>
       <Dialog open={open} onOpenChange={onOpenChange}>
-        <DialogContent className="sm:max-w-2xl">
+        <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
           <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
+            <DialogTitle className="flex flex-wrap items-center gap-2.5">
               {address?.key ?? 'Secret'}
-              {isReference ? (
+              {isReference && (
                 <Badge variant="secondary" className="gap-1">
                   <Link2 className="size-3" aria-hidden="true" />
                   reference
                 </Badge>
-              ) : null}
+              )}
             </DialogTitle>
-            <DialogDescription>
-              {address ? `${address.project} / ${address.environment} · ${address.folder_path || '/'}` : null}
+            <DialogDescription className="text-left">
+              {address
+                ? `${address.project} / ${address.environment} · ${address.folder_path || '/'}`
+                : null}
             </DialogDescription>
           </DialogHeader>
 
-          <Tabs defaultValue="overview">
+          <DetailTabs defaultValue="overview">
             <TabsList>
               <TabsTrigger value="overview">Overview</TabsTrigger>
               <TabsTrigger value="versions">Versions</TabsTrigger>
               <TabsTrigger value="rotation">Rotation</TabsTrigger>
             </TabsList>
 
-            <TabsContent value="overview" className="space-y-4 pt-4">
-              {metaQuery.isLoading ? <InlineLoading /> : null}
-              {metaQuery.isError ? (
+            <TabsContent value="overview" className="space-y-5">
+              {metaQuery.isLoading && <ListSkeleton rows={2} />}
+              {metaQuery.isError && (
                 <ErrorState error={metaQuery.error} onRetry={() => void metaQuery.refetch()} />
-              ) : null}
-              {meta ? (
+              )}
+              {meta && (
                 <>
-                  <dl className="grid gap-3 text-sm sm:grid-cols-2">
-                    <div>
-                      <dt className="text-xs text-muted-foreground">Current version</dt>
-                      <dd>{meta.current_version}</dd>
-                    </div>
-                    <div>
-                      <dt className="text-xs text-muted-foreground">Versions retained</dt>
-                      <dd>{meta.keep_versions}</dd>
-                    </div>
-                    <div>
-                      <dt className="text-xs text-muted-foreground">Rotated</dt>
-                      <dd>{formatRelative(meta.rotated_at)}</dd>
-                    </div>
-                    <div>
-                      <dt className="text-xs text-muted-foreground">Expires</dt>
-                      <dd>
-                        {meta.expires_at ? (
-                          <span className={isExpired(meta.expires_at) ? 'text-destructive' : ''}>
-                            {formatDateTime(meta.expires_at)}
-                            {isExpired(meta.expires_at) ? ' (expired)' : ''}
-                          </span>
-                        ) : (
-                          '—'
-                        )}
-                      </dd>
-                    </div>
-                    <div className="sm:col-span-2">
-                      <dt className="text-xs text-muted-foreground">Description</dt>
-                      <dd>{meta.description || '—'}</dd>
-                    </div>
-                    <div className="sm:col-span-2">
-                      <dt className="text-xs text-muted-foreground">Tags</dt>
-                      <dd className="flex flex-wrap gap-1">
-                        {meta.tags.length > 0
-                          ? meta.tags.map((tag) => (
-                              <Badge key={tag} variant="outline">
-                                {tag}
-                              </Badge>
-                            ))
-                          : '—'}
-                      </dd>
-                    </div>
-                    <div className="sm:col-span-2">
-                      <dt className="text-xs text-muted-foreground">MRN</dt>
-                      <dd className="font-mono text-xs break-all">{meta.mrn}</dd>
-                    </div>
-                  </dl>
+                  <AttributeGrid attributes={attributes} />
 
-                  {isReference ? (
-                    <div className="rounded-md border p-3 text-sm">
-                      <p className="font-medium">This secret is a reference</p>
-                      <p className="mt-1 text-xs text-muted-foreground">
+                  <div className="space-y-1.5">
+                    <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                      MRN
+                    </p>
+                    <CopyableCode value={meta.mrn} label="MRN" variant="block" />
+                  </div>
+
+                  {isReference && (
+                    <Alert>
+                      <Link2 className="size-4" aria-hidden="true" />
+                      <AlertTitle>This secret is a reference</AlertTitle>
+                      <AlertDescription>
                         Its stored value is a pointer of the form{' '}
                         <code>{'${project/environment/folder/KEY}'}</code>, not a credential.
                         Revealing it resolves the chain, re-checking your reveal grant against each
                         target and auditing every hop — so a reference can never widen what you can
                         read. Reveal it to see the chain it traversed.
-                      </p>
-                    </div>
-                  ) : null}
+                      </AlertDescription>
+                    </Alert>
+                  )}
 
                   <Button size="sm" onClick={() => openReveal(undefined)}>
                     <Eye className="size-4" aria-hidden="true" />
                     Reveal current value
                   </Button>
                 </>
-              ) : null}
+              )}
             </TabsContent>
 
-            <TabsContent value="versions" className="space-y-3 pt-4">
-              {versionsQuery.isLoading ? <InlineLoading /> : null}
-              {versionsQuery.isError ? (
+            <TabsContent value="versions" className="space-y-3">
+              {versionsQuery.isLoading && <ListSkeleton rows={3} />}
+              {versionsQuery.isError && (
                 <ErrorState
                   error={versionsQuery.error}
                   onRetry={() => void versionsQuery.refetch()}
                 />
-              ) : null}
-              {versions.length > 0 ? (
-                <div className="max-h-80 overflow-auto">
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead>Version</TableHead>
-                        <TableHead>Type</TableHead>
-                        <TableHead>Created</TableHead>
-                        <TableHead className="text-right">Actions</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {versions.map((version) => (
-                        <TableRow key={version.version}>
-                          <TableCell>
-                            {version.version}
-                            {version.version === meta?.current_version ? (
-                              <Badge variant="secondary" className="ml-2">
-                                current
-                              </Badge>
-                            ) : null}
-                          </TableCell>
-                          <TableCell>{version.value_type}</TableCell>
-                          <TableCell>{formatDateTime(version.created_at)}</TableCell>
-                          <TableCell className="text-right">
-                            <div className="flex justify-end gap-1">
+              )}
+              {!versionsQuery.isLoading && !versionsQuery.isError && versions.length === 0 && (
+                <EmptyState
+                  icon={History}
+                  title="No versions"
+                  description="This secret has no readable version history."
+                />
+              )}
+
+              {versions.length > 0 && (
+                <div className="max-h-80 space-y-2 overflow-y-auto pr-1">
+                  {versions.map((version) => {
+                    const current = version.version === meta?.current_version
+                    return (
+                      <ListingItemCard
+                        key={version.version}
+                        icon={History}
+                        action={
+                          <div className="flex gap-1">
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => openReveal(version.version)}
+                            >
+                              <Eye className="size-4" aria-hidden="true" />
+                              Reveal
+                            </Button>
+                            {!current && (
                               <Button
                                 variant="ghost"
                                 size="sm"
-                                onClick={() => openReveal(version.version)}
+                                onClick={() => setRollbackTarget(version.version)}
                               >
-                                <Eye className="size-4" aria-hidden="true" />
-                                Reveal
+                                <Undo2 className="size-4" aria-hidden="true" />
+                                Roll back
                               </Button>
-                              {version.version !== meta?.current_version ? (
-                                <Button
-                                  variant="ghost"
-                                  size="sm"
-                                  onClick={() => setRollbackTarget(version.version)}
-                                >
-                                  <Undo2 className="size-4" aria-hidden="true" />
-                                  Roll back
-                                </Button>
-                              ) : null}
-                            </div>
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
+                            )}
+                          </div>
+                        }
+                      >
+                        <div className="flex flex-wrap items-center gap-2">
+                          <p className="text-sm font-medium">Version {version.version}</p>
+                          {current && <StatusBadge status="active" label="current" />}
+                        </div>
+                        <ListingItemMeta>
+                          <span>{version.value_type}</span>
+                          <span>{formatDateTime(version.created_at)}</span>
+                        </ListingItemMeta>
+                      </ListingItemCard>
+                    )
+                  })}
                 </div>
-              ) : null}
+              )}
+
               <p className="flex items-start gap-2 text-xs text-muted-foreground">
                 <History className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
                 History is append-only. Retention prunes the oldest versions beyond the retained
@@ -242,10 +290,10 @@ export function SecretDetailDialog({
               </p>
             </TabsContent>
 
-            <TabsContent value="rotation" className="pt-4">
-              {address ? <RotationPanel address={address} meta={meta} /> : null}
+            <TabsContent value="rotation">
+              {address && <RotationPanel address={address} meta={meta} />}
             </TabsContent>
-          </Tabs>
+          </DetailTabs>
         </DialogContent>
       </Dialog>
 

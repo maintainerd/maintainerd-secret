@@ -1,8 +1,8 @@
-import { useEffect, useState } from 'react'
-import { useForm } from 'react-hook-form'
+import { useEffect } from 'react'
+import { useForm, Controller } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
-import { Eye, EyeOff } from 'lucide-react'
+import { KeyRound } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -12,16 +12,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { Textarea } from '@/components/ui/textarea'
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
+  FormInputField,
+  FormPasswordField,
+  FormSelectField,
+  FormSubmitButton,
+  FormTextareaField,
+} from '@/components/form'
 import { usePutSecret, useUpdateSecretMeta } from '@/hooks/useSecrets'
 import { encodeUtf8ToBase64 } from '@/lib/base64'
 import { fromDateTimeLocalInput, toDateTimeLocalInput } from '@/lib/formatDate'
@@ -36,12 +33,12 @@ import {
 /**
  * Create a secret, write a new version, or edit metadata.
  *
- * THE VALUE FIELD IS `type=password` WITH AN EXPLICIT SHOW TOGGLE, and it is
- * never given an autocomplete hint the browser could act on: a password manager
- * offering to save a production database credential typed into an admin console
- * is not a feature. The typed value is base64-encoded on submit and the form is
- * reset the moment the dialog closes, so it is not left sitting in React state
- * behind a closed dialog.
+ * THE VALUE FIELD IS A PASSWORD FIELD WITH AN EXPLICIT SHOW TOGGLE — auth's
+ * `FormPasswordField`, which defaults `autoComplete` to "new-password" for
+ * precisely this reason: a password manager offering to save a production
+ * database credential typed into an admin console is not a feature. The typed
+ * value is base64-encoded on submit and the form is reset the moment the dialog
+ * closes, so it is not left sitting in React state behind a closed dialog.
  *
  * Metadata edits go through a DIFFERENT endpoint (`PATCH /secrets`) that cannot
  * change a value at all — which is why "edit metadata" here does not ask for one
@@ -61,6 +58,12 @@ const schema = z.object({
 })
 
 type SecretForm = z.infer<typeof schema>
+
+const VALUE_TYPE_OPTIONS = [
+  { value: VALUE_TYPE_OPAQUE, label: 'opaque' },
+  { value: VALUE_TYPE_JSON, label: 'json' },
+  { value: VALUE_TYPE_REFERENCE, label: 'reference' },
+]
 
 function parseTags(raw: string | undefined): string[] {
   if (!raw) return []
@@ -90,13 +93,12 @@ export function SecretFormDialog({
 }) {
   const put = usePutSecret()
   const updateMeta = useUpdateSecretMeta()
-  const [showValue, setShowValue] = useState(false)
 
   const {
     register,
     handleSubmit,
     reset,
-    setValue: setField,
+    control,
     watch,
     formState: { errors, isSubmitting },
   } = useForm<SecretForm>({
@@ -110,7 +112,6 @@ export function SecretFormDialog({
     if (!open) {
       // Drop the typed plaintext as soon as the dialog closes.
       reset({ valueType: VALUE_TYPE_OPAQUE })
-      setShowValue(false)
       return
     }
     reset({
@@ -170,110 +171,110 @@ export function SecretFormDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>{title}</DialogTitle>
-          <DialogDescription>
-            {mode === 'edit-metadata'
-              ? 'Metadata only. This cannot change the value.'
-              : `In ${project} / ${environment} at ${normalizePath(folderPath)}`}
+          <div className="flex items-center gap-3">
+            <div className="flex size-9 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
+              <KeyRound className="size-5" aria-hidden="true" />
+            </div>
+            <DialogTitle>{title}</DialogTitle>
+          </div>
+          <DialogDescription className="pt-1 text-left">
+            {mode === 'edit-metadata' ? (
+              'Metadata only. This cannot change the value.'
+            ) : (
+              <>
+                In <span className="font-mono">{project}</span> /{' '}
+                <span className="font-mono">{environment}</span> at{' '}
+                <span className="font-mono">{normalizePath(folderPath)}</span>
+              </>
+            )}
           </DialogDescription>
         </DialogHeader>
 
-        <form id="secret-form" onSubmit={onSubmit} className="space-y-4" noValidate>
-          <fieldset className="space-y-4" disabled={isSubmitting}>
-            {mode === 'create' ? (
-              <div className="space-y-1.5">
-                <Label htmlFor="secret-key">Key</Label>
-                <Input
-                  id="secret-key"
-                  autoComplete="off"
-                  spellCheck={false}
-                  placeholder="DATABASE_PASSWORD"
-                  aria-invalid={Boolean(errors.key)}
-                  {...register('key', { required: true })}
-                />
-              </div>
-            ) : null}
-
-            {needsValue ? (
-              <>
-                <div className="space-y-1.5">
-                  <Label htmlFor="secret-value">Value</Label>
-                  <div className="flex gap-2">
-                    <Input
-                      id="secret-value"
-                      type={showValue ? 'text' : 'password'}
-                      autoComplete="off"
-                      spellCheck={false}
-                      aria-describedby="secret-value-help"
-                      {...register('value')}
-                    />
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="icon"
-                      aria-label={showValue ? 'Hide the value' : 'Show the value'}
-                      onClick={() => setShowValue((shown) => !shown)}
-                    >
-                      {showValue ? (
-                        <EyeOff className="size-4" aria-hidden="true" />
-                      ) : (
-                        <Eye className="size-4" aria-hidden="true" />
-                      )}
-                    </Button>
-                  </div>
-                  <p id="secret-value-help" className="text-xs text-muted-foreground">
-                    {valueType === VALUE_TYPE_REFERENCE
-                      ? 'A reference points at another secret: ${project/environment/folder/KEY}. Reading it re-checks your grant on the target, at every hop.'
-                      : 'Writing the same value again is a no-op — the service compares checksums and does not create a duplicate version.'}
-                  </p>
-                </div>
-
-                <div className="space-y-1.5">
-                  <Label htmlFor="secret-value-type">Value type</Label>
-                  <Select
-                    value={valueType}
-                    onValueChange={(next) => setField('valueType', next)}
-                  >
-                    <SelectTrigger id="secret-value-type" className="w-full">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value={VALUE_TYPE_OPAQUE}>opaque</SelectItem>
-                      <SelectItem value={VALUE_TYPE_JSON}>json</SelectItem>
-                      <SelectItem value={VALUE_TYPE_REFERENCE}>reference</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-              </>
-            ) : null}
-
-            <div className="space-y-1.5">
-              <Label htmlFor="secret-description">Description</Label>
-              <Textarea id="secret-description" rows={2} {...register('description')} />
-            </div>
-
-            <div className="space-y-1.5">
-              <Label htmlFor="secret-tags">Tags</Label>
-              <Input
-                id="secret-tags"
-                placeholder="database, prod"
+        <form id="secret-form" onSubmit={onSubmit} className="space-y-5" noValidate>
+          <fieldset className="space-y-5" disabled={isSubmitting}>
+            {mode === 'create' && (
+              <FormInputField
+                id="secret-key"
+                label="Key"
+                required
                 autoComplete="off"
-                {...register('tags')}
+                spellCheck={false}
+                placeholder="DATABASE_PASSWORD"
+                error={errors.key?.message}
+                {...register('key', { required: true })}
               />
-              <p className="text-xs text-muted-foreground">Comma-separated.</p>
-            </div>
+            )}
 
-            <div className="grid gap-4 sm:grid-cols-2">
-              <div className="space-y-1.5">
-                <Label htmlFor="secret-expires">Expires at</Label>
-                <Input id="secret-expires" type="datetime-local" {...register('expiresAt')} />
-              </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="secret-keep">Versions to keep</Label>
-                <Input id="secret-keep" type="number" min={1} {...register('keepVersions')} />
-              </div>
+            {needsValue && (
+              <>
+                <FormPasswordField
+                  id="secret-value"
+                  label="Value"
+                  required
+                  spellCheck={false}
+                  error={errors.value?.message}
+                  description={
+                    valueType === VALUE_TYPE_REFERENCE
+                      ? 'A reference points at another secret: ${project/environment/folder/KEY}. Reading it re-checks your grant on the target, at every hop.'
+                      : 'Writing the same value again is a no-op — the service compares checksums and does not create a duplicate version.'
+                  }
+                  {...register('value')}
+                />
+
+                <Controller
+                  control={control}
+                  name="valueType"
+                  render={({ field }) => (
+                    <FormSelectField
+                      id="secret-value-type"
+                      label="Value type"
+                      options={VALUE_TYPE_OPTIONS}
+                      value={field.value}
+                      onValueChange={field.onChange}
+                      error={errors.valueType?.message}
+                    />
+                  )}
+                />
+              </>
+            )}
+
+            <FormTextareaField
+              id="secret-description"
+              label="Description"
+              rows={2}
+              error={errors.description?.message}
+              {...register('description')}
+            />
+
+            <FormInputField
+              id="secret-tags"
+              label="Tags"
+              placeholder="database, prod"
+              autoComplete="off"
+              description="Comma-separated."
+              error={errors.tags?.message}
+              {...register('tags')}
+            />
+
+            <div className="grid gap-5 sm:grid-cols-2">
+              <FormInputField
+                id="secret-expires"
+                label="Expires at"
+                type="datetime-local"
+                error={errors.expiresAt?.message}
+                {...register('expiresAt')}
+              />
+              <FormInputField
+                id="secret-keep"
+                label="Versions to keep"
+                type="number"
+                min={1}
+                description="Retention prunes the oldest beyond this, never the current one."
+                error={errors.keepVersions?.message}
+                {...register('keepVersions')}
+              />
             </div>
           </fieldset>
         </form>
@@ -282,9 +283,7 @@ export function SecretFormDialog({
           <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
             Cancel
           </Button>
-          <Button type="submit" form="secret-form" disabled={isSubmitting}>
-            {isSubmitting ? 'Saving…' : 'Save'}
-          </Button>
+          <FormSubmitButton form="secret-form" isSubmitting={isSubmitting} submitText="Save" />
         </DialogFooter>
       </DialogContent>
     </Dialog>

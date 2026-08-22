@@ -1,27 +1,21 @@
-import type { ReactNode } from 'react'
-import { AlertTriangle, Inbox, Loader2, ShieldOff } from 'lucide-react'
+import { AlertTriangle, Loader2, ShieldOff } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { Skeleton } from '@/components/ui/skeleton'
+import { EmptyState } from '@/components/details'
 import { ApiError, isForbidden } from '@/services/api/client'
 
 /**
- * The four states every list and detail surface in this console has to render.
+ * The not-permitted and error states every surface in this console has to render.
  *
- * They are one module because they must stay consistent: a page that shows a
- * spinner where another shows a skeleton, or that renders an empty table on a
- * permission error, teaches the operator to distrust what they are looking at —
- * which in a vault means distrusting "this secret does not exist".
+ * Two of what used to live here are now maintainerd-auth's, adopted verbatim:
+ * the EMPTY state is `EmptyState` from `@/components/details` (for a panel) and
+ * `DataTableEmpty` from `@/components/data-table` (for a table), and the LOADING
+ * skeleton is `ListSkeleton`. What auth has no equivalent of — and what therefore
+ * stays local — is the 403 treatment below.
+ *
+ * They live in one module because they must stay consistent: a page that renders
+ * an empty table on a permission error teaches the operator to distrust what they
+ * are looking at — which in a vault means distrusting "this secret does not exist".
  */
-
-export function LoadingRows({ rows = 5 }: { rows?: number }) {
-  return (
-    <div className="space-y-2" role="status" aria-live="polite" aria-label="Loading">
-      {Array.from({ length: rows }).map((_, index) => (
-        <Skeleton key={index} className="h-10 w-full" />
-      ))}
-    </div>
-  )
-}
 
 export function InlineLoading({ label = 'Loading' }: { label?: string }) {
   return (
@@ -36,68 +30,62 @@ export function InlineLoading({ label = 'Loading' }: { label?: string }) {
   )
 }
 
-export function EmptyState({
-  title,
-  description,
-  action,
-}: {
-  title: string
-  description?: string
-  action?: ReactNode
-}) {
+/**
+ * "You are authenticated but not granted this."
+ *
+ * IN PLACE, NEVER A REDIRECT. A 403 means the caller IS signed in and simply
+ * lacks that grant, so bouncing it to the identity app would loop them through
+ * sign-in forever and land on the same refusal. And it is never dressed up as
+ * "nothing here": reading metadata and revealing a value are DIFFERENT grants in
+ * this service, so "you may not do this" is a normal, expected answer the
+ * operator has to be able to tell apart from "this is empty" — otherwise they go
+ * hunting for a secret that is right there.
+ */
+export function NotPermitted({ message }: { message?: string }) {
   return (
-    <div className="flex flex-col items-center gap-3 rounded-md border border-dashed p-10 text-center">
-      <Inbox className="size-6 text-muted-foreground" aria-hidden="true" />
-      <div>
-        <p className="font-medium">{title}</p>
-        {description ? <p className="mt-1 text-sm text-muted-foreground">{description}</p> : null}
-      </div>
-      {action}
+    <div role="alert">
+      <EmptyState
+        icon={ShieldOff}
+        title="Not permitted"
+        description={
+          message ??
+          'You do not hold the grant this action requires. Metadata access and value access are separate grants in maintainerd-secret; holding one does not imply the other.'
+        }
+      />
     </div>
   )
 }
 
 /**
- * The error state.
+ * The error state, with the 403 case routed to `NotPermitted`.
  *
- * A 403 is called out separately and never dressed up as "nothing here". Reading
- * metadata and revealing a value are DIFFERENT grants in this service, so "you
- * may not do this" is a normal, expected answer that the operator has to be able
- * to tell apart from "this is empty" — otherwise they go hunting for a secret
- * that is right there.
+ * A retry is offered for everything EXCEPT a 403 — retrying a denial just writes
+ * another denied-access row into the audit trail an incident review reads.
  */
 export function ErrorState({ error, onRetry }: { error: unknown; onRetry?: () => void }) {
-  const forbidden = isForbidden(error)
+  if (isForbidden(error)) {
+    return <NotPermitted message={error instanceof ApiError ? error.message : undefined} />
+  }
+
   const message =
     error instanceof ApiError || error instanceof Error
       ? error.message
       : 'Something went wrong. Please try again.'
 
   return (
-    <div
-      className="flex flex-col items-center gap-3 rounded-md border border-destructive/40 bg-destructive/5 p-10 text-center"
-      role="alert"
-    >
-      {forbidden ? (
-        <ShieldOff className="size-6 text-destructive" aria-hidden="true" />
-      ) : (
-        <AlertTriangle className="size-6 text-destructive" aria-hidden="true" />
-      )}
-      <div>
-        <p className="font-medium">{forbidden ? 'Not permitted' : 'Could not load this'}</p>
-        <p className="mt-1 text-sm text-muted-foreground">{message}</p>
-        {forbidden ? (
-          <p className="mt-2 max-w-prose text-xs text-muted-foreground">
-            Metadata access and value access are separate grants in maintainerd-secret. Holding one
-            does not imply the other.
-          </p>
-        ) : null}
-      </div>
-      {onRetry && !forbidden ? (
-        <Button variant="outline" size="sm" onClick={onRetry}>
-          Try again
-        </Button>
-      ) : null}
+    <div role="alert">
+      <EmptyState
+        icon={AlertTriangle}
+        title="Could not load this"
+        description={message}
+        action={
+          onRetry ? (
+            <Button variant="outline" size="sm" onClick={onRetry}>
+              Try again
+            </Button>
+          ) : undefined
+        }
+      />
     </div>
   )
 }

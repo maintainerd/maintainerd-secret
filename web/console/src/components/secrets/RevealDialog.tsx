@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useLocation } from 'react-router-dom'
-import { Check, Copy, Eye, EyeOff, ShieldAlert } from 'lucide-react'
+import { Check, Copy, Eye, EyeOff, Link2, ShieldAlert } from 'lucide-react'
 import { toast } from 'react-toastify'
 import { Button } from '@/components/ui/button'
 import {
@@ -13,6 +13,7 @@ import {
 } from '@/components/ui/dialog'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
+import { ListingItemNested } from '@/components/details'
 import { InlineLoading, ErrorState } from '@/components/layout/states'
 import { useRevealSecret } from '@/hooks/useSecrets'
 import { base64ByteLength, decodeBase64ToUtf8, isPrintableUtf8 } from '@/lib/base64'
@@ -37,9 +38,15 @@ import type { SecretAddress } from '@/services/api/types'
  *
  * EVERY OPEN IS ONE AUDITED READ. The server records `secret.reveal` against
  * this MRN, with the actor, and a reference chain records `secret.reference`
- * per hop. The dialog says so before the value appears, because an operator who
- * does not know the read is logged cannot make an informed decision about
- * whether to make it.
+ * per hop. The dialog says so — in a destructive `Alert`, above the value, so it
+ * cannot be missed — because an operator who does not know the read is logged
+ * cannot make an informed decision about whether to make it.
+ *
+ * The chrome is maintainerd-auth's: the shared Dialog, Alert and Badge
+ * primitives plus `ListingItemNested` for the reference chain. What is NOT
+ * adopted is auth's `CopyableCode`, which renders its value inline as `<code>`
+ * — that is right for a client id and wrong for a credential, which must stay
+ * masked until the operator asks.
  */
 export function RevealDialog({
   address,
@@ -138,10 +145,15 @@ export function RevealDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>Reveal {address?.key ?? 'secret'}</DialogTitle>
-          <DialogDescription>
+          <div className="flex items-center gap-3">
+            <div className="flex size-9 shrink-0 items-center justify-center rounded-full bg-destructive/10 text-destructive">
+              <Eye className="size-5" aria-hidden="true" />
+            </div>
+            <DialogTitle>Reveal {address?.key ?? 'secret'}</DialogTitle>
+          </div>
+          <DialogDescription className="pt-1 text-left">
             {revealedVersion !== null
               ? `Version ${revealedVersion}`
               : version
@@ -150,7 +162,7 @@ export function RevealDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <Alert>
+        <Alert variant="destructive">
           <ShieldAlert className="size-4" aria-hidden="true" />
           <AlertTitle>This read is recorded</AlertTitle>
           <AlertDescription>
@@ -159,16 +171,16 @@ export function RevealDialog({
           </AlertDescription>
         </Alert>
 
-        {reveal.isPending ? <InlineLoading label="Decrypting" /> : null}
-        {reveal.isError ? <ErrorState error={reveal.error} /> : null}
+        {reveal.isPending && <InlineLoading label="Decrypting" />}
+        {reveal.isError && <ErrorState error={reveal.error} />}
 
-        {value !== null ? (
+        {value !== null && (
           <div className="space-y-3">
             <div className="flex flex-wrap items-center gap-2">
-              {valueType ? <Badge variant="secondary">{valueType}</Badge> : null}
-              {!printable ? (
+              {valueType && <Badge variant="secondary">{valueType}</Badge>}
+              {!printable && (
                 <Badge variant="outline">binary · {base64ByteLength(value)} bytes</Badge>
-              ) : null}
+              )}
             </div>
 
             <div className="rounded-md border bg-muted/40 p-3">
@@ -199,34 +211,35 @@ export function RevealDialog({
               </Button>
             </div>
 
-            {!printable ? (
+            {!printable && (
               <p className="text-xs text-muted-foreground">
                 This value is not UTF-8 text, so it is shown and copied as base64.
               </p>
-            ) : null}
+            )}
 
-            {hops.length > 0 ? (
-              <div className="rounded-md border p-3">
-                <p className="text-sm font-medium">Resolved through references</p>
-                <p className="mt-1 text-xs text-muted-foreground">
+            {hops.length > 0 && (
+              <ListingItemNested className="p-3">
+                <p className="flex items-center gap-1.5 text-sm font-medium">
+                  <Link2 className="size-3.5" aria-hidden="true" />
+                  Resolved through references
+                </p>
+                <p className="text-xs text-muted-foreground">
                   This secret is a pointer. The value came from the chain below, and reading each
                   hop required your own grant on that hop and was audited separately.
                 </p>
-                <ol className="mt-2 space-y-1">
+                <ol className="space-y-1">
                   {hops.map((hop, index) => (
                     <li key={hop} className="font-mono text-xs break-all">
                       {index + 1}. {hop}
                     </li>
                   ))}
                 </ol>
-              </div>
-            ) : null}
+              </ListingItemNested>
+            )}
 
-            {mrn ? (
-              <p className="font-mono text-xs break-all text-muted-foreground">{mrn}</p>
-            ) : null}
+            {mrn && <p className="font-mono text-xs break-all text-muted-foreground">{mrn}</p>}
           </div>
-        ) : null}
+        )}
 
         <DialogFooter>
           <Button variant="outline" onClick={() => handleOpenChange(false)}>

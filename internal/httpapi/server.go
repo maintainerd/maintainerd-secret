@@ -335,14 +335,17 @@ func clientIP(r *http.Request) string {
 // silent default, which for retention means a version history quietly shorter than
 // asked for.
 //
-// THE SIZE BOUND IS APPLIED BY middleware.BodyLimit, on every route, before routing —
-// which is where it has to be, because the setup surface is reachable before any token
-// exists. The MaxBytesReader here is a second wrap at the same or a larger bound, kept
-// so that a handler reached by a path that somehow skipped the middleware (a test
-// calling decode directly, a future router) is still bounded. Wrapping twice is
-// harmless: the inner reader hits its limit first.
+// THE SIZE BOUND IS NOT APPLIED HERE. It belongs to middleware.BodyLimit, which wraps
+// EVERY route before routing — which is where it has to be, because the setup surface
+// is reachable before any token exists and the guard cannot run until the body has
+// started arriving.
+//
+// This function used to wrap the body a second time with a constant, as belt and
+// braces. That was a bug waiting to happen rather than defence in depth: an operator
+// who RAISED HTTP_MAX_BODY_BYTES would have found JSON bodies still refused at the old
+// constant, with nothing in the error saying why. One bound, one place, one number in
+// the error.
 func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, defaultMaxBodyBytes)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {

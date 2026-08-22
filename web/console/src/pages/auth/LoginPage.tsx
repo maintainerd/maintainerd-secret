@@ -1,7 +1,8 @@
 import { useEffect, useRef } from 'react'
 import { Navigate, useLocation } from 'react-router-dom'
-import { KeyRound } from 'lucide-react'
+import { Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { LoginLayout } from '@/components/layout/LoginLayout'
 import { useAuth } from '@/auth/authContext'
 import { safeReturnTo } from '@/auth/oauthFlow'
 
@@ -11,6 +12,10 @@ import { safeReturnTo } from '@/auth/oauthFlow'
  * The redirect fires automatically — an administrative console has exactly one
  * way in, so making the operator click a button first is ceremony. The button is
  * still rendered as the fallback for a browser that blocked the navigation.
+ *
+ * The chrome is maintainerd-auth's `LoginLayout`: brand lockup above a single
+ * card, so the first screen an operator sees belongs to the same product as the
+ * rest of the suite.
  */
 export default function LoginPage() {
   const { mode, signIn } = useAuth()
@@ -29,19 +34,27 @@ export default function LoginPage() {
   if (mode !== 'anonymous') return <Navigate to={returnTo} replace />
 
   return (
-    <div className="flex min-h-screen items-center justify-center p-6">
-      <div className="w-full max-w-sm space-y-4 text-center">
-        <KeyRound className="mx-auto size-8 text-primary" aria-hidden="true" />
-        <div>
-          <h1 className="text-lg font-semibold">maintainerd secret</h1>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Taking you to your identity provider to sign in.
+    <LoginLayout>
+      <div className="space-y-6 text-center">
+        <div className="space-y-2">
+          <h1 className="text-lg font-semibold tracking-tight">Sign in</h1>
+          <p className="text-sm text-muted-foreground">
+            Taking you to your identity provider. Nothing about your session is stored in this
+            browser.
           </p>
+        </div>
+        <div
+          className="flex items-center justify-center gap-2 text-muted-foreground"
+          role="status"
+          aria-live="polite"
+        >
+          <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+          <span className="text-sm">Redirecting…</span>
         </div>
         <Button className="w-full" onClick={() => signIn(returnTo)}>
           Continue to sign in
         </Button>
       </div>
-    </div>
+    </LoginLayout>
   )
 }

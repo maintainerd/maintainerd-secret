@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Trash2 } from 'lucide-react'
+import { MoveRight, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -8,12 +8,20 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
-import { EmptyState, ErrorState, InlineLoading } from '@/components/layout/states'
+import { Label } from '@/components/ui/label'
+import { Separator } from '@/components/ui/separator'
+import {
+  EmptyState,
+  ListingItemCard,
+  ListingItemMeta,
+  ListSkeleton,
+} from '@/components/details'
+import { FormInputField, FormSubmitButton } from '@/components/form'
+import { ErrorState } from '@/components/layout/states'
 import { useCreateImport, useDeleteImport, useImports, useSetImportEnabled } from '@/hooks/useImports'
 import { normalizePath } from '@/lib/paths'
+import { sanitizeName } from '@/lib/validations/regex'
 
 /**
  * Scope imports for one folder.
@@ -26,6 +34,9 @@ import { normalizePath } from '@/lib/paths'
  * surprising otherwise: an import may not cross a TENANT boundary (that would be
  * a supported cross-tenant read path), and an edge that would create a cycle is
  * refused at insert time inside the same transaction.
+ *
+ * Each edge renders as maintainerd-auth's `ListingItemCard`, the same row shape
+ * its detail tabs use for linked clients and assigned roles.
  */
 export function ImportsDialog({
   project,
@@ -50,7 +61,8 @@ export function ImportsDialog({
   const [sourceEnvironment, setSourceEnvironment] = useState('')
   const [sourceFolder, setSourceFolder] = useState('/')
 
-  const add = async () => {
+  const add = async (event: React.FormEvent) => {
+    event.preventDefault()
     await createImport.mutateAsync({
       project,
       environment,
@@ -68,115 +80,122 @@ export function ImportsDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-xl">
+      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-xl">
         <DialogHeader>
-          <DialogTitle>Imports for {path}</DialogTitle>
-          <DialogDescription>
+          <div className="flex items-center gap-3">
+            <div className="flex size-9 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
+              <MoveRight className="size-5" aria-hidden="true" />
+            </div>
+            <DialogTitle>Imports for {path}</DialogTitle>
+          </div>
+          <DialogDescription className="pt-1 text-left">
             Secrets from an imported scope resolve here as if they were local. Resolution order
             follows the position of each edge.
           </DialogDescription>
         </DialogHeader>
 
-        {importsQuery.isLoading ? <InlineLoading /> : null}
-        {importsQuery.isError ? (
+        {importsQuery.isLoading && <ListSkeleton rows={2} />}
+        {importsQuery.isError && (
           <ErrorState error={importsQuery.error} onRetry={() => void importsQuery.refetch()} />
-        ) : null}
+        )}
 
-        {!importsQuery.isLoading && !importsQuery.isError && rows.length === 0 ? (
+        {!importsQuery.isLoading && !importsQuery.isError && rows.length === 0 && (
           <EmptyState
+            icon={MoveRight}
             title="No imports"
             description="This folder resolves only its own secrets."
           />
-        ) : null}
+        )}
 
-        {rows.length > 0 ? (
+        {rows.length > 0 && (
           <ul className="space-y-2">
             {rows.map((edge) => (
-              <li
-                key={edge.import_uuid}
-                className="flex flex-wrap items-center justify-between gap-3 rounded-md border p-3"
-              >
-                <div className="min-w-0">
-                  <p className="truncate font-mono text-sm">
+              <li key={edge.import_uuid}>
+                <ListingItemCard
+                  icon={MoveRight}
+                  action={
+                    <div className="flex items-center gap-3">
+                      <div className="flex items-center gap-2">
+                        <Switch
+                          id={`import-${edge.import_uuid}`}
+                          checked={edge.enabled}
+                          onCheckedChange={(next) =>
+                            setEnabled.mutate({
+                              importUuid: edge.import_uuid,
+                              enabled: next,
+                              position: edge.position,
+                            })
+                          }
+                          aria-label={edge.enabled ? 'Disable this import' : 'Enable this import'}
+                        />
+                        <Label htmlFor={`import-${edge.import_uuid}`} className="text-xs">
+                          {edge.enabled ? 'Enabled' : 'Disabled'}
+                        </Label>
+                      </div>
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label="Remove this import"
+                        onClick={() => removeImport.mutate(edge.import_uuid)}
+                      >
+                        <Trash2 className="size-4" aria-hidden="true" />
+                      </Button>
+                    </div>
+                  }
+                >
+                  <p className="truncate font-mono text-sm font-medium">
                     {edge.source_project}/{edge.source_environment}
                     {edge.source_folder_path}
                   </p>
-                  <p className="text-xs text-muted-foreground">position {edge.position}</p>
-                </div>
-                <div className="flex items-center gap-3">
-                  <div className="flex items-center gap-2">
-                    <Switch
-                      id={`import-${edge.import_uuid}`}
-                      checked={edge.enabled}
-                      onCheckedChange={(next) =>
-                        setEnabled.mutate({
-                          importUuid: edge.import_uuid,
-                          enabled: next,
-                          position: edge.position,
-                        })
-                      }
-                      aria-label={edge.enabled ? 'Disable this import' : 'Enable this import'}
-                    />
-                    <Label htmlFor={`import-${edge.import_uuid}`} className="text-xs">
-                      {edge.enabled ? 'Enabled' : 'Disabled'}
-                    </Label>
-                  </div>
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    aria-label="Remove this import"
-                    onClick={() => removeImport.mutate(edge.import_uuid)}
-                  >
-                    <Trash2 className="size-4" aria-hidden="true" />
-                  </Button>
-                </div>
+                  <ListingItemMeta>
+                    <span>position {edge.position}</span>
+                  </ListingItemMeta>
+                </ListingItemCard>
               </li>
             ))}
           </ul>
-        ) : null}
+        )}
 
-        <div className="space-y-3 border-t pt-4">
-          <h3 className="text-sm font-medium">Add an import</h3>
-          <div className="grid gap-3 sm:grid-cols-3">
-            <div className="space-y-1.5">
-              <Label htmlFor="import-source-project">Source project</Label>
-              <Input
-                id="import-source-project"
-                value={sourceProject}
-                autoComplete="off"
-                onChange={(event) => setSourceProject(event.target.value)}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="import-source-environment">Source environment</Label>
-              <Input
-                id="import-source-environment"
-                value={sourceEnvironment}
-                autoComplete="off"
-                onChange={(event) => setSourceEnvironment(event.target.value)}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="import-source-folder">Source folder</Label>
-              <Input
-                id="import-source-folder"
-                value={sourceFolder}
-                autoComplete="off"
-                onChange={(event) => setSourceFolder(event.target.value)}
-              />
-            </div>
+        <Separator />
+
+        <form onSubmit={add} className="space-y-4" noValidate>
+          <h3 className="text-sm font-semibold">Add an import</h3>
+          <div className="grid gap-5 sm:grid-cols-3">
+            <FormInputField
+              id="import-source-project"
+              label="Source project"
+              required
+              value={sourceProject}
+              autoComplete="off"
+              onChange={(event) => setSourceProject(sanitizeName(event.target.value))}
+            />
+            <FormInputField
+              id="import-source-environment"
+              label="Source environment"
+              required
+              value={sourceEnvironment}
+              autoComplete="off"
+              onChange={(event) => setSourceEnvironment(sanitizeName(event.target.value))}
+            />
+            <FormInputField
+              id="import-source-folder"
+              label="Source folder"
+              value={sourceFolder}
+              autoComplete="off"
+              className="font-mono"
+              onChange={(event) => setSourceFolder(event.target.value)}
+            />
           </div>
           <p className="text-xs text-muted-foreground">
             The source must live in this tenant. An edge that would create a cycle is refused.
           </p>
-          <Button
-            size="sm"
-            onClick={() => void add()}
-            disabled={createImport.isPending || !sourceProject.trim() || !sourceEnvironment.trim()}
-          >
-            {createImport.isPending ? 'Adding…' : 'Add import'}
-          </Button>
-        </div>
+          <FormSubmitButton
+            isSubmitting={createImport.isPending}
+            disabled={!sourceProject.trim() || !sourceEnvironment.trim()}
+            submitText="Add import"
+            submittingText="Adding…"
+          />
+        </form>
       </DialogContent>
     </Dialog>
   )

@@ -12,8 +12,20 @@ import type { Folder } from '@/services/api/types'
  * idea of the hierarchy to drift from the vault's.
  *
  * Indentation comes from the path depth, and the list is a `tree` role so a
- * screen reader announces the nesting the indentation implies.
+ * screen reader announces the nesting the indentation implies. The item styling
+ * reuses maintainerd-auth's sidebar treatment (`NavMain`'s accent-on-active,
+ * muted-on-idle, heavier icon stroke when active) so the tree reads as
+ * navigation rather than as a widget of its own.
  */
+
+const itemClass =
+  'flex w-full items-center gap-2 rounded-md py-1.5 pr-2 text-left text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring'
+
+const idleClass =
+  'text-sidebar-foreground/75 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground'
+
+const activeClass = 'bg-sidebar-accent font-semibold text-sidebar-accent-foreground'
+
 export function FolderTree({
   folders,
   selected,
@@ -42,17 +54,16 @@ export function FolderTree({
               aria-level={depth + 1}
               onClick={() => onSelect(path)}
               style={{ paddingLeft: `${depth * 12 + 8}px` }}
-              className={cn(
-                'flex w-full items-center gap-2 rounded-md py-1.5 pr-2 text-left text-sm transition-colors',
-                active
-                  ? 'bg-accent font-medium text-accent-foreground'
-                  : 'text-muted-foreground hover:bg-accent/60 hover:text-foreground',
-              )}
+              className={cn(itemClass, active ? activeClass : idleClass)}
             >
               {onTrail ? (
-                <FolderOpen className="size-4 shrink-0" aria-hidden="true" />
+                <FolderOpen
+                  className="size-4 shrink-0"
+                  strokeWidth={active ? 2.25 : 1.5}
+                  aria-hidden="true"
+                />
               ) : (
-                <FolderIcon className="size-4 shrink-0" aria-hidden="true" />
+                <FolderIcon className="size-4 shrink-0" strokeWidth={1.5} aria-hidden="true" />
               )}
               <span className="truncate">{folderName(path)}</span>
             </button>

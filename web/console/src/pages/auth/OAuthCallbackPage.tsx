@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { Button } from '@/components/ui/button'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { LoginLayout } from '@/components/layout/LoginLayout'
 import { AppLoadingScreen } from '@/components/layout/AppLoadingScreen'
 import { useAuth } from '@/auth/authContext'
 import { exchangeAuthorizationCode } from '@/auth/oauthClient'
@@ -70,15 +72,20 @@ export default function OAuthCallbackPage() {
 
   if (error) {
     return (
-      <div className="flex min-h-screen items-center justify-center p-6">
-        <div className="w-full max-w-sm space-y-4 text-center" role="alert">
-          <h1 className="text-lg font-semibold">Sign-in failed</h1>
-          <p className="text-sm text-muted-foreground">{error}</p>
+      <LoginLayout>
+        <div className="space-y-5">
+          <div className="space-y-2 text-center">
+            <h1 className="text-lg font-semibold tracking-tight">Sign-in failed</h1>
+          </div>
+          <Alert variant="destructive">
+            <AlertTitle>Could not complete sign-in</AlertTitle>
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
           <Button className="w-full" onClick={() => navigate('/login', { replace: true })}>
             Try again
           </Button>
         </div>
-      </div>
+      </LoginLayout>
     )
   }
 

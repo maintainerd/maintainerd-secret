@@ -1,8 +1,12 @@
 import { Component, type ErrorInfo, type ReactNode } from 'react'
-import { Button } from '@/components/ui/button'
 
 /**
  * Last-resort render guard.
+ *
+ * Laid out like maintainerd-auth's `components/ErrorBoundary.tsx` — the same
+ * `data-console-auth-shell` full-height panel and plain `<button>` reload
+ * control, so it renders correctly even if the component tree (and therefore the
+ * Button primitive's providers) is what failed.
  *
  * It shows the error's MESSAGE and nothing else — no stack, no component tree,
  * no props. A crash inside a reveal or a put would otherwise be an excellent way
@@ -35,22 +39,33 @@ export class ErrorBoundary extends Component<Props, State> {
   componentDidCatch(error: Error, info: ErrorInfo): void {
     // Deliberately minimal: the message and the component stack only. Never the
     // error object, whose `config`/`response` on an axios failure would carry a
-    // request body.
+    // request body — and a put body carries a plaintext value.
     console.error('[console] render error', error.message, info.componentStack)
   }
 
-  render() {
+  render(): ReactNode {
     if (this.state.error) {
       return (
-        <div className="flex min-h-[60vh] flex-col items-center justify-center gap-4 p-6 text-center">
-          <div>
-            <h1 className="text-lg font-semibold">Something broke</h1>
-            <p className="mt-1 text-sm text-muted-foreground">{this.state.error.message}</p>
+        <div
+          role="alert"
+          data-console-auth-shell
+          className="flex min-h-svh flex-col items-center justify-center gap-6 bg-background px-4 text-center text-foreground"
+        >
+          <div className="flex flex-col items-center gap-3">
+            <h1 className="text-2xl font-semibold tracking-tight">Something went wrong</h1>
+            <p className="max-w-sm text-sm text-muted-foreground">{this.state.error.message}</p>
           </div>
-          <Button onClick={() => this.setState({ error: null })}>Try again</Button>
+          <button
+            type="button"
+            onClick={() => this.setState({ error: null })}
+            className="inline-flex h-9 items-center justify-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground shadow transition-colors hover:bg-primary/90"
+          >
+            Try again
+          </button>
         </div>
       )
     }
+
     return this.props.children
   }
 }

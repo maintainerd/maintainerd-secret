@@ -1,20 +1,13 @@
 import { useMemo, useState } from 'react'
-import { Eye, FolderPlus, Info, MoveRight, Plus, Trash2 } from 'lucide-react'
-import { Badge } from '@/components/ui/badge'
+import { FolderPlus, FolderTree as FolderTreeIcon, MoveRight, Plus } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table'
 import { PageHeader } from '@/components/layout/PageHeader'
-import { EmptyState, ErrorState, LoadingRows } from '@/components/layout/states'
+import { ErrorState } from '@/components/layout/states'
+import { EmptyState, ListSkeleton } from '@/components/details'
+import { ResourceListing } from '@/components/data-table'
 import { ConfirmDialog } from '@/components/ConfirmDialog'
 import { FolderBreadcrumb } from '@/components/secrets/FolderBreadcrumb'
 import { FolderTree } from '@/components/secrets/FolderTree'
@@ -23,11 +16,11 @@ import { ImportsDialog } from '@/components/secrets/ImportsDialog'
 import { RevealDialog } from '@/components/secrets/RevealDialog'
 import { SecretDetailDialog } from '@/components/secrets/SecretDetailDialog'
 import { SecretFormDialog, type SecretFormMode } from '@/components/secrets/SecretFormDialog'
+import { buildSecretColumns } from './components/secretColumns'
 import { useFolders } from '@/hooks/useFolders'
 import { useDeleteSecret, useSecrets } from '@/hooks/useSecrets'
 import { useScope } from '@/context/scopeContext'
-import { formatDateTime, formatRelative, isExpired } from '@/lib/formatDate'
-import { ROOT_PATH, isDirectChildOf, normalizePath } from '@/lib/paths'
+import { ROOT_PATH, normalizePath } from '@/lib/paths'
 import type { SecretAddress, SecretMeta } from '@/services/api/types'
 
 /**
@@ -41,13 +34,19 @@ import type { SecretAddress, SecretMeta } from '@/services/api/types'
  *  2. IT KEEPS THE FOLDER PATH AND THE SELECTED KEY OUT OF THE URL. Browsing
  *     state lives in component state, so a secret's address never reaches
  *     browser history or a referer header. That is the same reason the service
- *     made reveal a POST.
+ *     made reveal a POST — and the reason `ResourceListing` here is given no
+ *     `urlKey`, so it does not mirror its search term into the query string
+ *     either (an operator searching for "STRIPE_LIVE_KEY" would otherwise put
+ *     that in history).
+ *
+ * Everything else is maintainerd-auth's listing shape: a `PageHeader`, a
+ * `ResourceListing` (toolbar → table → pagination) and the shared row-actions
+ * menu, laid out full-width because the tree needs a column of its own.
  */
 export default function BrowsePage() {
   const { project, environment, loading: scopeLoading, error: scopeError } = useScope()
   const [folderPath, setFolderPath] = useState<string>(ROOT_PATH)
   const [includeSubfolders, setIncludeSubfolders] = useState(false)
-  const [search, setSearch] = useState('')
 
   const [formMode, setFormMode] = useState<SecretFormMode>('create')
   const [formSecret, setFormSecret] = useState<SecretMeta | null>(null)
@@ -72,26 +71,9 @@ export default function BrowsePage() {
     Boolean(project && environment),
   )
   const deleteSecret = useDeleteSecret()
-
-  const rows = useMemo(() => {
-    const all = secrets.data?.rows ?? []
-    const scoped = includeSubfolders
-      ? all
-      : all.filter((row) => normalizePath(row.folder_path) === normalizePath(folderPath))
-    const needle = search.trim().toLowerCase()
-    if (!needle) return scoped
-    return scoped.filter(
-      (row) =>
-        row.key.toLowerCase().includes(needle) ||
-        row.description.toLowerCase().includes(needle) ||
-        row.tags.some((tag) => tag.toLowerCase().includes(needle)),
-    )
-  }, [secrets.data, includeSubfolders, folderPath, search])
-
-  const childFolders = useMemo(
-    () => (folders.data ?? []).filter((folder) => isDirectChildOf(folder.path, folderPath)),
-    [folders.data, folderPath],
-  )
+  // `mutateAsync` is stable across renders; the mutation object is not. Depending
+  // on the object below would rebuild the column defs on every render.
+  const deleteSecretAsync = deleteSecret.mutateAsync
 
   const addressOf = (secret: SecretMeta): SecretAddress => ({
     project: project ?? '',
@@ -100,6 +82,39 @@ export default function BrowsePage() {
     key: secret.key,
   })
 
+  const rows = useMemo(() => {
+    const all = secrets.data?.rows ?? []
+    if (includeSubfolders) return all
+    return all.filter((row) => normalizePath(row.folder_path) === normalizePath(folderPath))
+  }, [secrets.data, includeSubfolders, folderPath])
+
+  const columns = useMemo(
+    () =>
+      buildSecretColumns(
+        {
+          onReveal: (secret) => setRevealAddress(addressOf(secret)),
+          onDetails: (secret) => setDetailAddress(addressOf(secret)),
+          onNewVersion: (secret) => {
+            setFormMode('new-version')
+            setFormSecret(secret)
+            setFormOpen(true)
+          },
+          onEditMetadata: (secret) => {
+            setFormMode('edit-metadata')
+            setFormSecret(secret)
+            setFormOpen(true)
+          },
+          onDelete: async (secret) => {
+            await deleteSecretAsync({ address: addressOf(secret) })
+          },
+        },
+        { showFolder: includeSubfolders },
+      ),
+    // `addressOf` closes over the scope, which is what actually has to be fresh.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [includeSubfolders, project, environment, deleteSecretAsync],
+  )
+
   if (scopeError) {
     return <ErrorState error={scopeError} />
   }
@@ -107,6 +122,7 @@ export default function BrowsePage() {
   if (!scopeLoading && (!project || !environment)) {
     return (
       <EmptyState
+        icon={FolderTreeIcon}
         title="No project or environment"
         description="Create a project and an environment before storing secrets."
       />
@@ -117,6 +133,7 @@ export default function BrowsePage() {
     <div className="space-y-6">
       <PageHeader
         title="Secrets"
+        icon={FolderTreeIcon}
         description={
           project && environment ? (
             <span>
@@ -128,11 +145,21 @@ export default function BrowsePage() {
         }
         actions={
           <>
-            <Button variant="outline" size="sm" onClick={() => setImportsOpen(true)}>
+            <Button
+              data-md-action-button
+              variant="outline"
+              size="sm"
+              onClick={() => setImportsOpen(true)}
+            >
               <MoveRight className="size-4" aria-hidden="true" />
               Imports
             </Button>
-            <Button variant="outline" size="sm" onClick={() => setCreateFolderOpen(true)}>
+            <Button
+              data-md-action-button
+              variant="outline"
+              size="sm"
+              onClick={() => setCreateFolderOpen(true)}
+            >
               <FolderPlus className="size-4" aria-hidden="true" />
               New folder
             </Button>
@@ -151,199 +178,68 @@ export default function BrowsePage() {
         }
       />
 
-      <div className="grid gap-6 lg:grid-cols-[240px_minmax(0,1fr)]">
-        <aside className="space-y-3">
-          <div className="flex items-center justify-between">
-            <h2 className="text-sm font-medium">Folders</h2>
-            {folderPath !== ROOT_PATH ? (
-              <Button variant="ghost" size="sm" onClick={() => setMoveFolderOpen(true)}>
-                Move
-              </Button>
-            ) : null}
-          </div>
-          {folders.isLoading ? <LoadingRows rows={4} /> : null}
-          {folders.isError ? (
-            <ErrorState error={folders.error} onRetry={() => void folders.refetch()} />
-          ) : null}
-          {folders.data ? (
-            <FolderTree
-              folders={folders.data}
-              selected={folderPath}
-              onSelect={setFolderPath}
-            />
-          ) : null}
-        </aside>
-
-        <section className="min-w-0 space-y-4">
-          <FolderBreadcrumb path={folderPath} onNavigate={setFolderPath} />
-
-          <div className="flex flex-wrap items-center gap-4">
-            <div className="min-w-48 flex-1">
-              <Label htmlFor="secret-search" className="sr-only">
-                Filter secrets
-              </Label>
-              <Input
-                id="secret-search"
-                placeholder="Filter by key, description or tag"
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-              />
-            </div>
-            <div className="flex items-center gap-2">
-              <Switch
-                id="include-subfolders"
-                checked={includeSubfolders}
-                onCheckedChange={setIncludeSubfolders}
-              />
-              <Label htmlFor="include-subfolders" className="text-sm">
-                Include subfolders
-              </Label>
-            </div>
-          </div>
-
-          {childFolders.length > 0 && !includeSubfolders ? (
-            <div className="flex flex-wrap gap-2">
-              {childFolders.map((folder) => (
-                <Button
-                  key={folder.folder_uuid}
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setFolderPath(folder.path)}
-                >
-                  {folder.name}
+      <div className="grid gap-6 lg:grid-cols-[260px_minmax(0,1fr)]">
+        <Card className="h-fit py-4">
+          <CardHeader className="px-4">
+            <div className="flex items-center justify-between gap-2">
+              <CardTitle className="text-base">Folders</CardTitle>
+              {folderPath !== ROOT_PATH && (
+                <Button variant="ghost" size="sm" onClick={() => setMoveFolderOpen(true)}>
+                  Move
                 </Button>
-              ))}
+              )}
             </div>
-          ) : null}
+          </CardHeader>
+          <CardContent className="px-2">
+            {folders.isLoading && <ListSkeleton rows={3} />}
+            {folders.isError && (
+              <ErrorState error={folders.error} onRetry={() => void folders.refetch()} />
+            )}
+            {folders.data && (
+              <FolderTree folders={folders.data} selected={folderPath} onSelect={setFolderPath} />
+            )}
+          </CardContent>
+        </Card>
 
-          {secrets.isLoading ? <LoadingRows /> : null}
-          {secrets.isError ? (
-            <ErrorState error={secrets.error} onRetry={() => void secrets.refetch()} />
-          ) : null}
+        <Card className="min-w-0 py-6">
+          <CardContent className="flex min-w-0 flex-col gap-4 px-6">
+            <FolderBreadcrumb path={folderPath} onNavigate={setFolderPath} />
 
-          {!secrets.isLoading && !secrets.isError && rows.length === 0 ? (
-            <EmptyState
-              title="No secrets here"
-              description={
-                search
-                  ? 'Nothing in this folder matches that filter.'
-                  : 'This folder is empty. Create a secret to get started.'
+            <ResourceListing<SecretMeta>
+              rows={rows}
+              columns={columns}
+              defaultSort={[{ id: 'key', desc: false }]}
+              searchFields={(row) => [row.key, row.description, row.tags.join(' ')]}
+              searchPlaceholder="Filter by key, description or tag"
+              isLoading={secrets.isLoading}
+              error={secrets.error}
+              onRowClick={(secret) => setDetailAddress(addressOf(secret))}
+              emptyTitle="No secrets here"
+              emptyDescription="This folder is empty. Create a secret to get started."
+              onCreate={() => {
+                setFormMode('create')
+                setFormSecret(null)
+                setFormOpen(true)
+              }}
+              createLabel="New secret"
+              extraActions={
+                <div className="flex items-center gap-2">
+                  <Switch
+                    id="include-subfolders"
+                    checked={includeSubfolders}
+                    onCheckedChange={setIncludeSubfolders}
+                  />
+                  <Label htmlFor="include-subfolders" className="text-sm whitespace-nowrap">
+                    Include subfolders
+                  </Label>
+                </div>
               }
             />
-          ) : null}
-
-          {rows.length > 0 ? (
-            <div className="overflow-x-auto">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Key</TableHead>
-                    {includeSubfolders ? <TableHead>Folder</TableHead> : null}
-                    <TableHead>Tags</TableHead>
-                    <TableHead>Version</TableHead>
-                    <TableHead>Rotated</TableHead>
-                    <TableHead>Expires</TableHead>
-                    <TableHead className="text-right">Actions</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {rows.map((secret) => (
-                    <TableRow key={secret.secret_uuid}>
-                      <TableCell className="max-w-56">
-                        <div className="truncate font-medium">{secret.key}</div>
-                        {secret.description ? (
-                          <div className="truncate text-xs text-muted-foreground">
-                            {secret.description}
-                          </div>
-                        ) : null}
-                      </TableCell>
-                      {includeSubfolders ? (
-                        <TableCell className="font-mono text-xs">
-                          {normalizePath(secret.folder_path)}
-                        </TableCell>
-                      ) : null}
-                      <TableCell>
-                        <div className="flex flex-wrap gap-1">
-                          {secret.tags.map((tag) => (
-                            <Badge key={tag} variant="outline">
-                              {tag}
-                            </Badge>
-                          ))}
-                        </div>
-                      </TableCell>
-                      <TableCell>{secret.current_version}</TableCell>
-                      <TableCell className="text-sm text-muted-foreground">
-                        {formatRelative(secret.rotated_at)}
-                      </TableCell>
-                      <TableCell className="text-sm">
-                        {secret.expires_at ? (
-                          <span className={isExpired(secret.expires_at) ? 'text-destructive' : ''}>
-                            {formatDateTime(secret.expires_at)}
-                          </span>
-                        ) : (
-                          <span className="text-muted-foreground">—</span>
-                        )}
-                      </TableCell>
-                      <TableCell className="text-right">
-                        <div className="flex justify-end gap-1">
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => setRevealAddress(addressOf(secret))}
-                          >
-                            <Eye className="size-4" aria-hidden="true" />
-                            Reveal
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => setDetailAddress(addressOf(secret))}
-                          >
-                            <Info className="size-4" aria-hidden="true" />
-                            Details
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => {
-                              setFormMode('new-version')
-                              setFormSecret(secret)
-                              setFormOpen(true)
-                            }}
-                          >
-                            New version
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => {
-                              setFormMode('edit-metadata')
-                              setFormSecret(secret)
-                              setFormOpen(true)
-                            }}
-                          >
-                            Edit
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="icon-sm"
-                            aria-label={`Delete ${secret.key}`}
-                            onClick={() => setDeleteTarget(secret)}
-                          >
-                            <Trash2 className="size-4" aria-hidden="true" />
-                          </Button>
-                        </div>
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
-          ) : null}
-        </section>
+          </CardContent>
+        </Card>
       </div>
 
-      {project && environment ? (
+      {project && environment && (
         <>
           <SecretFormDialog
             mode={formMode}
@@ -378,7 +274,7 @@ export default function BrowsePage() {
             onOpenChange={setImportsOpen}
           />
         </>
-      ) : null}
+      )}
 
       <RevealDialog
         address={revealAddress}
