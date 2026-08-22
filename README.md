@@ -1,4 +1,19 @@
-# maintainerd-secret
+<div align="left">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/maintainerd-icon-light.svg">
+    <img src=".github/assets/maintainerd-icon-dark.svg" alt="" height="70" align="left">
+  </picture>
+  <h1>&nbsp;Maintainerd Secret</h1>
+</div>
+
+<br clear="left">
+
+[![Release](https://img.shields.io/github/v/release/maintainerd/maintainerd-secret?logo=github&label=release&color=blue)](https://github.com/maintainerd/maintainerd-secret/releases/latest)
+[![CI](https://github.com/maintainerd/maintainerd-secret/actions/workflows/ci.yml/badge.svg)](https://github.com/maintainerd/maintainerd-secret/actions/workflows/ci.yml)
+[![Security](https://github.com/maintainerd/maintainerd-secret/actions/workflows/security.yml/badge.svg)](https://github.com/maintainerd/maintainerd-secret/actions/workflows/security.yml)
+[![Licenses](https://github.com/maintainerd/maintainerd-secret/actions/workflows/licenses.yml/badge.svg)](https://github.com/maintainerd/maintainerd-secret/actions/workflows/licenses.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/maintainerd/maintainerd-secret/badge)](https://scorecard.dev/viewer/?uri=github.com/maintainerd/maintainerd-secret)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
 maintainerd's **own** secret manager — a first-party vault, never a facade over
 anyone else's. Vault / AWS Secrets Manager / Azure Key Vault / GCP SM are
