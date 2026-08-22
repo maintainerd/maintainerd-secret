@@ -7,8 +7,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/maintainerd/secret/internal/api"
 	"github.com/maintainerd/secret/internal/crypto"
 	"github.com/maintainerd/secret/internal/platform/response"
@@ -112,7 +110,10 @@ func (s *Server) listVersions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	page, limit := response.PageParams(r)
-	versions, total, err := s.api.ListVersions(r.Context(), c, addr, page, limit)
+	versions, total, err := s.api.ListVersions(r.Context(), c, api.ListVersionsInput{
+		Address:    addr,
+		Pagination: api.Pagination{Page: page, Limit: limit},
+	})
 	if err != nil {
 		response.ServiceError(w, r, "could not list versions", err)
 		return
@@ -134,7 +135,11 @@ func (s *Server) listDeletedSecrets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	page, limit := response.PageParams(r)
-	deleted, err := s.api.ListDeletedSecrets(r.Context(), c, project, environment, page, limit)
+	deleted, err := s.api.ListDeletedSecrets(r.Context(), c, api.ListDeletedSecretsInput{
+		Project:     project,
+		Environment: environment,
+		Pagination:  api.Pagination{Page: page, Limit: limit},
+	})
 	if err != nil {
 		response.ServiceError(w, r, "could not list deleted secrets", err)
 		return
@@ -443,25 +448,20 @@ func (s *Server) deleteSecret(w http.ResponseWriter, r *http.Request) {
 	response.OK(w, deleted, "secret deleted; it can be restored until destroy_after")
 }
 
-type secretUUIDRequest struct {
-	SecretUUID string `json:"secret_uuid"`
-}
+// The restore and destroy bodies ARE api.SecretUUIDInput — decoded straight into the
+// shared DTO rather than into a transport twin, so the UUID rule that refuses a
+// malformed id is the same one the gRPC surface applies.
 
 func (s *Server) restoreSecret(w http.ResponseWriter, r *http.Request) {
 	c, ok := s.caller(w, r)
 	if !ok {
 		return
 	}
-	var req secretUUIDRequest
+	var req api.SecretUUIDInput
 	if !decode(w, r, &req) {
 		return
 	}
-	id, err := uuid.Parse(req.SecretUUID)
-	if err != nil {
-		response.Error(w, http.StatusBadRequest, "secret_uuid must be a UUID")
-		return
-	}
-	meta, err := s.api.RestoreSecret(r.Context(), c, id)
+	meta, err := s.api.RestoreSecret(r.Context(), c, req)
 	if err != nil {
 		response.ServiceError(w, r, "could not restore the secret", err)
 		return
@@ -474,16 +474,11 @@ func (s *Server) destroySecret(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var req secretUUIDRequest
+	var req api.SecretUUIDInput
 	if !decode(w, r, &req) {
 		return
 	}
-	id, err := uuid.Parse(req.SecretUUID)
-	if err != nil {
-		response.Error(w, http.StatusBadRequest, "secret_uuid must be a UUID")
-		return
-	}
-	if err := s.api.DestroySecret(r.Context(), c, id); err != nil {
+	if err := s.api.DestroySecret(r.Context(), c, req); err != nil {
 		response.ServiceError(w, r, "could not destroy the secret", err)
 		return
 	}

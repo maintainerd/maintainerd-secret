@@ -4,7 +4,6 @@ import (
 	"context"
 	"time"
 
-	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -42,7 +41,9 @@ func (s *Service) ListProjects(ctx context.Context, req *secretv1.ListProjectsRe
 		return nil, err
 	}
 	page, limit := pageOf(req.GetPage())
-	projects, total, err := s.api.ListProjects(ctx, c, page, limit)
+	projects, total, err := s.api.ListProjects(ctx, c, api.ListProjectsInput{
+		Pagination: api.Pagination{Page: page, Limit: limit},
+	})
 	if err != nil {
 		return nil, toStatus(err, "list projects")
 	}
@@ -70,7 +71,7 @@ func (s *Service) UpdateProject(ctx context.Context, req *secretv1.UpdateProject
 	if err != nil {
 		return nil, err
 	}
-	project, err := s.api.UpdateProject(ctx, c, store.UpdateProjectInput{
+	project, err := s.api.UpdateProject(ctx, c, api.UpdateProjectInput{
 		Slug:        req.GetSlug(),
 		Name:        req.GetName(),
 		Description: req.GetDescription(),
@@ -148,7 +149,7 @@ func (s *Service) UpdateEnvironment(ctx context.Context, req *secretv1.UpdateEnv
 	if err != nil {
 		return nil, err
 	}
-	env, err := s.api.UpdateEnvironment(ctx, c, store.UpdateEnvironmentInput{
+	env, err := s.api.UpdateEnvironment(ctx, c, api.UpdateEnvironmentInput{
 		Project:     req.GetProject(),
 		Slug:        req.GetSlug(),
 		Name:        req.GetName(),
@@ -182,7 +183,11 @@ func (s *Service) CreateFolder(ctx context.Context, req *secretv1.CreateFolderRe
 	if err != nil {
 		return nil, err
 	}
-	folder, err := s.api.CreateFolder(ctx, c, req.GetProject(), req.GetEnvironment(), req.GetPath())
+	folder, err := s.api.CreateFolder(ctx, c, api.CreateFolderInput{
+		Project:     req.GetProject(),
+		Environment: req.GetEnvironment(),
+		Path:        req.GetPath(),
+	})
 	if err != nil {
 		return nil, toStatus(err, "create folder")
 	}
@@ -194,7 +199,11 @@ func (s *Service) ListFolders(ctx context.Context, req *secretv1.ListFoldersRequ
 	if err != nil {
 		return nil, err
 	}
-	folders, err := s.api.ListFolders(ctx, c, req.GetProject(), req.GetEnvironment(), req.GetPrefix())
+	folders, err := s.api.ListFolders(ctx, c, api.ListFoldersInput{
+		Project:     req.GetProject(),
+		Environment: req.GetEnvironment(),
+		Prefix:      req.GetPrefix(),
+	})
 	if err != nil {
 		return nil, toStatus(err, "list folders")
 	}
@@ -210,7 +219,12 @@ func (s *Service) MoveFolder(ctx context.Context, req *secretv1.MoveFolderReques
 	if err != nil {
 		return nil, err
 	}
-	folder, err := s.api.MoveFolder(ctx, c, req.GetProject(), req.GetEnvironment(), req.GetFrom(), req.GetTo())
+	folder, err := s.api.MoveFolder(ctx, c, api.MoveFolderInput{
+		Project:     req.GetProject(),
+		Environment: req.GetEnvironment(),
+		From:        req.GetFrom(),
+		To:          req.GetTo(),
+	})
 	if err != nil {
 		return nil, toStatus(err, "move folder")
 	}
@@ -226,7 +240,12 @@ func (s *Service) DeleteFolder(ctx context.Context, req *secretv1.DeleteFolderRe
 	if err != nil {
 		return nil, err
 	}
-	deleted, err := s.api.DeleteFolder(ctx, c, req.GetProject(), req.GetEnvironment(), req.GetPath(), window)
+	deleted, err := s.api.DeleteFolder(ctx, c, api.DeleteFolderInput{
+		Project:        req.GetProject(),
+		Environment:    req.GetEnvironment(),
+		Path:           req.GetPath(),
+		RecoveryWindow: window,
+	})
 	if err != nil {
 		return nil, toStatus(err, "delete folder")
 	}
@@ -262,7 +281,11 @@ func (s *Service) ListImports(ctx context.Context, req *secretv1.ListImportsRequ
 	if err != nil {
 		return nil, err
 	}
-	edges, err := s.api.ListImports(ctx, c, req.GetProject(), req.GetEnvironment(), req.GetFolderPath())
+	edges, err := s.api.ListImports(ctx, c, api.ListImportsInput{
+		Project:     req.GetProject(),
+		Environment: req.GetEnvironment(),
+		FolderPath:  req.GetFolderPath(),
+	})
 	if err != nil {
 		return nil, toStatus(err, "list imports")
 	}
@@ -278,11 +301,11 @@ func (s *Service) UpdateImport(ctx context.Context, req *secretv1.UpdateImportRe
 	if err != nil {
 		return nil, err
 	}
-	id, err := uuid.Parse(req.GetImportUuid())
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, "import_uuid must be a UUID")
-	}
-	edge, err := s.api.SetImportEnabled(ctx, c, id, req.GetEnabled(), req.GetPosition())
+	edge, err := s.api.SetImportEnabled(ctx, c, api.UpdateImportInput{
+		ImportUUID: req.GetImportUuid(),
+		Enabled:    req.GetEnabled(),
+		Position:   req.GetPosition(),
+	})
 	if err != nil {
 		return nil, toStatus(err, "update import")
 	}
@@ -294,11 +317,7 @@ func (s *Service) DeleteImport(ctx context.Context, req *secretv1.DeleteImportRe
 	if err != nil {
 		return nil, err
 	}
-	id, err := uuid.Parse(req.GetImportUuid())
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, "import_uuid must be a UUID")
-	}
-	if err := s.api.DeleteImport(ctx, c, id); err != nil {
+	if err := s.api.DeleteImport(ctx, c, api.ImportRef{ImportUUID: req.GetImportUuid()}); err != nil {
 		return nil, toStatus(err, "delete import")
 	}
 	return &secretv1.DeleteImportResponse{Deleted: true}, nil
@@ -359,6 +378,12 @@ func toProtoImport(i *store.ScopeImport) *secretv1.ScopeImport {
 
 // pageOf reads a Page message, applying the same defaults the REST surface does so
 // the two transports paginate identically.
+//
+// Like response.PageParams, it does NOT clamp the upper bound: the cap belongs to the
+// api layer's Pagination DTO, which REFUSES an over-large limit rather than silently
+// narrowing it (a client that asked for 10000 and received 200 believes it read
+// everything). Clamping in one transport and refusing in the other would be exactly the
+// drift this package's structure exists to prevent.
 func pageOf(p *secretv1.Page) (int, int) {
 	page, limit := 1, 50
 	if p != nil {
@@ -368,9 +393,6 @@ func pageOf(p *secretv1.Page) (int, int) {
 		if p.GetLimit() > 0 {
 			limit = int(p.GetLimit())
 		}
-	}
-	if limit > 200 {
-		limit = 200
 	}
 	return page, limit
 }

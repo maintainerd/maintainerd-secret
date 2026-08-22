@@ -51,6 +51,9 @@ type CreateImportInput struct {
 // reveal grant at creation time means an import can never widen what its creator can
 // see.
 func (s *Service) CreateImport(ctx context.Context, c Caller, in CreateImportInput) (*store.ScopeImport, error) {
+	if err := validate(in); err != nil {
+		return nil, err
+	}
 	targetPath, err := store.NormalizePath(in.FolderPath)
 	if err != nil {
 		return nil, apperror.NewValidation(err.Error())
@@ -107,16 +110,19 @@ func (s *Service) CreateImport(ctx context.Context, c Caller, in CreateImportInp
 const importProbeKey = "_"
 
 // ListImports returns one folder's import chain in precedence order.
-func (s *Service) ListImports(ctx context.Context, c Caller, project, environment, folderPath string) ([]store.ScopeImport, error) {
-	normalized, err := store.NormalizePath(folderPath)
+func (s *Service) ListImports(ctx context.Context, c Caller, in ListImportsInput) ([]store.ScopeImport, error) {
+	if err := validate(in); err != nil {
+		return nil, err
+	}
+	normalized, err := store.NormalizePath(in.FolderPath)
 	if err != nil {
 		return nil, apperror.NewValidation(err.Error())
 	}
-	resourceMRN := c.mrn(project, store.FolderResourcePath(environment, normalized))
+	resourceMRN := c.mrn(in.Project, store.FolderResourcePath(in.Environment, normalized))
 	if err := s.guard(ctx, c, authz.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
 		return nil, err
 	}
-	edges, err := s.store.ListImports(ctx, c.TenantUUID, project, environment, normalized)
+	edges, err := s.store.ListImports(ctx, c.TenantUUID, in.Project, in.Environment, normalized)
 	if err != nil {
 		s.recordFailure(ctx, c, store.ActionRead, resourceMRN, err)
 		return nil, err
@@ -132,12 +138,19 @@ func (s *Service) ListImports(ctx context.Context, c Caller, project, environmen
 }
 
 // SetImportEnabled toggles and reorders an edge.
-func (s *Service) SetImportEnabled(ctx context.Context, c Caller, importUUID uuid.UUID, enabled bool, position int32) (*store.ScopeImport, error) {
+func (s *Service) SetImportEnabled(ctx context.Context, c Caller, in UpdateImportInput) (*store.ScopeImport, error) {
+	if err := validate(in); err != nil {
+		return nil, err
+	}
+	importUUID, err := uuid.Parse(in.ImportUUID)
+	if err != nil {
+		return nil, apperror.NewValidation("import_uuid must be a valid UUID")
+	}
 	resourceMRN := c.mrn("", store.ImportResourcePath(importUUID))
 	if err := s.guard(ctx, c, authz.PermManageFolder, store.ActionImportUpdate, resourceMRN); err != nil {
 		return nil, err
 	}
-	edge, err := s.store.SetImportEnabled(ctx, c.TenantUUID, importUUID, enabled, position)
+	edge, err := s.store.SetImportEnabled(ctx, c.TenantUUID, importUUID, in.Enabled, in.Position)
 	if err != nil {
 		s.recordFailure(ctx, c, store.ActionImportUpdate, resourceMRN, err)
 		return nil, err
@@ -145,7 +158,7 @@ func (s *Service) SetImportEnabled(ctx context.Context, c Caller, importUUID uui
 	if err := s.recordSuccess(ctx, c, audit.Event{
 		Action:      store.ActionImportUpdate,
 		ResourceMRN: resourceMRN,
-		Metadata:    map[string]any{"enabled": enabled, "position": position},
+		Metadata:    map[string]any{"enabled": in.Enabled, "position": in.Position},
 	}); err != nil {
 		return nil, err
 	}
@@ -154,7 +167,14 @@ func (s *Service) SetImportEnabled(ctx context.Context, c Caller, importUUID uui
 
 // DeleteImport removes an edge. The imported secrets are untouched — an import is a
 // resolution rule, not a copy.
-func (s *Service) DeleteImport(ctx context.Context, c Caller, importUUID uuid.UUID) error {
+func (s *Service) DeleteImport(ctx context.Context, c Caller, in ImportRef) error {
+	if err := validate(in); err != nil {
+		return err
+	}
+	importUUID, err := uuid.Parse(in.ImportUUID)
+	if err != nil {
+		return apperror.NewValidation("import_uuid must be a valid UUID")
+	}
 	resourceMRN := c.mrn("", store.ImportResourcePath(importUUID))
 	if err := s.guard(ctx, c, authz.PermManageFolder, store.ActionImportDelete, resourceMRN); err != nil {
 		return err

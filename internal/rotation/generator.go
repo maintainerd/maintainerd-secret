@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"strings"
 	"time"
@@ -76,6 +77,33 @@ type Spec struct {
 	// only thing done with it is a byte copy into the write path.
 	Value string `json:"value,omitempty"`
 }
+
+// String renders a Spec without its Value.
+//
+// A Spec is the one type in this package that can hold a plaintext (the `supplied`
+// generator's), and it travels through error paths and audit metadata as an ordinary
+// struct. Without these two methods, a single `slog.Info("rotating", "spec", spec)` or
+// a `%v` in a debug line writes a caller-supplied credential to the log. The value's
+// PRESENCE is reported, because "the caller supplied a value" is a fact worth logging
+// and its contents are not.
+func (s Spec) String() string {
+	value := "unset"
+	if s.Value != "" {
+		value = redacted
+	}
+	return fmt.Sprintf("rotation.Spec{Type:%q Length:%d Charset:%q Value:%s}",
+		s.Type, s.Length, s.Charset, value)
+}
+
+// LogValue implements slog.LogValuer, so a Spec passed to a structured logger renders
+// through String rather than field by field.
+func (s Spec) LogValue() slog.Value { return slog.StringValue(s.String()) }
+
+// redacted is what a supplied value renders as. It matches crypto.Redacted but is
+// restated here rather than imported, because this package is deliberately pure — no
+// store, no crypto, no context — and one string constant is a cheaper price than that
+// property.
+const redacted = "[REDACTED]"
 
 // Validate normalizes the spec and rejects the shapes that cannot work.
 //

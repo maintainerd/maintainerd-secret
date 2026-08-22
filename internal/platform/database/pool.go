@@ -33,7 +33,7 @@ func NewPool(ctx context.Context) (*pgxpool.Pool, error) {
 	poolCfg.MaxConns = int32(config.DBMaxOpenConns)
 	poolCfg.MinConns = int32(config.DBMaxIdleConns)
 	poolCfg.MaxConnLifetime = time.Duration(config.DBConnMaxLifetimeSec) * time.Second
-	poolCfg.MaxConnIdleTime = 90 * time.Second
+	poolCfg.MaxConnIdleTime = time.Duration(config.DBConnMaxIdleSec) * time.Second
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
@@ -49,6 +49,7 @@ func NewPool(ctx context.Context) (*pgxpool.Pool, error) {
 		"max_conns", config.DBMaxOpenConns,
 		"min_conns", config.DBMaxIdleConns,
 		"conn_max_lifetime_sec", config.DBConnMaxLifetimeSec,
+		"conn_max_idle_sec", config.DBConnMaxIdleSec,
 		"statement_timeout_ms", config.DBStatementTimeoutMs,
 		"sslmode", config.DBSSLMode,
 	)

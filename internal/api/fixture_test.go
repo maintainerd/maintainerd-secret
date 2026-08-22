@@ -644,11 +644,23 @@ func (fx *fixture) seed(environment, folderPath, key, value string) *store.PutRe
 	return res
 }
 
-// seedReference writes a reference-typed secret.
+// seedReference writes a reference-typed secret THROUGH THE STORE, deliberately
+// bypassing the api layer's write-time template check.
+//
+// That is not a shortcut around validation, it is what keeps the read-path tests
+// meaningful. Several of them seed a malformed template ON PURPOSE (an unterminated
+// placeholder, an address with no environment) to prove the RESOLVER refuses it. The
+// api layer now also refuses such a template at write time — see
+// validateReferenceTemplate — so seeding through PutSecret would exercise the write
+// check twice and the read check never. Both matter: the write check is the early,
+// legible rejection; the read check is the backstop for a row that arrived by any
+// other route (a rotation, a direct store write, or data written before the write
+// check existed). The write side is covered in validation_secret_test.go.
 func (fx *fixture) seedReference(environment, folderPath, key, template string) {
 	fx.t.Helper()
-	_, err := fx.api.PutSecret(context.Background(), fx.admin(), PutSecretInput{
-		Address:       addr(environment, folderPath, key),
+	address := addr(environment, folderPath, key)
+	_, err := fx.api.Store().PutSecret(context.Background(), store.PutSecretInput{
+		Ref:           address.ref(fx.admin()),
 		Value:         []byte(template),
 		ValueType:     store.ValueTypeReference,
 		CreateFolders: true,

@@ -82,10 +82,29 @@ type Options struct {
 	// Enabled turns delivery off entirely without removing the endpoints, which is
 	// what an operator wants during an incident on a receiver.
 	Enabled bool
+	// MaxTimeout and MaxAttempts CLAMP what a stored endpoint row may spend, on top of
+	// the bound the API applies when the endpoint is registered.
+	//
+	// Both bounds are needed and they are not redundant. The API bound is the one that
+	// gives a caller a useful error; this one is what actually protects the write path,
+	// because a row can carry a larger value for three reasons the API cannot reach: it
+	// predates the bound, an operator lowered the bound after the row was written, or
+	// the row was edited in the database. Deliveries run INLINE on a secret write (see
+	// Notify), so an endpoint configured with a ten-minute timeout and ten retries
+	// would hold a write open for the sum of them.
+	MaxTimeout  time.Duration
+	MaxAttempts int32
 }
 
-// DefaultConcurrency is the fan-out bound when none is configured.
-const DefaultConcurrency = 4
+// Defaults when Options leaves a bound unset.
+const (
+	// DefaultConcurrency is the fan-out bound.
+	DefaultConcurrency = 4
+	// DefaultMaxTimeout caps one attempt.
+	DefaultMaxTimeout = 30 * time.Second
+	// DefaultMaxAttempts caps the retry budget for one delivery.
+	DefaultMaxAttempts = 10
+)
 
 // Notifier fans a change out to a project's endpoints. It satisfies api.Notifier.
 type Notifier struct {
@@ -98,6 +117,12 @@ type Notifier struct {
 func New(st *store.Service, opts Options) *Notifier {
 	if opts.Concurrency < 1 {
 		opts.Concurrency = DefaultConcurrency
+	}
+	if opts.MaxTimeout <= 0 {
+		opts.MaxTimeout = DefaultMaxTimeout
+	}
+	if opts.MaxAttempts < 1 {
+		opts.MaxAttempts = DefaultMaxAttempts
 	}
 	return &Notifier{store: st, client: SafeDeliveryClient, opts: opts}
 }
@@ -182,12 +207,23 @@ func (n *Notifier) deliver(ctx context.Context, note api.Notification, endpoint 
 		return
 	}
 
+	// The row's retry budget is clamped by the notifier's bound — see Options.
+	maxAttempts := endpoint.MaxAttempts
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	if maxAttempts > n.opts.MaxAttempts {
+		slog.Warn("webhook: endpoint asks for more attempts than the configured maximum; clamping",
+			"endpoint", endpoint.UUID, "requested", endpoint.MaxAttempts, "max", n.opts.MaxAttempts)
+		maxAttempts = n.opts.MaxAttempts
+	}
+
 	var (
 		attempt    int32
 		lastStatus *int32
 		lastErr    error
 	)
-	for attempt = 1; attempt <= endpoint.MaxAttempts; attempt++ {
+	for attempt = 1; attempt <= maxAttempts; attempt++ {
 		status, derr := n.attempt(ctx, endpoint, payload, body, deliveryUUID, attempt)
 		if status != 0 {
 			s := status
@@ -198,7 +234,7 @@ func (n *Notifier) deliver(ctx context.Context, note api.Notification, endpoint 
 			break
 		}
 		lastErr = derr
-		if attempt < endpoint.MaxAttempts {
+		if attempt < maxAttempts {
 			// A fixed short backoff rather than an exponential one: this runs inline
 			// on a write path, so the whole retry budget has to stay inside a latency
 			// an operator would accept. An endpoint that needs minutes of backoff is
@@ -219,7 +255,7 @@ func (n *Notifier) deliver(ctx context.Context, note api.Notification, endpoint 
 		slog.Warn("webhook: delivery failed after every attempt",
 			"endpoint", endpoint.UUID, "resource", note.ResourceMRN, "attempts", attempt-1, "error", lastErr)
 	}
-	if err := n.store.FinishWebhookDelivery(ctx, deliveryID, min32(attempt, endpoint.MaxAttempts), outcome, lastStatus, failure); err != nil {
+	if err := n.store.FinishWebhookDelivery(ctx, deliveryID, min32(attempt, maxAttempts), outcome, lastStatus, failure); err != nil {
 		slog.Warn("webhook: recording the delivery outcome failed", "endpoint", endpoint.UUID, "error", err)
 	}
 	if lastErr == nil {
@@ -231,7 +267,14 @@ func (n *Notifier) deliver(ctx context.Context, note api.Notification, endpoint 
 
 // attempt performs one signed POST.
 func (n *Notifier) attempt(ctx context.Context, endpoint store.SignedWebhookEndpoint, payload Payload, body []byte, deliveryUUID uuid.UUID, attempt int32) (int32, error) {
+	// The row's timeout is clamped by the notifier's bound — see Options. A row can
+	// carry a larger value than the API would accept today (it predates the bound, the
+	// bound was lowered, or the row was edited in the database), and this delivery runs
+	// inline on a secret write.
 	timeout := time.Duration(endpoint.TimeoutSeconds) * time.Second
+	if timeout <= 0 || timeout > n.opts.MaxTimeout {
+		timeout = n.opts.MaxTimeout
+	}
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 

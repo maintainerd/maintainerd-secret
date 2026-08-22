@@ -6,6 +6,7 @@ replace github.com/maintainerd/kit => ../maintainerd-kit
 
 require (
 	github.com/go-chi/chi/v5 v5.3.1
+	github.com/go-ozzo/ozzo-validation/v4 v4.3.0
 	github.com/maintainerd/kit v0.0.0-00010101000000-000000000000
 	github.com/maintainerd/sdk v0.0.0-00010101000000-000000000000
 	github.com/stretchr/testify v1.11.1
@@ -16,6 +17,7 @@ require (
 require (
 	github.com/MicahParks/jwkset v0.11.1 // indirect
 	github.com/MicahParks/keyfunc/v3 v3.8.1 // indirect
+	github.com/asaskevich/govalidator v0.0.0-20200108200545-475eaeb16496 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect

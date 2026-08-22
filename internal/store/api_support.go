@@ -203,13 +203,30 @@ func (s *Service) UpdateEnvironment(ctx context.Context, in UpdateEnvironmentInp
 
 // validateStatus rejects a status the CHECK constraint would refuse anyway,
 // converting a constraint violation into a useful message.
+// Resource statuses a project or environment may hold. They are exported so the API
+// layer's validation and this check cannot drift: a status the API accepts and the
+// store rejects is a 500 where a 400 belongs, and the reverse is a value that reaches
+// a column nothing else understands.
+const (
+	StatusActive    = "active"
+	StatusSuspended = "suspended"
+	StatusArchived  = "archived"
+)
+
+// ResourceStatuses is the closed set, in the order an error message should list it.
+var ResourceStatuses = []string{StatusActive, StatusSuspended, StatusArchived}
+
 func validateStatus(status string) error {
-	switch status {
-	case "", "active", "suspended", "archived":
+	if status == "" {
 		return nil
-	default:
-		return apperror.NewValidation(fmt.Sprintf("status %q must be one of active, suspended, archived", status))
 	}
+	for _, s := range ResourceStatuses {
+		if status == s {
+			return nil
+		}
+	}
+	return apperror.NewValidation(fmt.Sprintf("status %q must be one of %s, %s, %s",
+		status, StatusActive, StatusSuspended, StatusArchived))
 }
 
 // ---------------------------------------------------------------------------

@@ -47,6 +47,28 @@ var knownWebhookEvents = map[string]bool{
 	WebhookEventSecretRotated: true,
 }
 
+// WebhookEvents returns the closed event set, in a stable order. It exists so the API
+// layer's validation lists exactly what this package accepts rather than a second copy
+// that can drift.
+func WebhookEvents() []string {
+	return []string{WebhookEventSecretChanged, WebhookEventSecretRotated}
+}
+
+// IsKnownWebhookEvent reports whether an event name is one an endpoint may subscribe
+// to.
+func IsKnownWebhookEvent(event string) bool {
+	return knownWebhookEvents[strings.TrimSpace(event)]
+}
+
+// Endpoint statuses. Exported for the same reason ResourceStatuses is.
+const (
+	WebhookStatusActive   = "active"
+	WebhookStatusDisabled = "disabled"
+)
+
+// WebhookStatuses is the closed set.
+var WebhookStatuses = []string{WebhookStatusActive, WebhookStatusDisabled}
+
 // WebhookEndpoint is an endpoint as it leaves this package. NOTE THE ABSENCE of any
 // signing-key field — this type cannot carry one.
 type WebhookEndpoint struct {
@@ -268,11 +290,12 @@ func (s *Service) UpdateWebhookEndpoint(ctx context.Context, in UpdateWebhookEnd
 		return nil, apperror.NewValidation(err.Error())
 	}
 	switch in.Status {
-	case "active", "disabled":
+	case WebhookStatusActive, WebhookStatusDisabled:
 	case "":
-		in.Status = "active"
+		in.Status = WebhookStatusActive
 	default:
-		return nil, apperror.NewValidation(fmt.Sprintf("status %q must be active or disabled", in.Status))
+		return nil, apperror.NewValidation(fmt.Sprintf("status %q must be %s or %s",
+			in.Status, WebhookStatusActive, WebhookStatusDisabled))
 	}
 	events, err := normalizeWebhookEvents(in.Events)
 	if err != nil {

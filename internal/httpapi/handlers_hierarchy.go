@@ -8,7 +8,6 @@ import (
 
 	"github.com/maintainerd/secret/internal/api"
 	"github.com/maintainerd/secret/internal/platform/response"
-	"github.com/maintainerd/secret/internal/store"
 )
 
 // Hierarchy handlers: projects, environments, folders and scope imports.
@@ -50,7 +49,9 @@ func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	page, limit := response.PageParams(r)
-	projects, total, err := s.api.ListProjects(r.Context(), c, page, limit)
+	projects, total, err := s.api.ListProjects(r.Context(), c, api.ListProjectsInput{
+		Pagination: api.Pagination{Page: page, Limit: limit},
+	})
 	if err != nil {
 		response.ServiceError(w, r, "could not list projects", err)
 		return
@@ -86,7 +87,7 @@ func (s *Server) updateProject(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	project, err := s.api.UpdateProject(r.Context(), c, store.UpdateProjectInput{
+	project, err := s.api.UpdateProject(r.Context(), c, api.UpdateProjectInput{
 		Slug:        chi.URLParam(r, "project"),
 		Name:        req.Name,
 		Description: req.Description,
@@ -192,7 +193,7 @@ func (s *Server) updateEnvironment(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	env, err := s.api.UpdateEnvironment(r.Context(), c, store.UpdateEnvironmentInput{
+	env, err := s.api.UpdateEnvironment(r.Context(), c, api.UpdateEnvironmentInput{
 		Project:     chi.URLParam(r, "project"),
 		Slug:        chi.URLParam(r, "environment"),
 		Name:        req.Name,
@@ -238,7 +239,11 @@ func (s *Server) createFolder(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	folder, err := s.api.CreateFolder(r.Context(), c, req.Project, req.Environment, req.Path)
+	folder, err := s.api.CreateFolder(r.Context(), c, api.CreateFolderInput{
+		Project:     req.Project,
+		Environment: req.Environment,
+		Path:        req.Path,
+	})
 	if err != nil {
 		response.ServiceError(w, r, "could not create the folder", err)
 		return
@@ -259,7 +264,11 @@ func (s *Server) listFolders(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	folders, err := s.api.ListFolders(r.Context(), c, project, environment, r.URL.Query().Get("prefix"))
+	folders, err := s.api.ListFolders(r.Context(), c, api.ListFoldersInput{
+		Project:     project,
+		Environment: environment,
+		Prefix:      r.URL.Query().Get("prefix"),
+	})
 	if err != nil {
 		response.ServiceError(w, r, "could not list folders", err)
 		return
@@ -283,7 +292,12 @@ func (s *Server) moveFolder(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	folder, err := s.api.MoveFolder(r.Context(), c, req.Project, req.Environment, req.From, req.To)
+	folder, err := s.api.MoveFolder(r.Context(), c, api.MoveFolderInput{
+		Project:     req.Project,
+		Environment: req.Environment,
+		From:        req.From,
+		To:          req.To,
+	})
 	if err != nil {
 		response.ServiceError(w, r, "could not move the folder", err)
 		return
@@ -317,7 +331,12 @@ func (s *Server) deleteFolder(w http.ResponseWriter, r *http.Request) {
 		}
 		window = &d
 	}
-	deleted, err := s.api.DeleteFolder(r.Context(), c, project, environment, path, window)
+	deleted, err := s.api.DeleteFolder(r.Context(), c, api.DeleteFolderInput{
+		Project:        project,
+		Environment:    environment,
+		Path:           path,
+		RecoveryWindow: window,
+	})
 	if err != nil {
 		response.ServiceError(w, r, "could not delete the folder", err)
 		return
@@ -377,7 +396,11 @@ func (s *Server) listImports(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	edges, err := s.api.ListImports(r.Context(), c, project, environment, r.URL.Query().Get("folder_path"))
+	edges, err := s.api.ListImports(r.Context(), c, api.ListImportsInput{
+		Project:     project,
+		Environment: environment,
+		FolderPath:  r.URL.Query().Get("folder_path"),
+	})
 	if err != nil {
 		response.ServiceError(w, r, "could not list imports", err)
 		return
@@ -395,15 +418,15 @@ func (s *Server) updateImport(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	id, ok := pathUUID(w, r, "importUUID")
-	if !ok {
-		return
-	}
 	var req updateImportRequest
 	if !decode(w, r, &req) {
 		return
 	}
-	edge, err := s.api.SetImportEnabled(r.Context(), c, id, req.Enabled, req.Position)
+	edge, err := s.api.SetImportEnabled(r.Context(), c, api.UpdateImportInput{
+		ImportUUID: chi.URLParam(r, "importUUID"),
+		Enabled:    req.Enabled,
+		Position:   req.Position,
+	})
 	if err != nil {
 		response.ServiceError(w, r, "could not update the import", err)
 		return
@@ -416,11 +439,9 @@ func (s *Server) deleteImport(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	id, ok := pathUUID(w, r, "importUUID")
-	if !ok {
-		return
-	}
-	if err := s.api.DeleteImport(r.Context(), c, id); err != nil {
+	if err := s.api.DeleteImport(r.Context(), c, api.ImportRef{
+		ImportUUID: chi.URLParam(r, "importUUID"),
+	}); err != nil {
 		response.ServiceError(w, r, "could not delete the import", err)
 		return
 	}

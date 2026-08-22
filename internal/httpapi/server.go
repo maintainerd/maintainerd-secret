@@ -22,22 +22,23 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
-	"github.com/google/uuid"
+	chimw "github.com/go-chi/chi/v5/middleware"
 
 	"github.com/maintainerd/secret/internal/api"
 	"github.com/maintainerd/secret/internal/audit"
 	"github.com/maintainerd/secret/internal/platform/apperror"
 	"github.com/maintainerd/secret/internal/platform/authz"
+	mw "github.com/maintainerd/secret/internal/platform/middleware"
 	"github.com/maintainerd/secret/internal/platform/response"
 	"github.com/maintainerd/secret/internal/setup"
 )
@@ -53,45 +54,137 @@ const TenantHeader = "X-Maintainerd-Tenant"
 // SetupTokenHeader carries the bootstrap token on the REST setup wizard.
 const SetupTokenHeader = "X-Setup-Token"
 
-// maxBodyBytes bounds a request body. Generous enough for a 100-item batch put of
+// defaultMaxBodyBytes bounds a request body when no Options value is supplied (the
+// zero-Options construction used by tests). Generous enough for a 100-item batch put of
 // realistic credentials, small enough that an unauthenticated POST cannot be a memory
-// exhaustion primitive (the guard runs first, but the setup surface does not).
-const maxBodyBytes = 4 << 20 // 4 MiB
+// exhaustion primitive — the guard runs first on the API, but the setup surface is
+// self-guarded and reachable before any token exists.
+const defaultMaxBodyBytes = 4 << 20 // 4 MiB
+
+// ReadinessCheck is one dependency /readyz probes.
+type ReadinessCheck struct {
+	// Name appears in the response and in the log line, so an operator reading a
+	// failing probe knows WHICH dependency is down without reading the server log.
+	Name string
+	// Probe reports the dependency's health. It must respect the context: /readyz
+	// bounds every probe, and a probe that ignores the bound makes the readiness
+	// endpoint itself the thing that hangs.
+	Probe func(context.Context) error
+}
+
+// RateLimitOptions configures the in-process limiter's budgets. See
+// internal/platform/middleware/rate_limit.go for the single-node caveat.
+type RateLimitOptions struct {
+	Enabled bool
+	Window  time.Duration
+	// Reveal budgets the two surfaces that return decrypted values.
+	Reveal int
+	// Write budgets every mutating surface.
+	Write int
+	// Setup budgets the self-guarded first-run surface, keyed by client IP.
+	Setup int
+}
+
+// Options tunes the REST server. The zero value is a working configuration with the
+// defaults in this file, so a test can construct a Server without a config package.
+type Options struct {
+	// Production selects the production security-header posture (HSTS).
+	Production bool
+	// MaxBodyBytes caps a request body on every route.
+	MaxBodyBytes int64
+	// RequestTimeout is the per-request context deadline applied to /api/v1.
+	RequestTimeout time.Duration
+	// ReadinessTimeout bounds each /readyz probe.
+	ReadinessTimeout time.Duration
+	RateLimit        RateLimitOptions
+	// Readiness are the dependency probes /readyz reports on. An empty list makes
+	// /readyz equivalent to /healthz, which is the honest answer for a server with no
+	// dependencies wired — and never the production configuration.
+	Readiness []ReadinessCheck
+}
+
+func (o Options) withDefaults() Options {
+	if o.MaxBodyBytes < 1 {
+		o.MaxBodyBytes = defaultMaxBodyBytes
+	}
+	if o.ReadinessTimeout <= 0 {
+		o.ReadinessTimeout = 2 * time.Second
+	}
+	if o.RateLimit.Window <= 0 {
+		o.RateLimit.Window = time.Minute
+	}
+	return o
+}
 
 // Server holds the dependencies the handlers need.
 type Server struct {
-	api   *api.Service
-	setup *setup.Service
-	guard authz.Guard
+	api     *api.Service
+	setup   *setup.Service
+	guard   authz.Guard
+	opts    Options
+	limiter *mw.Limiter
 }
 
 // NewServer builds the REST server.
-func NewServer(svc *api.Service, setupSvc *setup.Service, guard authz.Guard) *Server {
-	return &Server{api: svc, setup: setupSvc, guard: guard}
+func NewServer(svc *api.Service, setupSvc *setup.Service, guard authz.Guard, opts Options) *Server {
+	resolved := opts.withDefaults()
+	s := &Server{api: svc, setup: setupSvc, guard: guard, opts: resolved}
+	if resolved.RateLimit.Enabled {
+		s.limiter = mw.NewLimiter(resolved.RateLimit.Window)
+	}
+	return s
 }
 
-// Router builds the full mux, including /healthz.
+// UseLimiter replaces the server's own limiter with a shared one.
 //
-// /healthz is mounted OUTSIDE the /api/v1 group, which is what makes it exempt from
-// the guard by construction rather than by an exception inside it — an orchestrator
-// has to be able to probe liveness before it has credentials, and the response leaks
-// nothing beyond "serving".
+// It exists so the REST and gRPC surfaces spend ONE budget. A per-transport budget is
+// not a budget: a client that has exhausted its reveal allowance over REST would
+// otherwise open a gRPC channel and spend a second one against the same secrets with
+// the same grants. The bootstrap builds one limiter and hands it to both.
+//
+// Passing nil disables rate limiting on this server, which is what
+// SECRET_RATE_LIMIT_ENABLED=false produces.
+func (s *Server) UseLimiter(l *mw.Limiter) { s.limiter = l }
+
+// Router builds the full mux, including the health probes.
+//
+// MIDDLEWARE ORDER IS LOAD-BEARING, outermost first:
+//
+//	RequestID       so every line below can correlate, including a panic
+//	SecurityHeaders set before anything can write a response, including a 413 from the
+//	                body cap or a 500 from recovery — a header that is only on the happy
+//	                path is a header an attacker routes around
+//	Recovery        outside the logger so a panic still produces the request line
+//	RequestLogger   seeds the request-scoped logger every handler reports through
+//	BodyLimit       before routing, because the setup surface is unauthenticated and the
+//	                guard has not run yet
+//
+// THE HEALTH PROBES ARE MOUNTED OUTSIDE /api/v1, which is what makes them exempt from
+// the guard by construction rather than by an exception inside it. They are also
+// outside the per-request Timeout: a liveness probe must not inherit a 30-second
+// budget. They are the ONLY unauthenticated surface on this transport apart from the
+// self-guarded setup wizard.
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID)
-	r.Use(middleware.Recoverer)
-	r.Use(s.requestLogger)
+	r.Use(chimw.RequestID)
+	r.Use(mw.SecurityHeaders(s.opts.Production))
+	r.Use(mw.Recovery)
+	r.Use(mw.RequestLogger)
+	r.Use(mw.BodyLimit(s.opts.MaxBodyBytes))
 
-	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
-	})
+	r.Get("/healthz", s.healthz)
+	r.Get("/readyz", s.readyz)
 
 	r.Route("/api/v1", func(v1 chi.Router) {
+		v1.Use(mw.Timeout(s.opts.RequestTimeout))
 		v1.Use(s.guard.Middleware)
 
 		v1.Route("/setup", func(g chi.Router) {
+			// The setup surface carries its OWN rate limit, keyed by client IP,
+			// because it is the one path reachable without an Auth-minted token and it
+			// compares a bootstrap token. Everything else is keyed by principal, which
+			// this surface does not have.
+			g.Use(s.rateLimit("setup", s.opts.RateLimit.Setup, mw.ByClientIP))
 			g.Get("/status", s.getSetupStatus)
 			// chi's Route mounts the subrouter, so "/api/v1/setup" and
 			// "/api/v1/setup/" both arrive here as "/". An operator following a runbook
@@ -100,63 +193,69 @@ func (s *Server) Router() http.Handler {
 			g.Post("/", s.postSetup)
 		})
 
+		write := s.rateLimit("write", s.opts.RateLimit.Write, mw.ByPrincipal)
+		reveal := s.rateLimit("reveal", s.opts.RateLimit.Reveal, mw.ByPrincipal)
+
 		v1.Route("/projects", func(g chi.Router) {
 			g.Get("/", s.listProjects)
-			g.Post("/", s.createProject)
+			g.With(write).Post("/", s.createProject)
 			g.Get("/{project}", s.getProject)
-			g.Patch("/{project}", s.updateProject)
-			g.Delete("/{project}", s.deleteProject)
+			g.With(write).Patch("/{project}", s.updateProject)
+			g.With(write).Delete("/{project}", s.deleteProject)
 		})
 
 		v1.Route("/environments", func(g chi.Router) {
 			g.Get("/", s.listEnvironments)
-			g.Post("/", s.createEnvironment)
+			g.With(write).Post("/", s.createEnvironment)
 			g.Get("/{project}/{environment}", s.getEnvironment)
-			g.Patch("/{project}/{environment}", s.updateEnvironment)
-			g.Delete("/{project}/{environment}", s.deleteEnvironment)
+			g.With(write).Patch("/{project}/{environment}", s.updateEnvironment)
+			g.With(write).Delete("/{project}/{environment}", s.deleteEnvironment)
 		})
 
 		v1.Route("/folders", func(g chi.Router) {
 			g.Get("/", s.listFolders)
-			g.Post("/", s.createFolder)
-			g.Post("/move", s.moveFolder)
-			g.Delete("/", s.deleteFolder)
+			g.With(write).Post("/", s.createFolder)
+			g.With(write).Post("/move", s.moveFolder)
+			g.With(write).Delete("/", s.deleteFolder)
 		})
 
 		v1.Route("/imports", func(g chi.Router) {
 			g.Get("/", s.listImports)
-			g.Post("/", s.createImport)
-			g.Patch("/{importUUID}", s.updateImport)
-			g.Delete("/{importUUID}", s.deleteImport)
+			g.With(write).Post("/", s.createImport)
+			g.With(write).Patch("/{importUUID}", s.updateImport)
+			g.With(write).Delete("/{importUUID}", s.deleteImport)
 		})
 
 		v1.Route("/secrets", func(g chi.Router) {
 			g.Get("/", s.listSecrets)
-			g.Post("/", s.putSecret)
-			g.Patch("/", s.updateSecretMeta)
+			g.With(write).Post("/", s.putSecret)
+			g.With(write).Patch("/", s.updateSecretMeta)
 			g.Get("/describe", s.describeSecret)
 			g.Get("/versions", s.listVersions)
 			g.Get("/deleted", s.listDeletedSecrets)
-			// Reveal is a POST because its address belongs in a body, not a URL.
-			g.Post("/reveal", s.revealSecret)
-			g.Post("/rollback", s.rollbackSecret)
-			g.Post("/rotate", s.rotateSecret)
-			g.Post("/rotation-policy", s.setRotationPolicy)
-			g.Post("/delete", s.deleteSecret)
-			g.Post("/restore", s.restoreSecret)
-			g.Post("/destroy", s.destroySecret)
+			// Reveal is a POST because its address belongs in a body, not a URL. It
+			// carries the REVEAL budget, not the write one: it is the exfiltration
+			// path, and metering it separately means a workload writing at its full
+			// write budget is still able to read.
+			g.With(reveal).Post("/reveal", s.revealSecret)
+			g.With(write).Post("/rollback", s.rollbackSecret)
+			g.With(write).Post("/rotate", s.rotateSecret)
+			g.With(write).Post("/rotation-policy", s.setRotationPolicy)
+			g.With(write).Post("/delete", s.deleteSecret)
+			g.With(write).Post("/restore", s.restoreSecret)
+			g.With(write).Post("/destroy", s.destroySecret)
 		})
 
 		v1.Route("/bulk", func(g chi.Router) {
-			g.Post("/get", s.batchGet)
-			g.Post("/put", s.batchPut)
+			g.With(reveal).Post("/get", s.batchGet)
+			g.With(write).Post("/put", s.batchPut)
 		})
 
 		v1.Route("/webhooks", func(g chi.Router) {
 			g.Get("/", s.listWebhooks)
-			g.Post("/", s.createWebhook)
-			g.Patch("/{endpointUUID}", s.updateWebhook)
-			g.Delete("/{endpointUUID}", s.deleteWebhook)
+			g.With(write).Post("/", s.createWebhook)
+			g.With(write).Patch("/{endpointUUID}", s.updateWebhook)
+			g.With(write).Delete("/{endpointUUID}", s.deleteWebhook)
 			g.Get("/{endpointUUID}/deliveries", s.listWebhookDeliveries)
 		})
 
@@ -166,14 +265,14 @@ func (s *Server) Router() http.Handler {
 	return r
 }
 
-// requestLogger attaches a request-scoped logger seeded with the request id, so an
-// internal error logged from anywhere in the stack is correlatable with the client's
-// request.
-func (s *Server) requestLogger(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		logger := slog.With("request_id", middleware.GetReqID(r.Context()), "path", r.URL.Path, "method", r.Method)
-		next.ServeHTTP(w, r.WithContext(response.WithLogger(r.Context(), logger)))
-	})
+// rateLimit returns the limiter middleware for one budget, or a pass-through when the
+// limiter is disabled. Returning a pass-through rather than nil keeps the route
+// declarations uniform.
+func (s *Server) rateLimit(class string, limit int, key mw.KeyFunc) func(http.Handler) http.Handler {
+	if s.limiter == nil || limit <= 0 {
+		return func(next http.Handler) http.Handler { return next }
+	}
+	return mw.RateLimit(s.limiter, class, limit, key)
 }
 
 // caller resolves the request's authenticated principal into an api.Caller.
@@ -201,7 +300,7 @@ func actorFrom(r *http.Request) audit.Actor {
 	return audit.Actor{
 		IP:        clientIP(r),
 		UserAgent: r.UserAgent(),
-		RequestID: middleware.GetReqID(r.Context()),
+		RequestID: chimw.GetReqID(r.Context()),
 	}
 }
 
@@ -235,8 +334,15 @@ func clientIP(r *http.Request) string {
 // caller that misspells "create_folders" or "keep_versions" would otherwise get a
 // silent default, which for retention means a version history quietly shorter than
 // asked for.
+//
+// THE SIZE BOUND IS APPLIED BY middleware.BodyLimit, on every route, before routing —
+// which is where it has to be, because the setup surface is reachable before any token
+// exists. The MaxBytesReader here is a second wrap at the same or a larger bound, kept
+// so that a handler reached by a path that somehow skipped the middleware (a test
+// calling decode directly, a future router) is still bounded. Wrapping twice is
+// harmless: the inner reader hits its limit first.
 func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	r.Body = http.MaxBytesReader(w, r.Body, defaultMaxBodyBytes)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
@@ -250,16 +356,10 @@ func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
 	return true
 }
 
-// pathUUID reads a UUID path parameter.
-func pathUUID(w http.ResponseWriter, r *http.Request, name string) (uuid.UUID, bool) {
-	raw := chi.URLParam(r, name)
-	id, err := uuid.Parse(raw)
-	if err != nil {
-		response.Error(w, http.StatusBadRequest, name+" must be a UUID")
-		return uuid.Nil, false
-	}
-	return id, true
-}
+// UUID path parameters are NOT parsed here any more. They are carried into the api
+// layer as strings and validated by the DTO's is.UUID rule (internal/api), so the
+// message a caller gets for a malformed id is the same one the gRPC surface produces
+// rather than a second, transport-local wording.
 
 // requireQuery reads a required query parameter.
 func requireQuery(w http.ResponseWriter, r *http.Request, name string) (string, bool) {

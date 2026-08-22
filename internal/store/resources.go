@@ -50,6 +50,11 @@ const ResourceAudit = "audit"
 // ResourceSetup is the resource path of the one-time setup surface.
 const ResourceSetup = "setup"
 
+// ResourceWebhook is the resource path of a project's webhook COLLECTION — the scope a
+// create and a listing are authorized against, before any endpoint UUID exists.
+// WebhookResourcePath names one endpoint under it.
+const ResourceWebhook = "webhook"
+
 // EnvironmentResourcePath returns the resource path of one environment.
 func EnvironmentResourcePath(environmentSlug string) string {
 	return "environment/" + environmentSlug

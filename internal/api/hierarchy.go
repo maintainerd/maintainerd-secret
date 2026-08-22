@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"time"
 
 	"github.com/maintainerd/secret/internal/audit"
 	"github.com/maintainerd/secret/internal/platform/apperror"
@@ -31,6 +30,9 @@ type CreateProjectInput struct {
 
 // CreateProject adds a project to the caller's tenant.
 func (s *Service) CreateProject(ctx context.Context, c Caller, in CreateProjectInput) (*store.Project, error) {
+	if err := validate(in); err != nil {
+		return nil, err
+	}
 	resourceMRN := c.mrn(in.Slug, store.ResourceProject)
 	if err := s.guard(ctx, c, authz.PermManageProject, store.ActionProjectCreate, resourceMRN); err != nil {
 		return nil, err
@@ -59,7 +61,11 @@ func (s *Service) CreateProject(ctx context.Context, c Caller, in CreateProjectI
 // It is authorized against the TENANT-scoped project MRN (an empty project segment),
 // which is the scope boundary in MRN semantics: a grant written for one project does
 // not carry the ability to enumerate the tenant's others.
-func (s *Service) ListProjects(ctx context.Context, c Caller, page, limit int) ([]store.Project, int64, error) {
+func (s *Service) ListProjects(ctx context.Context, c Caller, in ListProjectsInput) ([]store.Project, int64, error) {
+	if err := validate(in); err != nil {
+		return nil, 0, err
+	}
+	page, limit := in.Pagination.resolved()
 	resourceMRN := c.mrn("", store.ResourceProject)
 	if err := s.guard(ctx, c, authz.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
 		return nil, 0, err
@@ -81,6 +87,9 @@ func (s *Service) ListProjects(ctx context.Context, c Caller, page, limit int) (
 
 // GetProject reads one project.
 func (s *Service) GetProject(ctx context.Context, c Caller, slug string) (*store.Project, error) {
+	if err := validate(ProjectRef{Slug: slug}); err != nil {
+		return nil, err
+	}
 	resourceMRN := c.mrn(slug, store.ResourceProject)
 	if err := s.guard(ctx, c, authz.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
 		return nil, err
@@ -99,13 +108,21 @@ func (s *Service) GetProject(ctx context.Context, c Caller, slug string) (*store
 // UpdateProject rewrites a project's descriptive fields. The slug is not editable —
 // it is an MRN segment, and renaming it would silently repoint every grant written
 // against the old name.
-func (s *Service) UpdateProject(ctx context.Context, c Caller, in store.UpdateProjectInput) (*store.Project, error) {
-	in.TenantUUID = c.TenantUUID
+func (s *Service) UpdateProject(ctx context.Context, c Caller, in UpdateProjectInput) (*store.Project, error) {
+	if err := validate(in); err != nil {
+		return nil, err
+	}
 	resourceMRN := c.mrn(in.Slug, store.ResourceProject)
 	if err := s.guard(ctx, c, authz.PermManageProject, store.ActionProjectUpdate, resourceMRN); err != nil {
 		return nil, err
 	}
-	project, err := s.store.UpdateProject(ctx, in)
+	project, err := s.store.UpdateProject(ctx, store.UpdateProjectInput{
+		TenantUUID:  c.TenantUUID,
+		Slug:        in.Slug,
+		Name:        in.Name,
+		Description: in.Description,
+		Status:      in.Status,
+	})
 	if err != nil {
 		s.recordFailure(ctx, c, store.ActionProjectUpdate, resourceMRN, err)
 		return nil, err
@@ -120,6 +137,9 @@ func (s *Service) UpdateProject(ctx context.Context, c Caller, in store.UpdatePr
 // deletion of encrypted material is a separate, explicitly sanctioned operation, not
 // a side effect of removing a project from a list.
 func (s *Service) DeleteProject(ctx context.Context, c Caller, slug string) error {
+	if err := validate(ProjectRef{Slug: slug}); err != nil {
+		return err
+	}
 	resourceMRN := c.mrn(slug, store.ResourceProject)
 	if err := s.guard(ctx, c, authz.PermManageProject, store.ActionProjectDelete, resourceMRN); err != nil {
 		return err
@@ -152,6 +172,9 @@ type CreateEnvironmentInput struct {
 // CreateEnvironment adds an environment to a project (and its root folder, in one
 // transaction — see the store).
 func (s *Service) CreateEnvironment(ctx context.Context, c Caller, in CreateEnvironmentInput) (*store.Environment, error) {
+	if err := validate(in); err != nil {
+		return nil, err
+	}
 	resourceMRN := c.mrn(in.Project, store.EnvironmentResourcePath(in.Slug))
 	if err := s.guard(ctx, c, authz.PermManageEnvironment, store.ActionEnvironmentCreate, resourceMRN); err != nil {
 		return nil, err
@@ -176,6 +199,9 @@ func (s *Service) CreateEnvironment(ctx context.Context, c Caller, in CreateEnvi
 
 // ListEnvironments returns a project's environments in display order.
 func (s *Service) ListEnvironments(ctx context.Context, c Caller, project string) ([]store.Environment, error) {
+	if err := validate(ProjectRef{Slug: project}); err != nil {
+		return nil, err
+	}
 	resourceMRN := c.mrn(project, store.ResourceProject)
 	if err := s.guard(ctx, c, authz.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
 		return nil, err
@@ -197,6 +223,9 @@ func (s *Service) ListEnvironments(ctx context.Context, c Caller, project string
 
 // GetEnvironment reads one environment.
 func (s *Service) GetEnvironment(ctx context.Context, c Caller, project, slug string) (*store.Environment, error) {
+	if err := validate(EnvironmentRef{Project: project, Slug: slug}); err != nil {
+		return nil, err
+	}
 	resourceMRN := c.mrn(project, store.EnvironmentResourcePath(slug))
 	if err := s.guard(ctx, c, authz.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
 		return nil, err
@@ -213,13 +242,23 @@ func (s *Service) GetEnvironment(ctx context.Context, c Caller, project, slug st
 }
 
 // UpdateEnvironment rewrites an environment's descriptive fields.
-func (s *Service) UpdateEnvironment(ctx context.Context, c Caller, in store.UpdateEnvironmentInput) (*store.Environment, error) {
-	in.TenantUUID = c.TenantUUID
+func (s *Service) UpdateEnvironment(ctx context.Context, c Caller, in UpdateEnvironmentInput) (*store.Environment, error) {
+	if err := validate(in); err != nil {
+		return nil, err
+	}
 	resourceMRN := c.mrn(in.Project, store.EnvironmentResourcePath(in.Slug))
 	if err := s.guard(ctx, c, authz.PermManageEnvironment, store.ActionEnvironmentUpdate, resourceMRN); err != nil {
 		return nil, err
 	}
-	env, err := s.store.UpdateEnvironment(ctx, in)
+	env, err := s.store.UpdateEnvironment(ctx, store.UpdateEnvironmentInput{
+		TenantUUID:  c.TenantUUID,
+		Project:     in.Project,
+		Slug:        in.Slug,
+		Name:        in.Name,
+		Description: in.Description,
+		Position:    in.Position,
+		Status:      in.Status,
+	})
 	if err != nil {
 		s.recordFailure(ctx, c, store.ActionEnvironmentUpdate, resourceMRN, err)
 		return nil, err
@@ -232,6 +271,9 @@ func (s *Service) UpdateEnvironment(ctx context.Context, c Caller, in store.Upda
 
 // DeleteEnvironment soft-deletes an environment.
 func (s *Service) DeleteEnvironment(ctx context.Context, c Caller, project, slug string) error {
+	if err := validate(EnvironmentRef{Project: project, Slug: slug}); err != nil {
+		return err
+	}
 	resourceMRN := c.mrn(project, store.EnvironmentResourcePath(slug))
 	if err := s.guard(ctx, c, authz.PermManageEnvironment, store.ActionEnvironmentDelete, resourceMRN); err != nil {
 		return err
@@ -249,16 +291,19 @@ func (s *Service) DeleteEnvironment(ctx context.Context, c Caller, project, slug
 
 // CreateFolder creates a folder and any missing ancestors (mkdir -p). Creating an
 // existing folder is a no-op returning the existing row.
-func (s *Service) CreateFolder(ctx context.Context, c Caller, project, environment, folderPath string) (*store.Folder, error) {
-	normalized, err := store.NormalizePath(folderPath)
+func (s *Service) CreateFolder(ctx context.Context, c Caller, in CreateFolderInput) (*store.Folder, error) {
+	if err := validate(in); err != nil {
+		return nil, err
+	}
+	normalized, err := store.NormalizePath(in.Path)
 	if err != nil {
 		return nil, apperror.NewValidation(err.Error())
 	}
-	resourceMRN := c.mrn(project, store.FolderResourcePath(environment, normalized))
+	resourceMRN := c.mrn(in.Project, store.FolderResourcePath(in.Environment, normalized))
 	if err := s.guard(ctx, c, authz.PermManageFolder, store.ActionFolderCreate, resourceMRN); err != nil {
 		return nil, err
 	}
-	folder, err := s.store.CreateFolder(ctx, c.TenantUUID, project, environment, normalized)
+	folder, err := s.store.CreateFolder(ctx, c.TenantUUID, in.Project, in.Environment, normalized)
 	if err != nil {
 		s.recordFailure(ctx, c, store.ActionFolderCreate, resourceMRN, err)
 		return nil, err
@@ -270,16 +315,19 @@ func (s *Service) CreateFolder(ctx context.Context, c Caller, project, environme
 }
 
 // ListFolders returns the folder subtree at or under a prefix.
-func (s *Service) ListFolders(ctx context.Context, c Caller, project, environment, prefix string) ([]store.Folder, error) {
-	normalized, err := store.NormalizePath(prefix)
+func (s *Service) ListFolders(ctx context.Context, c Caller, in ListFoldersInput) ([]store.Folder, error) {
+	if err := validate(in); err != nil {
+		return nil, err
+	}
+	normalized, err := store.NormalizePath(in.Prefix)
 	if err != nil {
 		return nil, apperror.NewValidation(err.Error())
 	}
-	resourceMRN := c.mrn(project, store.FolderResourcePath(environment, normalized))
+	resourceMRN := c.mrn(in.Project, store.FolderResourcePath(in.Environment, normalized))
 	if err := s.guard(ctx, c, authz.PermReadMetadata, store.ActionRead, resourceMRN); err != nil {
 		return nil, err
 	}
-	folders, err := s.store.ListFolders(ctx, c.TenantUUID, project, environment, normalized)
+	folders, err := s.store.ListFolders(ctx, c.TenantUUID, in.Project, in.Environment, normalized)
 	if err != nil {
 		s.recordFailure(ctx, c, store.ActionRead, resourceMRN, err)
 		return nil, err
@@ -302,24 +350,27 @@ func (s *Service) ListFolders(ctx context.Context, c Caller, project, environmen
 // the folder, so a principal who could move a subtree into a scope it controls could
 // bring secrets it never had a grant on into the reach of one it does. Requiring the
 // destination grant closes that; the audit row records both ends.
-func (s *Service) MoveFolder(ctx context.Context, c Caller, project, environment, from, to string) (*store.Folder, error) {
-	fromPath, err := store.NormalizePath(from)
+func (s *Service) MoveFolder(ctx context.Context, c Caller, in MoveFolderInput) (*store.Folder, error) {
+	if err := validate(in); err != nil {
+		return nil, err
+	}
+	fromPath, err := store.NormalizePath(in.From)
 	if err != nil {
 		return nil, apperror.NewValidation(err.Error())
 	}
-	toPath, err := store.NormalizePath(to)
+	toPath, err := store.NormalizePath(in.To)
 	if err != nil {
 		return nil, apperror.NewValidation(err.Error())
 	}
-	fromMRN := c.mrn(project, store.FolderResourcePath(environment, fromPath))
-	toMRN := c.mrn(project, store.FolderResourcePath(environment, toPath))
+	fromMRN := c.mrn(in.Project, store.FolderResourcePath(in.Environment, fromPath))
+	toMRN := c.mrn(in.Project, store.FolderResourcePath(in.Environment, toPath))
 	if err := s.guard(ctx, c, authz.PermManageFolder, store.ActionFolderMove, fromMRN); err != nil {
 		return nil, err
 	}
 	if err := s.guard(ctx, c, authz.PermManageFolder, store.ActionFolderMove, toMRN); err != nil {
 		return nil, err
 	}
-	folder, err := s.store.MoveFolder(ctx, c.TenantUUID, project, environment, fromPath, toPath)
+	folder, err := s.store.MoveFolder(ctx, c.TenantUUID, in.Project, in.Environment, fromPath, toPath)
 	if err != nil {
 		s.recordFailure(ctx, c, store.ActionFolderMove, fromMRN, err)
 		return nil, err
@@ -340,19 +391,22 @@ func (s *Service) MoveFolder(ctx context.Context, c Caller, project, environment
 //
 // It requires DeleteSecret as well as ManageFolder, because it deletes secrets. A
 // folder-management grant alone must not be a way to delete credentials.
-func (s *Service) DeleteFolder(ctx context.Context, c Caller, project, environment, folderPath string, window *time.Duration) (int64, error) {
-	normalized, err := store.NormalizePath(folderPath)
+func (s *Service) DeleteFolder(ctx context.Context, c Caller, in DeleteFolderInput) (int64, error) {
+	if err := validate(in); err != nil {
+		return 0, err
+	}
+	normalized, err := store.NormalizePath(in.Path)
 	if err != nil {
 		return 0, apperror.NewValidation(err.Error())
 	}
-	resourceMRN := c.mrn(project, store.FolderResourcePath(environment, normalized))
+	resourceMRN := c.mrn(in.Project, store.FolderResourcePath(in.Environment, normalized))
 	if err := s.guard(ctx, c, authz.PermManageFolder, store.ActionFolderDelete, resourceMRN); err != nil {
 		return 0, err
 	}
 	if err := s.guard(ctx, c, authz.PermDeleteSecret, store.ActionFolderDelete, resourceMRN); err != nil {
 		return 0, err
 	}
-	deleted, err := s.store.DeleteFolder(ctx, c.TenantUUID, project, environment, normalized, window)
+	deleted, err := s.store.DeleteFolder(ctx, c.TenantUUID, in.Project, in.Environment, normalized, in.RecoveryWindow)
 	if err != nil {
 		s.recordFailure(ctx, c, store.ActionFolderDelete, resourceMRN, err)
 		return 0, err

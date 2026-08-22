@@ -27,6 +27,11 @@ import (
 	"github.com/maintainerd/secret/internal/platform/apperror"
 )
 
+// StatusClientClosedRequest is nginx's 499. Go has no constant for it because it is not
+// in any RFC, but it is what a log pipeline expects to see when the client hung up, and
+// it keeps those out of the 5xx bucket an operator alerts on.
+const StatusClientClosedRequest = 499
+
 // Envelope is the shape every REST response takes.
 type Envelope struct {
 	Success bool   `json:"success"`
@@ -126,14 +131,34 @@ func ServiceError(w http.ResponseWriter, r *http.Request, fallback string, err e
 		Error(w, http.StatusConflict, "a record with these values already exists")
 	case errors.As(err, &pgErr) && pgErr.Code == "23503":
 		Error(w, http.StatusBadRequest, "a referenced record does not exist")
+	// A request that blew its per-request deadline (middleware.Timeout) is a 503 with
+	// a Retry-After-shaped meaning, not a 500: nothing is broken, the work did not fit
+	// in the budget. Matched before the internal case so it does not fill the log with
+	// "internal service error" lines during a slow-database incident.
+	case errors.Is(err, context.DeadlineExceeded):
+		ErrorWithCode(w, http.StatusServiceUnavailable, "request_timeout",
+			"the request exceeded its time budget and was abandoned")
+	// The CLIENT went away. There is nobody to answer and nothing to alarm about, so
+	// this writes a status the connection will never carry and logs at debug.
+	case errors.Is(err, context.Canceled):
+		LoggerFromContext(r.Context()).Debug("request cancelled by the client")
+		Error(w, StatusClientClosedRequest, "the request was cancelled")
 	default:
 		LoggerFromContext(r.Context()).Error("internal service error", "error", err.Error())
 		Error(w, http.StatusInternalServerError, fallback)
 	}
 }
 
-// PageParams reads ?page and ?limit, clamping to the same bounds the store applies
-// so a client cannot ask for an unbounded page.
+// PageParams reads ?page and ?limit, applying the defaults for an absent or
+// unparseable value.
+//
+// IT DOES NOT CLAMP THE UPPER BOUND, and that is a deliberate change from the obvious
+// implementation. Clamping here would mean a client asking for 10000 rows silently
+// receives 200 and believes it has read everything — which for a reconciler walking an
+// environment means it stops early and reports success. The cap is enforced by the API
+// layer's Pagination DTO instead (internal/api/validation.go), which REFUSES an
+// over-large limit with a message naming the maximum, and which both transports funnel
+// through so the two cannot disagree about the number.
 func PageParams(r *http.Request) (page, limit int) {
 	page = atoiDefault(r.URL.Query().Get("page"), 1)
 	limit = atoiDefault(r.URL.Query().Get("limit"), 50)
@@ -142,9 +167,6 @@ func PageParams(r *http.Request) (page, limit int) {
 	}
 	if limit < 1 {
 		limit = 50
-	}
-	if limit > 200 {
-		limit = 200
 	}
 	return page, limit
 }

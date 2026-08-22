@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -168,7 +167,10 @@ func (s *Service) ListSecretVersions(ctx context.Context, req *secretv1.ListSecr
 		return nil, err
 	}
 	page, limit := pageOf(req.GetPage())
-	versions, total, err := s.api.ListVersions(ctx, c, addressOf(req.GetAddress()), page, limit)
+	versions, total, err := s.api.ListVersions(ctx, c, api.ListVersionsInput{
+		Address:    addressOf(req.GetAddress()),
+		Pagination: api.Pagination{Page: page, Limit: limit},
+	})
 	if err != nil {
 		return nil, toStatus(err, "list secret versions")
 	}
@@ -264,7 +266,11 @@ func (s *Service) ListDeletedSecrets(ctx context.Context, req *secretv1.ListDele
 		return nil, err
 	}
 	page, limit := pageOf(req.GetPage())
-	deleted, err := s.api.ListDeletedSecrets(ctx, c, req.GetProject(), req.GetEnvironment(), page, limit)
+	deleted, err := s.api.ListDeletedSecrets(ctx, c, api.ListDeletedSecretsInput{
+		Project:     req.GetProject(),
+		Environment: req.GetEnvironment(),
+		Pagination:  api.Pagination{Page: page, Limit: limit},
+	})
 	if err != nil {
 		return nil, toStatus(err, "list deleted secrets")
 	}
@@ -280,11 +286,7 @@ func (s *Service) RestoreSecret(ctx context.Context, req *secretv1.RestoreSecret
 	if err != nil {
 		return nil, err
 	}
-	id, err := uuid.Parse(req.GetSecretUuid())
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, "secret_uuid must be a UUID")
-	}
-	meta, err := s.api.RestoreSecret(ctx, c, id)
+	meta, err := s.api.RestoreSecret(ctx, c, api.SecretUUIDInput{SecretUUID: req.GetSecretUuid()})
 	if err != nil {
 		return nil, toStatus(err, "restore secret")
 	}
@@ -296,11 +298,7 @@ func (s *Service) DestroySecret(ctx context.Context, req *secretv1.DestroySecret
 	if err != nil {
 		return nil, err
 	}
-	id, err := uuid.Parse(req.GetSecretUuid())
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, "secret_uuid must be a UUID")
-	}
-	if err := s.api.DestroySecret(ctx, c, id); err != nil {
+	if err := s.api.DestroySecret(ctx, c, api.SecretUUIDInput{SecretUUID: req.GetSecretUuid()}); err != nil {
 		return nil, toStatus(err, "destroy secret")
 	}
 	return &secretv1.DestroySecretResponse{Destroyed: true}, nil
@@ -390,7 +388,7 @@ func (s *Service) CreateWebhookEndpoint(ctx context.Context, req *secretv1.Creat
 	if err != nil {
 		return nil, err
 	}
-	endpoint, err := s.api.CreateWebhookEndpoint(ctx, c, store.CreateWebhookEndpointInput{
+	endpoint, err := s.api.CreateWebhookEndpoint(ctx, c, api.CreateWebhookEndpointInput{
 		Project:        req.GetProject(),
 		URL:            req.GetUrl(),
 		Description:    req.GetDescription(),
@@ -413,7 +411,10 @@ func (s *Service) ListWebhookEndpoints(ctx context.Context, req *secretv1.ListWe
 		return nil, err
 	}
 	page, limit := pageOf(req.GetPage())
-	endpoints, total, err := s.api.ListWebhookEndpoints(ctx, c, req.GetProject(), page, limit)
+	endpoints, total, err := s.api.ListWebhookEndpoints(ctx, c, api.ListWebhookEndpointsInput{
+		Project:    req.GetProject(),
+		Pagination: api.Pagination{Page: page, Limit: limit},
+	})
 	if err != nil {
 		return nil, toStatus(err, "list webhook endpoints")
 	}
@@ -429,12 +430,9 @@ func (s *Service) UpdateWebhookEndpoint(ctx context.Context, req *secretv1.Updat
 	if err != nil {
 		return nil, err
 	}
-	id, err := uuid.Parse(req.GetEndpointUuid())
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, "endpoint_uuid must be a UUID")
-	}
-	endpoint, err := s.api.UpdateWebhookEndpoint(ctx, c, req.GetProject(), store.UpdateWebhookEndpointInput{
-		EndpointUUID:   id,
+	endpoint, err := s.api.UpdateWebhookEndpoint(ctx, c, api.UpdateWebhookEndpointInput{
+		Project:        req.GetProject(),
+		EndpointUUID:   req.GetEndpointUuid(),
 		URL:            req.GetUrl(),
 		Description:    req.GetDescription(),
 		Events:         req.GetEvents(),
@@ -453,11 +451,10 @@ func (s *Service) DeleteWebhookEndpoint(ctx context.Context, req *secretv1.Delet
 	if err != nil {
 		return nil, err
 	}
-	id, err := uuid.Parse(req.GetEndpointUuid())
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, "endpoint_uuid must be a UUID")
-	}
-	if err := s.api.DeleteWebhookEndpoint(ctx, c, req.GetProject(), id); err != nil {
+	if err := s.api.DeleteWebhookEndpoint(ctx, c, api.WebhookEndpointRef{
+		Project:      req.GetProject(),
+		EndpointUUID: req.GetEndpointUuid(),
+	}); err != nil {
 		return nil, toStatus(err, "delete webhook endpoint")
 	}
 	return &secretv1.DeleteWebhookEndpointResponse{Deleted: true}, nil
@@ -468,12 +465,12 @@ func (s *Service) ListWebhookDeliveries(ctx context.Context, req *secretv1.ListW
 	if err != nil {
 		return nil, err
 	}
-	id, err := uuid.Parse(req.GetEndpointUuid())
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, "endpoint_uuid must be a UUID")
-	}
 	page, limit := pageOf(req.GetPage())
-	deliveries, total, err := s.api.ListWebhookDeliveries(ctx, c, req.GetProject(), id, page, limit)
+	deliveries, total, err := s.api.ListWebhookDeliveries(ctx, c, api.ListWebhookDeliveriesInput{
+		Project:      req.GetProject(),
+		EndpointUUID: req.GetEndpointUuid(),
+		Pagination:   api.Pagination{Page: page, Limit: limit},
+	})
 	if err != nil {
 		return nil, toStatus(err, "list webhook deliveries")
 	}
@@ -505,7 +502,9 @@ func (s *Service) ListAuditEvents(ctx context.Context, req *secretv1.ListAuditEv
 		return nil, err
 	}
 	page, limit := pageOf(req.GetPage())
-	entries, total, err := s.api.ListAuditEvents(ctx, c, page, limit)
+	entries, total, err := s.api.ListAuditEvents(ctx, c, api.ListAuditEventsInput{
+		Pagination: api.Pagination{Page: page, Limit: limit},
+	})
 	if err != nil {
 		return nil, toStatus(err, "list audit events")
 	}

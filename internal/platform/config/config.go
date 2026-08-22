@@ -35,6 +35,41 @@ var (
 	GRPCAddr string // GRPC_PORT; default ":9092".
 	HTTPAddr string // HTTP_PORT; default ":8092".
 
+	// --- http server timeouts ----------------------------------------------
+	//
+	// Every one of these exists to bound a resource an anonymous peer can hold.
+	// A server with no timeouts is a server whose connection table is a
+	// denial-of-service target: a slowloris client opens sockets, sends one byte
+	// a minute, and never has to authenticate to do it.
+
+	// HTTPReadHeaderTimeout (HTTP_READ_HEADER_TIMEOUT, default 10s) bounds how
+	// long a peer may take to send request headers. This is the slowloris bound
+	// specifically, and it is separate from the body bound because a slow BODY
+	// from an authenticated client is ordinary and a slow HEADER never is.
+	HTTPReadHeaderTimeout time.Duration
+	// HTTPReadTimeout (HTTP_READ_TIMEOUT, default 15s) bounds headers plus body.
+	HTTPReadTimeout time.Duration
+	// HTTPWriteTimeout (HTTP_WRITE_TIMEOUT, default 60s) bounds the response.
+	HTTPWriteTimeout time.Duration
+	// HTTPIdleTimeout (HTTP_IDLE_TIMEOUT, default 120s) bounds a keep-alive
+	// connection between requests.
+	HTTPIdleTimeout time.Duration
+	// HTTPRequestTimeout (HTTP_REQUEST_TIMEOUT, default 30s) is the per-request
+	// context deadline handlers inherit, so a query that will never finish stops
+	// occupying a pool connection. It must be shorter than HTTPWriteTimeout, or
+	// the write deadline fires first and the client sees a truncated response
+	// instead of a 503.
+	HTTPRequestTimeout time.Duration
+	// HTTPMaxBodyBytes (HTTP_MAX_BODY_BYTES, default 4 MiB) caps a request body.
+	// Enforced by http.MaxBytesReader on EVERY route, including the ones that
+	// take no body, because the guard runs after the body has started arriving.
+	HTTPMaxBodyBytes int64
+	// ShutdownTimeout (SHUTDOWN_TIMEOUT, default 20s) bounds the drain on
+	// SIGTERM: in-flight HTTP requests, in-flight RPCs, and the rotator's
+	// current pass. A container runtime will send SIGKILL after its own grace
+	// period, so this must be shorter than that (Kubernetes defaults to 30s).
+	ShutdownTimeout time.Duration
+
 	// --- database ----------------------------------------------------------
 	DBHost               string // DB_HOST (required)
 	DBPort               string // DB_PORT (required)
@@ -45,6 +80,7 @@ var (
 	DBMaxOpenConns       int    // DB_MAX_OPEN_CONNS; default 25
 	DBMaxIdleConns       int    // DB_MAX_IDLE_CONNS; default 5
 	DBConnMaxLifetimeSec int    // DB_CONN_MAX_LIFETIME_SEC; default 300
+	DBConnMaxIdleSec     int    // DB_CONN_MAX_IDLE_SEC; default 90
 	DBStatementTimeoutMs int    // DB_STATEMENT_TIMEOUT_MS; default 30000
 
 	// --- root of trust -----------------------------------------------------
@@ -161,6 +197,80 @@ var (
 	// WebhookConcurrency (SECRET_WEBHOOK_CONCURRENCY, default 4) bounds parallel
 	// deliveries for one event, so a slow endpoint cannot serialize the fan-out.
 	WebhookConcurrency int
+
+	// WebhookMaxTimeoutSeconds (SECRET_WEBHOOK_MAX_TIMEOUT_SEC, default 30) caps
+	// the per-endpoint delivery timeout a caller may register. Deliveries run
+	// inline on the write path, so this is also a bound on how long a secret
+	// write can be held open by a tenant-supplied URL.
+	WebhookMaxTimeoutSeconds int
+	// WebhookMaxAttempts (SECRET_WEBHOOK_MAX_ATTEMPTS, default 10) caps the
+	// per-endpoint retry budget, for the same reason.
+	WebhookMaxAttempts int
+
+	// --- request limits ----------------------------------------------------
+	//
+	// These are the server-side bounds on what one request may CONTAIN, as
+	// opposed to how long it may take. They are surfaced to the API layer as an
+	// api.Limits (see internal/api/limits.go), which the request DTOs read, so
+	// REST and gRPC are bounded identically. Every one is clamped to a positive
+	// value: setting a limit to 0 yields the default, never "no limit".
+
+	// MaxSecretValueBytes (SECRET_MAX_VALUE_BYTES, default 65536) bounds one
+	// secret's plaintext, measured on the DECODED bytes.
+	MaxSecretValueBytes int
+	// MaxBatchItems (SECRET_MAX_BATCH_ITEMS, default 100) bounds items in one
+	// bulk get/put. It may be LOWERED but never raised past 100: an unbounded
+	// batch get is a bulk-decryption endpoint.
+	MaxBatchItems int
+	// MaxTags (SECRET_MAX_TAGS, default 32) and MaxTagLength
+	// (SECRET_MAX_TAG_LENGTH, default 64) bound a secret's tag list, which is
+	// returned in every listing.
+	MaxTags      int
+	MaxTagLength int
+	// MaxPageLimit (SECRET_MAX_PAGE_LIMIT, default 200) is the largest page a
+	// client may request. A larger `limit` is REFUSED, not clamped.
+	MaxPageLimit int
+	// MaxDescriptionLength (SECRET_MAX_DESCRIPTION_LENGTH, default 500) bounds
+	// free-text description fields.
+	MaxDescriptionLength int
+
+	// --- rate limiting -----------------------------------------------------
+	//
+	// The limiter is IN-PROCESS (see internal/platform/middleware/rate_limit.go).
+	// This service has no Redis, so the counters are per-replica: with N
+	// replicas behind a load balancer the effective ceiling is N times the
+	// configured one. That is stated plainly rather than papered over — it is a
+	// brute-force and burst dampener, not a distributed quota.
+
+	// RateLimitEnabled (SECRET_RATE_LIMIT_ENABLED, default true) turns the
+	// limiter off. Off is a supported configuration for a deployment that meters
+	// at its ingress; it is not the default.
+	RateLimitEnabled bool
+	// RateLimitWindow (SECRET_RATE_LIMIT_WINDOW, default 1m) is the counting
+	// window every budget below is measured over.
+	RateLimitWindow time.Duration
+	// RateLimitReveal (SECRET_RATE_LIMIT_REVEAL, default 300) budgets the reveal
+	// surfaces per principal per window — the single reveal and the batch get.
+	// It is the exfiltration bound: a compromised token with broad grants is
+	// metered on how fast it can walk a store.
+	RateLimitReveal int
+	// RateLimitWrite (SECRET_RATE_LIMIT_WRITE, default 120) budgets every
+	// mutating surface per principal per window.
+	RateLimitWrite int
+	// RateLimitSetup (SECRET_RATE_LIMIT_SETUP, default 10) budgets the
+	// self-guarded setup surface per client IP per window. That surface compares
+	// a bootstrap token, so it is the one brute-forceable path reachable without
+	// an Auth-minted credential, and it is keyed by IP because there is no
+	// principal yet.
+	RateLimitSetup int
+
+	// --- readiness ---------------------------------------------------------
+
+	// ReadinessTimeout (SECRET_READINESS_TIMEOUT, default 2s) bounds the
+	// dependency probes /readyz performs. A probe that hangs must report NOT
+	// ready rather than hang with it: a readiness endpoint that never answers is
+	// read as a failing pod by some orchestrators and a healthy one by others.
+	ReadinessTimeout time.Duration
 )
 
 // Init reads, validates and freezes the configuration. It returns an error rather
@@ -173,6 +283,9 @@ func Init() error {
 	HTTPAddr = kitconfig.NormalizePort(kitconfig.GetEnv("HTTP_PORT", "8092"))
 
 	var err error
+	if err = initServerTimeouts(); err != nil {
+		return err
+	}
 	if DBHost, err = required("DB_HOST"); err != nil {
 		return err
 	}
@@ -196,6 +309,9 @@ func Init() error {
 		return err
 	}
 	if DBConnMaxLifetimeSec, err = positiveInt("DB_CONN_MAX_LIFETIME_SEC", 300); err != nil {
+		return err
+	}
+	if DBConnMaxIdleSec, err = positiveInt("DB_CONN_MAX_IDLE_SEC", 90); err != nil {
 		return err
 	}
 	if DBStatementTimeoutMs, err = positiveInt("DB_STATEMENT_TIMEOUT_MS", 30000); err != nil {
@@ -269,6 +385,18 @@ func Init() error {
 	if WebhookConcurrency, err = positiveInt("SECRET_WEBHOOK_CONCURRENCY", 4); err != nil {
 		return err
 	}
+	if WebhookMaxTimeoutSeconds, err = positiveInt("SECRET_WEBHOOK_MAX_TIMEOUT_SEC", 30); err != nil {
+		return err
+	}
+	if WebhookMaxAttempts, err = positiveInt("SECRET_WEBHOOK_MAX_ATTEMPTS", 10); err != nil {
+		return err
+	}
+	if err = initRequestLimits(); err != nil {
+		return err
+	}
+	if err = initRateLimits(); err != nil {
+		return err
+	}
 
 	SetupBootstrapToken = kitconfig.GetEnv("SETUP_BOOTSTRAP_TOKEN", "")
 	if SetupBootstrapToken == "" && !IsDevelopment() {
@@ -282,6 +410,101 @@ func Init() error {
 	DefaultProject = kitconfig.GetEnv("SECRET_DEFAULT_PROJECT", "default")
 	DefaultEnvironment = kitconfig.GetEnv("SECRET_DEFAULT_ENVIRONMENT", "default")
 
+	return nil
+}
+
+// initServerTimeouts reads the HTTP server and shutdown bounds.
+//
+// The one CROSS-CHECK is deliberate: a per-request deadline longer than the write
+// timeout is a configuration that cannot work, because the write deadline fires first
+// and the client sees a truncated response rather than the 503 the deadline was meant
+// to produce. Refusing at boot means the operator learns it now.
+func initServerTimeouts() error {
+	var err error
+	if HTTPReadHeaderTimeout, err = positiveDuration("HTTP_READ_HEADER_TIMEOUT", 10*time.Second); err != nil {
+		return err
+	}
+	if HTTPReadTimeout, err = positiveDuration("HTTP_READ_TIMEOUT", 15*time.Second); err != nil {
+		return err
+	}
+	if HTTPWriteTimeout, err = positiveDuration("HTTP_WRITE_TIMEOUT", 60*time.Second); err != nil {
+		return err
+	}
+	if HTTPIdleTimeout, err = positiveDuration("HTTP_IDLE_TIMEOUT", 120*time.Second); err != nil {
+		return err
+	}
+	if HTTPRequestTimeout, err = positiveDuration("HTTP_REQUEST_TIMEOUT", 30*time.Second); err != nil {
+		return err
+	}
+	if ShutdownTimeout, err = positiveDuration("SHUTDOWN_TIMEOUT", 20*time.Second); err != nil {
+		return err
+	}
+	if ReadinessTimeout, err = positiveDuration("SECRET_READINESS_TIMEOUT", 2*time.Second); err != nil {
+		return err
+	}
+	if HTTPRequestTimeout >= HTTPWriteTimeout {
+		return fmt.Errorf(
+			"config: HTTP_REQUEST_TIMEOUT (%s) must be shorter than HTTP_WRITE_TIMEOUT (%s), "+
+				"or the write deadline fires first and a timed-out request returns a truncated response instead of an error",
+			HTTPRequestTimeout, HTTPWriteTimeout)
+	}
+	if HTTPMaxBodyBytes, err = positiveInt64("HTTP_MAX_BODY_BYTES", 4<<20); err != nil {
+		return err
+	}
+	return nil
+}
+
+// initRequestLimits reads the bounds on request CONTENT.
+func initRequestLimits() error {
+	var err error
+	if MaxSecretValueBytes, err = positiveInt("SECRET_MAX_VALUE_BYTES", 64<<10); err != nil {
+		return err
+	}
+	if MaxBatchItems, err = positiveInt("SECRET_MAX_BATCH_ITEMS", 100); err != nil {
+		return err
+	}
+	if MaxTags, err = positiveInt("SECRET_MAX_TAGS", 32); err != nil {
+		return err
+	}
+	if MaxTagLength, err = positiveInt("SECRET_MAX_TAG_LENGTH", 64); err != nil {
+		return err
+	}
+	if MaxPageLimit, err = positiveInt("SECRET_MAX_PAGE_LIMIT", 200); err != nil {
+		return err
+	}
+	if MaxDescriptionLength, err = positiveInt("SECRET_MAX_DESCRIPTION_LENGTH", 500); err != nil {
+		return err
+	}
+	// A value bound larger than the body bound is not wrong, but it is a lie: the
+	// body reader refuses first, and the operator who raised one and not the other
+	// would be debugging a 413 while reading a 64 KiB limit.
+	if int64(MaxSecretValueBytes) >= HTTPMaxBodyBytes {
+		return fmt.Errorf(
+			"config: SECRET_MAX_VALUE_BYTES (%d) must be smaller than HTTP_MAX_BODY_BYTES (%d); "+
+				"base64 on the REST surface makes a value roughly a third larger on the wire",
+			MaxSecretValueBytes, HTTPMaxBodyBytes)
+	}
+	return nil
+}
+
+// initRateLimits reads the in-process limiter's budgets.
+func initRateLimits() error {
+	var err error
+	if RateLimitEnabled, err = boolEnv("SECRET_RATE_LIMIT_ENABLED", true); err != nil {
+		return err
+	}
+	if RateLimitWindow, err = positiveDuration("SECRET_RATE_LIMIT_WINDOW", time.Minute); err != nil {
+		return err
+	}
+	if RateLimitReveal, err = positiveInt("SECRET_RATE_LIMIT_REVEAL", 300); err != nil {
+		return err
+	}
+	if RateLimitWrite, err = positiveInt("SECRET_RATE_LIMIT_WRITE", 120); err != nil {
+		return err
+	}
+	if RateLimitSetup, err = positiveInt("SECRET_RATE_LIMIT_SETUP", 10); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -326,6 +549,43 @@ func positiveInt(key string, def int) (int, error) {
 		return 0, fmt.Errorf("config: %s must be at least 1, got %d", key, n)
 	}
 	return n, nil
+}
+
+// positiveInt64 is positiveInt for a byte count, which can legitimately exceed an
+// int32 on a 32-bit build.
+func positiveInt64(key string, def int64) (int64, error) {
+	raw := kitconfig.GetEnv(key, "")
+	if raw == "" {
+		return def, nil
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s must be an integer, got %q", key, raw)
+	}
+	if n < 1 {
+		return 0, fmt.Errorf("config: %s must be at least 1, got %d", key, n)
+	}
+	return n, nil
+}
+
+// positiveDuration parses a duration env var and REFUSES a malformed or non-positive
+// value rather than falling back to the default. A timeout that silently becomes the
+// default is a bound nobody chose; a timeout of zero is no bound at all, which for
+// every variable that uses this helper means an unbounded resource an anonymous peer
+// can hold.
+func positiveDuration(key string, def time.Duration) (time.Duration, error) {
+	raw := strings.TrimSpace(kitconfig.GetEnv(key, ""))
+	if raw == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s must be a duration such as \"30s\", got %q", key, raw)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("config: %s must be positive, got %s", key, d)
+	}
+	return d, nil
 }
 
 // boolCount counts how many of the flags are set, used for the all-or-nothing

@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/maintainerd/secret/internal/platform/apperror"
 	"github.com/maintainerd/secret/internal/store"
@@ -32,8 +31,8 @@ import (
 // request that reveals an entire environment, held in memory at once, with a single
 // audit timestamp. The bound is what keeps a reveal an event rather than a stream.
 
-// MaxBatchSize bounds items per bulk call.
-const MaxBatchSize = 100
+// The bound itself lives in internal/api/limits.go (Limits.MaxBatchItems, capped by
+// the MaxBatchSize constant) so an operator can lower it and nobody can raise it.
 
 // BatchGetItem is one requested reveal.
 type BatchGetItem struct {
@@ -64,12 +63,11 @@ func (r *BatchGetResult) Zero() {
 // so an aborted batch never leaves decrypted values in a slice the caller was not
 // given.
 func (s *Service) BatchGet(ctx context.Context, c Caller, items []BatchGetItem) ([]BatchGetResult, error) {
-	if len(items) == 0 {
-		return nil, apperror.NewValidation("a batch get needs at least one item")
-	}
-	if len(items) > MaxBatchSize {
-		return nil, apperror.NewValidation(fmt.Sprintf(
-			"a batch get is limited to %d items, got %d", MaxBatchSize, len(items)))
+	// The whole batch is validated up front — item count AND every item's address —
+	// so a malformed item is a 400 for the request rather than a per-item error
+	// buried among ninety-nine successful reveals.
+	if err := validate(BatchGetInput{Items: items}); err != nil {
+		return nil, err
 	}
 
 	out := make([]BatchGetResult, 0, len(items))
@@ -122,12 +120,8 @@ type BatchPutResult struct {
 // it has nothing to do with. Per-item results tell the caller exactly which writes
 // landed, which is what a reconciler needs in order to retry the rest.
 func (s *Service) BatchPut(ctx context.Context, c Caller, items []BatchPutItem) ([]BatchPutResult, error) {
-	if len(items) == 0 {
-		return nil, apperror.NewValidation("a batch put needs at least one item")
-	}
-	if len(items) > MaxBatchSize {
-		return nil, apperror.NewValidation(fmt.Sprintf(
-			"a batch put is limited to %d items, got %d", MaxBatchSize, len(items)))
+	if err := validate(BatchPutInput{Items: items}); err != nil {
+		return nil, err
 	}
 
 	out := make([]BatchPutResult, 0, len(items))

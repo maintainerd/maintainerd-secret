@@ -24,7 +24,7 @@ func unavailableRouter() http.Handler {
 	return NewServer(nil, nil, authz.Guard{
 		Mode:   authz.ModeUnavailable,
 		Reason: "AUTH_JWKS_URL not set",
-	}).Router()
+	}, Options{}).Router()
 }
 
 func do(t *testing.T, router http.Handler, method, target string) *httptest.ResponseRecorder {

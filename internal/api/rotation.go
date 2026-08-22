@@ -52,6 +52,9 @@ type RotateSecretInput struct {
 // different"; reading the result is a reveal, with its own grant and its own audit
 // row. A rotate that returned the value would be a reveal with a weaker permission.
 func (s *Service) RotateSecret(ctx context.Context, c Caller, in RotateSecretInput) (*store.PutResult, error) {
+	if err := validate(in); err != nil {
+		return nil, err
+	}
 	ref := in.Address.ref(c)
 	resourceMRN, err := s.store.SecretMRN(ctx, ref)
 	if err != nil {
@@ -60,6 +63,9 @@ func (s *Service) RotateSecret(ctx context.Context, c Caller, in RotateSecretInp
 	if err := s.guard(ctx, c, authz.PermRotateSecret, store.ActionRotate, resourceMRN); err != nil {
 		return nil, err
 	}
+	// Validate again on the local copy: the DTO rule proved the spec is usable, and
+	// this call is what NORMALIZES it (the zero value becomes a random alphanumeric of
+	// the default length) before Generate reads it.
 	spec := in.Generator
 	if err := spec.Validate(false); err != nil {
 		return nil, apperror.NewValidation(err.Error())
@@ -109,6 +115,9 @@ func (s *Service) RotateSecret(ctx context.Context, c Caller, in RotateSecretInp
 // that a credential rotates every 30 days is an administrative act, distinct both
 // from writing a value and from performing a rotation.
 func (s *Service) SetRotationPolicy(ctx context.Context, c Caller, addr SecretAddress, policy rotation.Policy) (*store.SecretMeta, error) {
+	if err := validate(SetRotationPolicyInput{Address: addr, Policy: policy}); err != nil {
+		return nil, err
+	}
 	ref := addr.ref(c)
 	resourceMRN, err := s.store.SecretMRN(ctx, ref)
 	if err != nil {

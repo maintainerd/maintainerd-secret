@@ -3,11 +3,18 @@ package httpapi
 import (
 	"net/http"
 
+	"github.com/go-chi/chi/v5"
+
+	"github.com/maintainerd/secret/internal/api"
 	"github.com/maintainerd/secret/internal/platform/response"
-	"github.com/maintainerd/secret/internal/store"
 )
 
 // Webhook endpoint handlers and the audit read.
+//
+// The handlers construct the api-layer DTOs (api.CreateWebhookEndpointInput and
+// friends) and hand them straight over; the URL policy, the event-name set, the status
+// set and the timeout/retry caps all live on those DTOs, so the gRPC surface enforces
+// exactly the same rules.
 
 type createWebhookRequest struct {
 	Project        string   `json:"project"`
@@ -32,7 +39,7 @@ func (s *Server) createWebhook(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	endpoint, err := s.api.CreateWebhookEndpoint(r.Context(), c, store.CreateWebhookEndpointInput{
+	endpoint, err := s.api.CreateWebhookEndpoint(r.Context(), c, api.CreateWebhookEndpointInput{
 		Project:        req.Project,
 		URL:            req.URL,
 		Description:    req.Description,
@@ -53,12 +60,11 @@ func (s *Server) listWebhooks(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	project, ok := requireQuery(w, r, "project")
-	if !ok {
-		return
-	}
 	page, limit := response.PageParams(r)
-	endpoints, total, err := s.api.ListWebhookEndpoints(r.Context(), c, project, page, limit)
+	endpoints, total, err := s.api.ListWebhookEndpoints(r.Context(), c, api.ListWebhookEndpointsInput{
+		Project:    r.URL.Query().Get("project"),
+		Pagination: api.Pagination{Page: page, Limit: limit},
+	})
 	if err != nil {
 		response.ServiceError(w, r, "could not list webhook endpoints", err)
 		return
@@ -81,16 +87,13 @@ func (s *Server) updateWebhook(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	id, ok := pathUUID(w, r, "endpointUUID")
-	if !ok {
-		return
-	}
 	var req updateWebhookRequest
 	if !decode(w, r, &req) {
 		return
 	}
-	endpoint, err := s.api.UpdateWebhookEndpoint(r.Context(), c, req.Project, store.UpdateWebhookEndpointInput{
-		EndpointUUID:   id,
+	endpoint, err := s.api.UpdateWebhookEndpoint(r.Context(), c, api.UpdateWebhookEndpointInput{
+		Project:        req.Project,
+		EndpointUUID:   chi.URLParam(r, "endpointUUID"),
 		URL:            req.URL,
 		Description:    req.Description,
 		Events:         req.Events,
@@ -110,15 +113,10 @@ func (s *Server) deleteWebhook(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	id, ok := pathUUID(w, r, "endpointUUID")
-	if !ok {
-		return
-	}
-	project, ok := requireQuery(w, r, "project")
-	if !ok {
-		return
-	}
-	if err := s.api.DeleteWebhookEndpoint(r.Context(), c, project, id); err != nil {
+	if err := s.api.DeleteWebhookEndpoint(r.Context(), c, api.WebhookEndpointRef{
+		Project:      r.URL.Query().Get("project"),
+		EndpointUUID: chi.URLParam(r, "endpointUUID"),
+	}); err != nil {
 		response.ServiceError(w, r, "could not delete the webhook endpoint", err)
 		return
 	}
@@ -130,16 +128,12 @@ func (s *Server) listWebhookDeliveries(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	id, ok := pathUUID(w, r, "endpointUUID")
-	if !ok {
-		return
-	}
-	project, ok := requireQuery(w, r, "project")
-	if !ok {
-		return
-	}
 	page, limit := response.PageParams(r)
-	deliveries, total, err := s.api.ListWebhookDeliveries(r.Context(), c, project, id, page, limit)
+	deliveries, total, err := s.api.ListWebhookDeliveries(r.Context(), c, api.ListWebhookDeliveriesInput{
+		Project:      r.URL.Query().Get("project"),
+		EndpointUUID: chi.URLParam(r, "endpointUUID"),
+		Pagination:   api.Pagination{Page: page, Limit: limit},
+	})
 	if err != nil {
 		response.ServiceError(w, r, "could not list webhook deliveries", err)
 		return
@@ -154,7 +148,9 @@ func (s *Server) listAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	page, limit := response.PageParams(r)
-	entries, total, err := s.api.ListAuditEvents(r.Context(), c, page, limit)
+	entries, total, err := s.api.ListAuditEvents(r.Context(), c, api.ListAuditEventsInput{
+		Pagination: api.Pagination{Page: page, Limit: limit},
+	})
 	if err != nil {
 		response.ServiceError(w, r, "could not read the audit trail", err)
 		return

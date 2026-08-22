@@ -9,7 +9,6 @@ import (
 	"github.com/maintainerd/secret/internal/audit"
 	"github.com/maintainerd/secret/internal/platform/apperror"
 	"github.com/maintainerd/secret/internal/platform/authz"
-	"github.com/maintainerd/secret/internal/rotation"
 	"github.com/maintainerd/secret/internal/store"
 )
 
@@ -70,6 +69,9 @@ func (s *Service) Reveal(ctx context.Context, c Caller, addr SecretAddress, vers
 	// one either.
 	if s.auditor == nil {
 		return nil, audit.ErrNoAuditor
+	}
+	if err := validate(RevealSecretInput{Address: addr, Version: version}); err != nil {
+		return nil, err
 	}
 	// Scope imports are resolved BEFORE the permission check, and the check is made
 	// against the secret that will actually be decrypted — see internal/api/imports.go
@@ -161,6 +163,9 @@ func revealMetadata(revealed *store.RevealedSecret, hops []string, resolved reso
 // is that of the secret a reveal would actually decrypt. Reporting staging's address
 // with dev's rotation timestamps would be worse than either answer alone.
 func (s *Service) DescribeSecret(ctx context.Context, c Caller, addr SecretAddress) (*store.SecretMeta, error) {
+	if err := validate(addr); err != nil {
+		return nil, err
+	}
 	resolved, err := s.resolveThroughImports(ctx, c, addr)
 	if err != nil {
 		return nil, err
@@ -208,6 +213,10 @@ type ListSecretsInput struct {
 // it returns []store.SecretMeta — a type with no value field — so "listing cannot
 // leak a value" holds structurally rather than by filtering.
 func (s *Service) ListSecrets(ctx context.Context, c Caller, in ListSecretsInput) ([]store.SecretMeta, int64, error) {
+	if err := validate(in); err != nil {
+		return nil, 0, err
+	}
+	page, limit := Pagination{Page: in.Page, Limit: in.Limit}.resolved()
 	names, err := s.store.ResolveScopeNames(ctx, c.TenantUUID, in.Project, in.Environment)
 	if err != nil {
 		return nil, 0, err
@@ -225,8 +234,8 @@ func (s *Service) ListSecrets(ctx context.Context, c Caller, in ListSecretsInput
 		Project:     in.Project,
 		Environment: in.Environment,
 		PathPrefix:  prefix,
-		Page:        in.Page,
-		Limit:       in.Limit,
+		Page:        page,
+		Limit:       limit,
 	})
 	if err != nil {
 		s.recordFailure(ctx, c, store.ActionList, resourceMRN, err)
@@ -246,8 +255,12 @@ func (s *Service) ListSecrets(ctx context.Context, c Caller, in ListSecretsInput
 // which root key wrapped each, and each one's checksum. No payloads — browsing
 // history must never be a way to pull every value a credential has ever held, which
 // is why this needs only ReadMetadata.
-func (s *Service) ListVersions(ctx context.Context, c Caller, addr SecretAddress, page, limit int) ([]store.VersionMeta, int64, error) {
-	ref := addr.ref(c)
+func (s *Service) ListVersions(ctx context.Context, c Caller, in ListVersionsInput) ([]store.VersionMeta, int64, error) {
+	if err := validate(in); err != nil {
+		return nil, 0, err
+	}
+	page, limit := in.Pagination.resolved()
+	ref := in.Address.ref(c)
 	resourceMRN, err := s.store.SecretMRN(ctx, ref)
 	if err != nil {
 		return nil, 0, err
@@ -299,6 +312,13 @@ type PutSecretInput struct {
 // believes otherwise), and a policy carrying a generator `value` would put a
 // plaintext credential into readable metadata.
 func (s *Service) PutSecret(ctx context.Context, c Caller, in PutSecretInput) (*store.PutResult, error) {
+	// Validated before the MRN is resolved: resolving reads the database, and a
+	// syntactically impossible address should not buy a caller a query. The rotation
+	// policy is parsed by the DTO's rules (rotationPolicyMapRule), which is the same
+	// refusal this method used to make inline.
+	if err := validate(in); err != nil {
+		return nil, err
+	}
 	ref := in.Address.ref(c)
 	resourceMRN, err := s.store.SecretMRN(ctx, ref)
 	if err != nil {
@@ -306,11 +326,6 @@ func (s *Service) PutSecret(ctx context.Context, c Caller, in PutSecretInput) (*
 	}
 	if err := s.guard(ctx, c, authz.PermPutSecret, store.ActionWrite, resourceMRN); err != nil {
 		return nil, err
-	}
-	if len(in.RotationPolicy) > 0 {
-		if _, perr := rotation.ParsePolicy(in.RotationPolicy); perr != nil {
-			return nil, apperror.NewValidation(perr.Error())
-		}
 	}
 
 	result, err := s.store.PutSecret(ctx, store.PutSecretInput{
@@ -365,6 +380,9 @@ type UpdateSecretMetaInput struct {
 // ReadMetadata: retention and expiry decide when a value is destroyed, so editing
 // them is a write to the secret in every sense that matters.
 func (s *Service) UpdateSecretMeta(ctx context.Context, c Caller, in UpdateSecretMetaInput) (*store.SecretMeta, error) {
+	if err := validate(in); err != nil {
+		return nil, err
+	}
 	ref := in.Address.ref(c)
 	resourceMRN, err := s.store.SecretMRN(ctx, ref)
 	if err != nil {
@@ -372,11 +390,6 @@ func (s *Service) UpdateSecretMeta(ctx context.Context, c Caller, in UpdateSecre
 	}
 	if err := s.guard(ctx, c, authz.PermPutSecret, store.ActionMetadataUpdate, resourceMRN); err != nil {
 		return nil, err
-	}
-	if len(in.RotationPolicy) > 0 {
-		if _, perr := rotation.ParsePolicy(in.RotationPolicy); perr != nil {
-			return nil, apperror.NewValidation(perr.Error())
-		}
 	}
 	meta, err := s.store.UpdateSecretMeta(ctx, store.UpdateSecretMetaInput{
 		Ref:            ref,
@@ -410,6 +423,9 @@ func (s *Service) UpdateSecretMeta(ctx context.Context, c Caller, in UpdateSecre
 // known value, roll back, and compare version checksums to learn what the old value
 // was.
 func (s *Service) Rollback(ctx context.Context, c Caller, addr SecretAddress, version int32) (*store.PutResult, error) {
+	if err := validate(RollbackSecretInput{Address: addr, Version: version}); err != nil {
+		return nil, err
+	}
 	ref := addr.ref(c)
 	resourceMRN, err := s.store.SecretMRN(ctx, ref)
 	if err != nil {
@@ -448,6 +464,9 @@ func (s *Service) Rollback(ctx context.Context, c Caller, addr SecretAddress, ve
 // DeleteSecret soft-deletes a secret, opening its recovery window. Versions are
 // untouched: until the window closes, Restore puts the secret back intact.
 func (s *Service) DeleteSecret(ctx context.Context, c Caller, addr SecretAddress, window *time.Duration) (*store.DeletedSecret, error) {
+	if err := validate(DeleteSecretInput{Address: addr, RecoveryWindow: window}); err != nil {
+		return nil, err
+	}
 	ref := addr.ref(c)
 	resourceMRN, err := s.store.SecretMRN(ctx, ref)
 	if err != nil {
@@ -475,8 +494,12 @@ func (s *Service) DeleteSecret(ctx context.Context, c Caller, addr SecretAddress
 
 // ListDeletedSecrets returns what is still inside its recovery window, and until
 // when. Metadata only.
-func (s *Service) ListDeletedSecrets(ctx context.Context, c Caller, project, environment string, page, limit int) ([]store.DeletedSecret, error) {
-	names, err := s.store.ResolveScopeNames(ctx, c.TenantUUID, project, environment)
+func (s *Service) ListDeletedSecrets(ctx context.Context, c Caller, in ListDeletedSecretsInput) ([]store.DeletedSecret, error) {
+	if err := validate(in); err != nil {
+		return nil, err
+	}
+	page, limit := in.Pagination.resolved()
+	names, err := s.store.ResolveScopeNames(ctx, c.TenantUUID, in.Project, in.Environment)
 	if err != nil {
 		return nil, err
 	}
@@ -484,7 +507,7 @@ func (s *Service) ListDeletedSecrets(ctx context.Context, c Caller, project, env
 	if err := s.guard(ctx, c, authz.PermListSecrets, store.ActionList, resourceMRN); err != nil {
 		return nil, err
 	}
-	out, err := s.store.ListDeletedSecrets(ctx, c.TenantUUID, project, environment, page, limit)
+	out, err := s.store.ListDeletedSecrets(ctx, c.TenantUUID, in.Project, in.Environment, page, limit)
 	if err != nil {
 		s.recordFailure(ctx, c, store.ActionList, resourceMRN, err)
 		return nil, err
@@ -505,7 +528,16 @@ func (s *Service) ListDeletedSecrets(ctx context.Context, c Caller, project, env
 // address uniqueness index covers LIVE rows only, so several deleted secrets can
 // share one path and key and a restore by address would be ambiguous. The MRN is
 // therefore resolved AFTER the restore, from the restored row.
-func (s *Service) RestoreSecret(ctx context.Context, c Caller, secretUUID uuid.UUID) (*store.SecretMeta, error) {
+func (s *Service) RestoreSecret(ctx context.Context, c Caller, in SecretUUIDInput) (*store.SecretMeta, error) {
+	if err := validate(in); err != nil {
+		return nil, err
+	}
+	// Parsed after validation, so the is.UUID rule owns the message both transports
+	// return. The error is unreachable — the rule already proved the shape.
+	secretUUID, err := uuid.Parse(in.SecretUUID)
+	if err != nil {
+		return nil, apperror.NewValidation("secret_uuid must be a valid UUID")
+	}
 	// A restore is authorized at TENANT scope because the target's project and
 	// environment are not known until the row is read, and reading it to build a
 	// narrower MRN would itself be the unauthorized act. The trade is explicit: a
@@ -533,7 +565,14 @@ func (s *Service) RestoreSecret(ctx context.Context, c Caller, secretUUID uuid.U
 
 // DestroySecret permanently deletes a secret and every version of it. Irreversible,
 // and refused until the recovery window has closed (checked in the store, twice).
-func (s *Service) DestroySecret(ctx context.Context, c Caller, secretUUID uuid.UUID) error {
+func (s *Service) DestroySecret(ctx context.Context, c Caller, in SecretUUIDInput) error {
+	if err := validate(in); err != nil {
+		return err
+	}
+	secretUUID, err := uuid.Parse(in.SecretUUID)
+	if err != nil {
+		return apperror.NewValidation("secret_uuid must be a valid UUID")
+	}
 	resourceMRN := c.mrn("", store.ResourceProject)
 	if err := s.guard(ctx, c, authz.PermDeleteSecret, store.ActionDestroy, resourceMRN); err != nil {
 		return err
