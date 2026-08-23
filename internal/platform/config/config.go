@@ -10,6 +10,7 @@
 package config
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -20,9 +21,17 @@ import (
 	"time"
 
 	kitconfig "github.com/maintainerd/kit/config"
+	secretkit "github.com/maintainerd/kit/secret"
 
 	"github.com/maintainerd/secret/internal/crypto"
 )
+
+// secretSource is the resolved config source for the four secret-valued settings,
+// built once by initSecretSource. It is package-private on purpose: nothing outside
+// this package should be fetching configuration at runtime — every value it produces
+// is already frozen in an exported variable above, and a second reader would be a
+// second place where a credential can be logged.
+var secretSource *secretkit.Manager
 
 // EnvDevelopment is the one APP_ENV value in which reduced-safety behaviour (an
 // ephemeral root key, an open setup window) is permitted.
@@ -236,6 +245,99 @@ var (
 	// replicas is N times the configured ceiling, and the reveal ceiling is the
 	// exfiltration bound on a compromised token.
 	RateLimitShared bool
+
+	// --- where SECRET-VALUED CONFIGURATION comes from ----------------------
+	//
+	// TWO AXES, AND THEY ARE NOT THE SAME AXIS. This is the distinction to keep
+	// straight, because the variable names are one word apart and merging them would
+	// break both:
+	//
+	//	SECRET_PROVIDER           HOW THIS PROCESS READS ITS OWN SECRET-VALUED
+	//	                          CONFIGURATION — the four values below (DB_PASSWORD,
+	//	                          SECRET_ROOT_KEY, SETUP_BOOTSTRAP_TOKEN,
+	//	                          SECRET_CLIENT_SECRET). It is a CONFIG SOURCE, read
+	//	                          exactly once, at boot, before anything is serving.
+	//	                          env | file | aws_secrets | aws_ssm | vault | gcp |
+	//	                          azure_kv.
+	//
+	//	SECRET_ROOT_KEY_PROVIDER  HOW THE ROOT KEY (the KEK) IS OBTAINED AND USED —
+	//	                          the key that wraps every DEK in this vault. It is a
+	//	                          CRYPTOGRAPHIC ROOT OF TRUST, used on the read and
+	//	                          write path of every secret this service stores for
+	//	                          its tenants, for the lifetime of the process.
+	//	                          env | file | aws_kms | gcp_kms | azure_kv.
+	//
+	// So a deployment setting SECRET_PROVIDER=aws_secrets and
+	// SECRET_ROOT_KEY_PROVIDER=aws_kms is not redundant and not a mistake: it says
+	// "fetch my configuration from Secrets Manager, and wrap my tenants' data keys
+	// with a KMS key". Either one can be env while the other is a cloud service.
+	// Their validation is likewise separate — initSecretSource below and
+	// initRootKeyKMS further down — and neither may consult the other's variables.
+	//
+	// The one shared name is azure_kv, which appears in both lists and means different
+	// things: for SECRET_PROVIDER it is Key Vault SECRETS, for
+	// SECRET_ROOT_KEY_PROVIDER it is Key Vault KEYS. They are separate Azure APIs with
+	// separate permissions and separate settings (AZURE_KEYVAULT_URL versus
+	// SECRET_KMS_AZURE_VAULT_URL), so the collision is in the name only.
+
+	// SecretProvider (SECRET_PROVIDER) selects the config source. Default "env",
+	// which is byte-for-byte the behaviour this service had before the source was
+	// pluggable, so a deployment that sets nothing is unaffected.
+	SecretProvider string
+
+	// SecretStrict (SECRET_STRICT, default false) makes the provider authoritative.
+	//
+	// OFF, a value the provider does not have may come from the environment, which is
+	// what lets a deployment migrate ONE CREDENTIAL AT A TIME — move DB_PASSWORD into
+	// Vault today, leave the rest in the environment, finish later. ON, a missing
+	// value is a boot failure. It defaults off because the alternative makes adopting
+	// a secret store an all-or-nothing cutover; it should be turned ON once the
+	// migration is finished, at which point a forgotten variable fails loudly instead
+	// of silently resolving to whatever the environment still holds.
+	//
+	// NOTE WHAT IT IS NOT: the fallback only ever applies to a value the provider
+	// POSITIVELY REPORTS AS ABSENT. A provider that is unreachable, unauthorized or
+	// malformed is a boot error in either mode — see the kit package's ErrSecretNotFound.
+	SecretStrict bool
+
+	// SecretPrefix (SECRET_PREFIX, default "maintainerd/secret") namespaces this
+	// service's keys within the store: a secret-name prefix in AWS Secrets Manager, a
+	// parameter path prefix in SSM, a path prefix within the mount in Vault. GCP and
+	// Azure ignore it — their namespaces are flat and scoped by IAM instead.
+	SecretPrefix string
+
+	// SecretFilePath (SECRET_FILE_PATH, default /run/secrets) is the directory the
+	// "file" provider reads, one file per key: DB_PASSWORD → <dir>/db-password.
+	SecretFilePath string
+
+	// SecretAWSRegion (AWS_REGION, or AWS_DEFAULT_REGION) is the region for
+	// aws_secrets and aws_ssm. DISTINCT FROM SECRET_KMS_AWS_REGION, deliberately: the
+	// account's configuration secrets and the vault's KMS key can live in different
+	// regions, and forcing them to share one variable would make that
+	// unconfigurable. Credentials come from the standard AWS chain — this service
+	// never reads an access key.
+	SecretAWSRegion string
+
+	// Vault settings for SECRET_PROVIDER=vault. VAULT_TOKEN is a static token, which
+	// is the dev-server choice; leaving it empty selects AppRole (VAULT_ROLE_ID +
+	// VAULT_SECRET_ID), which is the production one because an AppRole token can be
+	// renewed and a static one cannot. NEVER LOG VaultToken or VaultSecretID.
+	SecretVaultAddress  string // VAULT_ADDR
+	SecretVaultToken    string // VAULT_TOKEN (secret)
+	SecretVaultMount    string // VAULT_MOUNT; default "secret"
+	SecretVaultField    string // VAULT_SECRET_FIELD; default "value"
+	SecretVaultRoleID   string // VAULT_ROLE_ID
+	SecretVaultSecretID string // VAULT_SECRET_ID (secret)
+
+	// SecretGCPProjectID (GCP_PROJECT_ID) is required by SECRET_PROVIDER=gcp.
+	// Credentials come from Application Default Credentials.
+	SecretGCPProjectID string
+
+	// SecretAzureVaultURL (AZURE_KEYVAULT_URL) is required by
+	// SECRET_PROVIDER=azure_kv. Not to be confused with
+	// SECRET_KMS_AZURE_VAULT_URL, which addresses the Key Vault KEYS API for the
+	// root key — see the two-axes note above.
+	SecretAzureVaultURL string
 
 	// --- database ----------------------------------------------------------
 	DBHost               string // DB_HOST (required)
@@ -578,6 +680,12 @@ func Init() error {
 	if err = initServerTimeouts(); err != nil {
 		return err
 	}
+	// The CONFIG SOURCE is resolved before anything that might be secret-valued is
+	// read, because it is what reads them. It is not the root of trust — see the
+	// two-axes note on SecretProvider above, and initRootKeyKMS further down.
+	if err = initSecretSource(); err != nil {
+		return err
+	}
 	if DBHost, err = required("DB_HOST"); err != nil {
 		return err
 	}
@@ -587,7 +695,10 @@ func Init() error {
 	if DBUser, err = required("DB_USER"); err != nil {
 		return err
 	}
-	if DBPassword, err = required("DB_PASSWORD"); err != nil {
+	// SECRET-VALUED (1 of 4): resolved through SECRET_PROVIDER, not os.Getenv. The
+	// host, port, user and name above stay plain environment configuration — routing a
+	// hostname through a secret manager buys nothing and costs a round trip.
+	if DBPassword, err = requiredSecret("DB_PASSWORD"); err != nil {
 		return err
 	}
 	if DBName, err = required("DB_NAME"); err != nil {
@@ -621,7 +732,18 @@ func Init() error {
 		return fmt.Errorf("config: SECRET_ROOT_KEY_PROVIDER %q is not one of %s",
 			RootKeyProvider, strings.Join(crypto.KnownProviders(), ", "))
 	}
-	RootKey = kitconfig.GetEnv("SECRET_ROOT_KEY", "")
+	// SECRET-VALUED (2 of 4). The KEY is a secret and resolves through the provider;
+	// the PROVIDER NAME and the key FILE PATH are not secrets and stay plain
+	// environment configuration.
+	//
+	// A caller storing this in a remote store should store it in the form crypto
+	// parses — hex or base64 — and NOT with a `base64:` prefix, which the kit
+	// normalizer consumes and hands back as raw bytes that ParseKeyMaterial then
+	// rejects. That fails at boot with a clear message rather than silently, but it is
+	// the wrong thing to configure.
+	if RootKey, err = optionalSecret("SECRET_ROOT_KEY"); err != nil {
+		return err
+	}
 	RootKeyFile = kitconfig.GetEnv("SECRET_ROOT_KEY_FILE", "")
 	if RootKeyProvider == crypto.ProviderFile && RootKeyFile == "" {
 		return fmt.Errorf("config: SECRET_ROOT_KEY_FILE is required when SECRET_ROOT_KEY_PROVIDER=file")
@@ -720,7 +842,12 @@ func Init() error {
 		return err
 	}
 
-	SetupBootstrapToken = kitconfig.GetEnv("SETUP_BOOTSTRAP_TOKEN", "")
+	// SECRET-VALUED (3 of 4). Optional here so the "required outside development"
+	// refusal below stays the one that reports it — a provider that simply does not
+	// hold this token must produce that message, not a generic not-found.
+	if SetupBootstrapToken, err = optionalSecret("SETUP_BOOTSTRAP_TOKEN"); err != nil {
+		return err
+	}
 	if SetupBootstrapToken == "" && !IsDevelopment() {
 		return fmt.Errorf("config: SETUP_BOOTSTRAP_TOKEN is required outside %s — an empty token leaves the one-time setup window open to anyone", EnvDevelopment)
 	}
@@ -762,7 +889,15 @@ func initRunMode() error {
 	}
 
 	ClientID = strings.TrimSpace(kitconfig.GetEnv("SECRET_CLIENT_ID", ""))
-	ClientSecret = kitconfig.GetEnv("SECRET_CLIENT_SECRET", "")
+	// SECRET-VALUED (4 of 4). The client ID, the console client ID and the private-key
+	// PATH are public identifiers and stay plain environment configuration; only the
+	// shared secret routes through the provider. Optional here because the
+	// standalone-mode check below is what decides whether its absence is an error, and
+	// it names the alternative credential in the same breath.
+	var err error
+	if ClientSecret, err = optionalSecret("SECRET_CLIENT_SECRET"); err != nil {
+		return err
+	}
 	ClientPrivateKeyFile = strings.TrimSpace(kitconfig.GetEnv("SECRET_CLIENT_PRIVATE_KEY_FILE", ""))
 	ConsoleClientID = strings.TrimSpace(kitconfig.GetEnv("SECRET_CONSOLE_CLIENT_ID", ""))
 
@@ -827,6 +962,210 @@ func standaloneMissing() []string {
 		missing = append(missing, "SECRET_CONSOLE_CLIENT_ID")
 	}
 	return missing
+}
+
+// initSecretSource resolves SECRET_PROVIDER and builds the manager the four
+// secret-valued settings are read through.
+//
+// THIS IS THE CONFIG SOURCE, NOT THE ROOT OF TRUST. It decides where DB_PASSWORD,
+// SECRET_ROOT_KEY, SETUP_BOOTSTRAP_TOKEN and SECRET_CLIENT_SECRET are fetched from at
+// boot. initRootKeyKMS, below, decides what wraps this vault's data keys for the life
+// of the process. They are validated separately, they may name different clouds, and
+// neither reads the other's variables — see the two-axes note on SecretProvider.
+//
+// THE VALIDATION IS THE POINT, exactly as it is for the KMS settings: a provider
+// selected without its coordinates must refuse to start, not fail on the first read
+// after the process is already serving. So a missing setting for the SELECTED provider
+// is a boot error naming every missing variable at once, and settings belonging to the
+// OTHER providers are read and left alone — an operator migrating between stores
+// legitimately has two sets in place.
+//
+// An UNKNOWN name is refused rather than defaulted to env. That is not defensiveness:
+// the shared implementation this replaced logged a warning and fell back to the
+// environment, so a typo ("hashicorp" instead of "vault") started the service reading
+// environment variables while the operator believed it was reading Vault — and if
+// stale values happened to be present, it booted with them.
+func initSecretSource() error {
+	if err := readSecretSourceSettings(); err != nil {
+		return err
+	}
+
+	// Constructing the manager is also what performs the transport check (a plaintext
+	// remote store is refused outside development) and, for Vault with AppRole, the
+	// login. Doing it here means every one of those failures is a boot error.
+	var err error
+	secretSource, err = secretkit.New(secretkit.Config{
+		Provider:      SecretProvider,
+		Strict:        SecretStrict,
+		Prefix:        SecretPrefix,
+		AppEnv:        AppEnv,
+		FilePath:      SecretFilePath,
+		AWSRegion:     SecretAWSRegion,
+		VaultAddress:  SecretVaultAddress,
+		VaultToken:    SecretVaultToken,
+		VaultMount:    SecretVaultMount,
+		VaultField:    SecretVaultField,
+		VaultRoleID:   SecretVaultRoleID,
+		VaultSecretID: SecretVaultSecretID,
+		GCPProjectID:  SecretGCPProjectID,
+		AzureVaultURL: SecretAzureVaultURL,
+	})
+	if err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	if SecretProvider != secretkit.ProviderEnv && !SecretStrict {
+		// Stated at boot because it is the difference between "this credential is
+		// served by the store" and "it might be, or it might be the environment", and
+		// an auditor asking that question deserves to find the answer in the log
+		// rather than in a diff of two configurations.
+		slog.Info("config: secret provider is not authoritative — a value it does not hold is read from the environment",
+			"provider", SecretProvider,
+			"to_make_authoritative", "SECRET_STRICT=true",
+			"detail", "a provider that is unreachable or unauthorized is still a boot error; only a positively absent value falls back")
+	}
+	return nil
+}
+
+// readSecretSourceSettings reads and validates the config-source variables WITHOUT
+// building a client.
+//
+// It is separate from initSecretSource so that "is this configuration acceptable" can
+// be answered without a network round trip — by a test, and by the boot itself, which
+// must reject a bad selection before it spends a credential resolution discovering it.
+func readSecretSourceSettings() error {
+	SecretProvider = strings.ToLower(strings.TrimSpace(kitconfig.GetEnv("SECRET_PROVIDER", secretkit.ProviderEnv)))
+	if err := secretkit.ValidateProvider(SecretProvider); err != nil {
+		return fmt.Errorf("config: SECRET_PROVIDER %q is not one of %s (this is the CONFIG SOURCE; "+
+			"the root key's provider is SECRET_ROOT_KEY_PROVIDER, a different setting)",
+			SecretProvider, strings.Join(secretkit.KnownProviders(), ", "))
+	}
+
+	var err error
+	if SecretStrict, err = boolEnv("SECRET_STRICT", false); err != nil {
+		return err
+	}
+	SecretPrefix = strings.TrimSpace(kitconfig.GetEnv("SECRET_PREFIX", "maintainerd/secret"))
+	SecretFilePath = strings.TrimSpace(kitconfig.GetEnv("SECRET_FILE_PATH", secretkit.DefaultFilePath))
+
+	SecretAWSRegion = strings.TrimSpace(kitconfig.GetEnv("AWS_REGION", ""))
+	if SecretAWSRegion == "" {
+		SecretAWSRegion = strings.TrimSpace(kitconfig.GetEnv("AWS_DEFAULT_REGION", ""))
+	}
+
+	SecretVaultAddress = strings.TrimSpace(kitconfig.GetEnv("VAULT_ADDR", ""))
+	SecretVaultToken = kitconfig.GetEnv("VAULT_TOKEN", "")
+	SecretVaultMount = strings.TrimSpace(kitconfig.GetEnv("VAULT_MOUNT", secretkit.DefaultVaultMount))
+	SecretVaultField = strings.TrimSpace(kitconfig.GetEnv("VAULT_SECRET_FIELD", secretkit.DefaultVaultField))
+	SecretVaultRoleID = strings.TrimSpace(kitconfig.GetEnv("VAULT_ROLE_ID", ""))
+	SecretVaultSecretID = kitconfig.GetEnv("VAULT_SECRET_ID", "")
+
+	SecretGCPProjectID = strings.TrimSpace(kitconfig.GetEnv("GCP_PROJECT_ID", ""))
+	SecretAzureVaultURL = strings.TrimSpace(kitconfig.GetEnv("AZURE_KEYVAULT_URL", ""))
+
+	if missing := secretSourceMissing(); len(missing) > 0 {
+		return fmt.Errorf(
+			"config: SECRET_PROVIDER=%s requires %s. Selecting a secret store without its coordinates "+
+				"would fail on the first configuration read rather than at boot, so this is refused here",
+			SecretProvider, strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+// secretSourceMissing lists the variables the SELECTED config source needs and does
+// not have, in the order an operator would set them.
+//
+// Naming every one at once matters for the same reason it does in kmsMissing: a
+// message that reports them one boot at a time turns a two-minute setup into four
+// restarts. env and file need nothing — SECRET_FILE_PATH has a default, and a
+// directory that does not exist surfaces as a per-key not-found, which the fallback
+// then handles or reports.
+func secretSourceMissing() []string {
+	var missing []string
+	switch SecretProvider {
+	case secretkit.ProviderAWSSecrets, secretkit.ProviderAWSSSM:
+		if SecretAWSRegion == "" {
+			missing = append(missing, "AWS_REGION (or AWS_DEFAULT_REGION)")
+		}
+	case secretkit.ProviderVault:
+		if SecretVaultAddress == "" {
+			missing = append(missing, "VAULT_ADDR")
+		}
+		// A static token OR an AppRole pair, not neither. AppRole is the production
+		// choice because its token can be renewed; a static token cannot, so a long-
+		// running process holding one eventually reads 403 for everything.
+		if SecretVaultToken == "" && (SecretVaultRoleID == "" || SecretVaultSecretID == "") {
+			missing = append(missing, "VAULT_TOKEN or VAULT_ROLE_ID+VAULT_SECRET_ID")
+		}
+	case secretkit.ProviderGCP:
+		if SecretGCPProjectID == "" {
+			missing = append(missing, "GCP_PROJECT_ID")
+		}
+	case secretkit.ProviderAzureKV:
+		if SecretAzureVaultURL == "" {
+			missing = append(missing, "AZURE_KEYVAULT_URL")
+		}
+	}
+	return missing
+}
+
+// DescribeSecretSource renders the config source for a boot log line. It names the
+// store and, for the remote ones, WHERE — never a credential: the Vault token and the
+// AppRole secret id are omitted, and a prefix, a region, a project id and a vault URL
+// are all safe to print.
+func DescribeSecretSource() string {
+	authority := "environment fallback permitted"
+	if SecretStrict {
+		authority = "authoritative (SECRET_STRICT)"
+	}
+	switch SecretProvider {
+	case secretkit.ProviderFile:
+		return fmt.Sprintf("%s (%s, %s)", SecretProvider, SecretFilePath, authority)
+	case secretkit.ProviderAWSSecrets, secretkit.ProviderAWSSSM:
+		return fmt.Sprintf("%s (%s, prefix %s, %s)", SecretProvider, SecretAWSRegion, SecretPrefix, authority)
+	case secretkit.ProviderVault:
+		return fmt.Sprintf("%s (%s, mount %s, prefix %s, %s)",
+			SecretProvider, SecretVaultAddress, SecretVaultMount, SecretPrefix, authority)
+	case secretkit.ProviderGCP:
+		return fmt.Sprintf("%s (project %s, %s)", SecretProvider, SecretGCPProjectID, authority)
+	case secretkit.ProviderAzureKV:
+		return fmt.Sprintf("%s (%s, %s)", SecretProvider, SecretAzureVaultURL, authority)
+	default:
+		return SecretProvider
+	}
+}
+
+// requiredSecret reads a secret-valued setting that this service cannot run without.
+//
+// The error is prefixed and re-worded rather than passed through so it reads like
+// every other line in this package and so it names the VARIABLE an operator would set,
+// which is not always the store-side name the provider reports.
+func requiredSecret(key string) (string, error) {
+	if secretSource == nil {
+		return "", fmt.Errorf("config: %s was read before the secret provider was resolved", key)
+	}
+	v, err := secretSource.GetString(context.Background(), key)
+	if err != nil {
+		return "", fmt.Errorf("config: %s is required: %w", key, err)
+	}
+	return v, nil
+}
+
+// optionalSecret reads a secret-valued setting that may legitimately be unset,
+// returning "" when it is configured nowhere.
+//
+// "Unset" means the provider positively does not hold it AND the environment does not
+// either. A provider that is unreachable or unauthorized is still an error — reading
+// an outage as "intentionally unset" is how a service boots with an open setup window
+// because Vault was down.
+func optionalSecret(key string) (string, error) {
+	if secretSource == nil {
+		return "", fmt.Errorf("config: %s was read before the secret provider was resolved", key)
+	}
+	v, err := secretSource.GetStringOptional(context.Background(), key)
+	if err != nil {
+		return "", fmt.Errorf("config: %s could not be read: %w", key, err)
+	}
+	return v, nil
 }
 
 // initRootKeyKMS reads the cloud-KMS settings and validates the ones the SELECTED

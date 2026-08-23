@@ -30,6 +30,24 @@ func setRequiredEnv(t *testing.T) {
 	t.Setenv("SETUP_BOOTSTRAP_TOKEN", "bootstrap-token")
 	t.Setenv("APP_ENV", "production")
 	setStandaloneEnv(t)
+	clearSecretSourceEnv(t)
+}
+
+// clearSecretSourceEnv blanks every SECRET_PROVIDER-axis variable so the config
+// source resolves to the default (env) regardless of what a developer's own shell
+// exports. Without it, a contributor with VAULT_ADDR set would see every test in this
+// package try to reach their Vault — the same reason setKMSEnv clears AWS_REGION.
+func clearSecretSourceEnv(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{
+		"SECRET_PROVIDER", "SECRET_STRICT", "SECRET_PREFIX", "SECRET_FILE_PATH",
+		"VAULT_ADDR", "VAULT_TOKEN", "VAULT_MOUNT", "VAULT_SECRET_FIELD",
+		"VAULT_ROLE_ID", "VAULT_SECRET_ID",
+		"GCP_PROJECT_ID", "AZURE_KEYVAULT_URL",
+		"AWS_REGION", "AWS_DEFAULT_REGION",
+	} {
+		t.Setenv(key, "")
+	}
 }
 
 // setStandaloneEnv sets the identity configuration standalone mode requires: the

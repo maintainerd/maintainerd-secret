@@ -81,6 +81,12 @@ func run(parent context.Context) error {
 		"mode", config.DescribeMode(),
 		"grpc_port", config.GRPCAddr,
 		"http_port", config.HTTPAddr,
+		// TWO DIFFERENT AXES, printed side by side so the log itself says they are
+		// not the same setting: config_source is where this process READ its own
+		// secret-valued configuration (SECRET_PROVIDER), root_key_provider is what
+		// WRAPS every data key in the vault (SECRET_ROOT_KEY_PROVIDER). A deployment
+		// legitimately runs aws_secrets for one and aws_kms for the other.
+		"config_source", config.DescribeSecretSource(),
 		"root_key_provider", config.RootKeyProvider,
 	)
 	logRunMode()

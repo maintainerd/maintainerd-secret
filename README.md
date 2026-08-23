@@ -773,10 +773,68 @@ about, not refused. The API answers 503 in the meantime.
 | `DB_CONN_MAX_LIFETIME_SEC` | `300` | connection lifetime |
 | `DB_STATEMENT_TIMEOUT_MS` | `30000` | server-side statement timeout |
 
+### Configuration source (`SECRET_PROVIDER`)
+
+Four of this service's own settings are **secret-valued** and resolve through a
+pluggable store at boot instead of being read straight out of the environment:
+`DB_PASSWORD`, `SECRET_ROOT_KEY`, `SETUP_BOOTSTRAP_TOKEN` and `SECRET_CLIENT_SECRET`.
+Everything else — hosts, ports, timeouts, feature flags — stays plain environment
+configuration, because routing a port number through a secret manager buys nothing and
+costs a round trip.
+
+> **`SECRET_PROVIDER` is not `SECRET_ROOT_KEY_PROVIDER`.** They are different axes and
+> both are meaningful at once. `SECRET_PROVIDER` is where **this process reads its own
+> configuration** — once, at boot, before anything is serving. `SECRET_ROOT_KEY_PROVIDER`
+> (next section) is the **cryptographic root of trust** that wraps every data key in the
+> vault, on the read and write path of every secret, for the life of the process. A
+> deployment setting `SECRET_PROVIDER=aws_secrets` **and**
+> `SECRET_ROOT_KEY_PROVIDER=aws_kms` is not redundant: it says "fetch my configuration
+> from Secrets Manager, and wrap my tenants' data keys with a KMS key". Either can be
+> `env` while the other is a cloud service, and their validation is separate. `azure_kv`
+> appears on both lists and means different things — Key Vault **secrets** for the config
+> source, Key Vault **keys** for the root key — so they read separate variables
+> (`AZURE_KEYVAULT_URL` versus `SECRET_KMS_AZURE_VAULT_URL`).
+
+| Var | Default | Purpose |
+|---|---|---|
+| `SECRET_PROVIDER` | `env` | `env`\|`file`\|`aws_secrets`\|`aws_ssm`\|`vault`\|`gcp`\|`azure_kv`. An unknown name is a **boot error**, never a silent fallback to `env` |
+| `SECRET_STRICT` | `false` | `true` makes the store authoritative. Off, a value the store does **not hold** may come from the environment, so a deployment migrates one credential at a time. Turn it on once the migration is finished |
+| `SECRET_PREFIX` | `maintainerd/secret` | namespaces this service's keys: secret-name prefix (Secrets Manager), parameter path prefix (SSM), path prefix within the mount (Vault). GCP and Azure ignore it — flat namespaces, scoped by IAM |
+| `SECRET_FILE_PATH` | `/run/secrets` | directory for the `file` provider, one file per key |
+| `AWS_REGION` | — | **required for `aws_secrets` and `aws_ssm`** (falls back to `AWS_DEFAULT_REGION`). Separate from `SECRET_KMS_AWS_REGION`: the configuration secrets and the KMS key may live in different regions |
+| `VAULT_ADDR` | — | **required for `vault`.** Must be `https` outside development; loopback is permitted for a local dev server |
+| `VAULT_TOKEN` | — | static token. **Required for `vault` unless** `VAULT_ROLE_ID`+`VAULT_SECRET_ID` are set. Never log it |
+| `VAULT_ROLE_ID` `VAULT_SECRET_ID` | — | AppRole credentials — the production choice, because an AppRole token can be renewed when it expires and a static one cannot |
+| `VAULT_MOUNT` | `secret` | KV v2 mount path |
+| `VAULT_SECRET_FIELD` | `value` | the field within a KV entry holding the value |
+| `GCP_PROJECT_ID` | — | **required for `gcp`.** Credentials from Application Default Credentials |
+| `AZURE_KEYVAULT_URL` | — | **required for `azure_kv`.** Credentials from `DefaultAzureCredential` |
+
+Only the **selected** provider's settings are required — the same rule the root of trust
+follows, and for the same reason: an operator migrating between stores keeps both sets in
+place. Key naming in every remote store is the setting name lowercased with underscores
+replaced by hyphens (`DB_PASSWORD` → `db-password`), so a secret keeps its name across a
+migration; Azure Key Vault permits only that alphabet, which is why it is used
+everywhere.
+
+Value handling is **identical for every provider**, so swapping the store is
+transparent: whitespace is trimmed (a secret written with `echo value > secret` carries a
+newline that would otherwise make a key one byte longer than the one you stored) and a
+`base64:`-prefixed payload is decoded (which is how binary key material survives a
+text-only store). Store `SECRET_ROOT_KEY` in the form the crypto layer parses — hex or
+base64 — **not** with a `base64:` prefix.
+
+Only a value the store **positively reports as absent** may fall back to the
+environment. A store that is unreachable, unauthorized or malformed is a **boot error in
+either mode**: conflating an outage with "not configured" is how a service boots on a
+stale environment value while its operator believes the store is authoritative. The boot
+log records, per secret, whether it came from the `provider` or from `env-fallback` —
+never the value.
+
 ### Root of trust
 | Var | Default | Purpose |
 |---|---|---|
-| `SECRET_ROOT_KEY_PROVIDER` | `env` | `env`\|`file`\|`aws_kms`\|`gcp_kms`\|`azure_kv` |
+| `SECRET_ROOT_KEY_PROVIDER` | `env` | `env`\|`file`\|`aws_kms`\|`gcp_kms`\|`azure_kv`. **Not** `SECRET_PROVIDER` — see the note above |
 | `SECRET_ROOT_KEY` | — | 32-byte AES-256 KEK as hex or base64. **Required outside development.** Never log it |
 | `SECRET_ROOT_KEY_FILE` | — | sealed key file for the `file` provider; must be `0600` |
 | `SECRET_KMS_TIMEOUT` | `10s` | bounds ONE cloud wrap or unwrap. The root key is on the read and write path of every secret, so an unbounded call would hold a request goroutine as long as the network allowed |
