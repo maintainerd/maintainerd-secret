@@ -25,6 +25,7 @@ import (
 	"github.com/maintainerd/secret/internal/platform/permissions"
 	"github.com/maintainerd/secret/internal/storage"
 	"github.com/maintainerd/secret/internal/store"
+	"github.com/maintainerd/secret/internal/transit"
 )
 
 // TRANSPORT-LEVEL TESTS FOR THE NEW SURFACES.
@@ -315,12 +316,29 @@ func TestAFailedDecryptSaysNothingAboutTheValue(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(sealed.Body.Bytes(), &envelope))
 
-	// Flip the last character of the payload: the token still parses, and the AEAD tag
-	// no longer authenticates.
-	tampered := envelope.Data.Ciphertext[:len(envelope.Data.Ciphertext)-1] + "A"
-	if tampered == envelope.Data.Ciphertext {
-		tampered = envelope.Data.Ciphertext[:len(envelope.Data.Ciphertext)-1] + "B"
-	}
+	// Tamper with a CIPHERTEXT BYTE, not with the encoded text.
+	//
+	// This test used to flip the last character of the base64url payload, which is
+	// flaky by construction: the final character of a base64 string may carry fewer
+	// than six significant bits, so substituting it can decode to the SAME bytes. When
+	// that happened the token authenticated, decrypt returned 200, and the assertion
+	// below failed — dependent on the random nonce and the payload length, so it passed
+	// locally and failed on CI at random.
+	//
+	// Decoding the payload, flipping one bit inside the ciphertext region (past the
+	// 12-byte nonce) and re-encoding is deterministic: the AEAD tag cannot validate a
+	// payload whose bytes actually differ, so this exercises authentication failure
+	// rather than the encoder's padding rules.
+	parts := strings.Split(envelope.Data.Ciphertext, ":")
+	require.Len(t, parts, 5, "token shape is m9dt:v1:<key>:<version>:<payload>")
+	payload, err := base64.RawURLEncoding.DecodeString(parts[4])
+	require.NoError(t, err)
+	require.Greater(t, len(payload), transit.NonceSize,
+		"the payload must carry ciphertext past the nonce for this to tamper with anything")
+	payload[transit.NonceSize] ^= 0x01
+	parts[4] = base64.RawURLEncoding.EncodeToString(payload)
+	tampered := strings.Join(parts, ":")
+	require.NotEqual(t, envelope.Data.Ciphertext, tampered)
 
 	refused := h.call(t, http.MethodPost, "/api/v1/transit/decrypt", map[string]any{
 		"project": "billing-app", "ciphertext": tampered,
