@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { Layers, Trash2 } from 'lucide-react'
-import { PageContainer } from '@/components/layout/PageContainer'
+import type { SortingState } from '@tanstack/react-table'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { ResourceListing } from '@/components/data-table'
 import { EmptyState } from '@/components/details'
@@ -10,6 +10,11 @@ import { useDeletedSecrets, useDestroySecret, useRestoreSecret } from '@/hooks/u
 import { useScope } from '@/context/scopeContext'
 import type { DeletedSecret } from '@/services/api/types'
 
+const DEFAULT_SORT: SortingState = [{ id: 'deleted', desc: true }]
+// Stable identity: secret's engine filters client-side and re-runs its memo
+// whenever this changes. See ProjectsPage for the full note.
+const SEARCH_FIELDS = (row: DeletedSecret) => [row.key, row.folder_path]
+
 /**
  * The recovery window.
  *
@@ -17,6 +22,9 @@ import type { DeletedSecret } from '@/services/api/types'
  * destroy date. DESTROY IS THE ONE ACTION IN THIS CONSOLE WITH NO WAY BACK, so
  * it uses auth's type-to-confirm `DeleteConfirmationDialog` — the operator has to
  * type the key — instead of a one-click confirm.
+ *
+ * The shell is auth's standard listing shape: centred `max-w-6xl` column →
+ * `PageHeader` → `ResourceListing tableInCard`.
  */
 export default function DeletedPage() {
   const { project, environment } = useScope()
@@ -40,7 +48,7 @@ export default function DeletedPage() {
   )
 
   return (
-    <PageContainer>
+    <div className="mx-auto flex w-full max-w-6xl flex-col gap-4">
       <PageHeader
         title="Deleted secrets"
         icon={Trash2}
@@ -55,10 +63,11 @@ export default function DeletedPage() {
         />
       ) : (
         <ResourceListing<DeletedSecret>
+          tableInCard
           rows={deleted.data ?? []}
           columns={columns}
-          defaultSort={[{ id: 'deleted', desc: true }]}
-          searchFields={(row) => [row.key, row.folder_path]}
+          defaultSort={DEFAULT_SORT}
+          searchFields={SEARCH_FIELDS}
           searchPlaceholder="Search deleted secrets"
           isLoading={deleted.isLoading}
           error={deleted.error}
@@ -84,6 +93,6 @@ export default function DeletedPage() {
         isDeleting={destroy.isPending}
         confirmLabel="Destroy permanently"
       />
-    </PageContainer>
+    </div>
   )
 }

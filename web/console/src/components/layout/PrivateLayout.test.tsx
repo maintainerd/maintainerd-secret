@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render, screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { PrivateLayout } from './PrivateLayout'
 import { AuthContext, type AuthContextValue } from '@/auth/authContext'
@@ -156,5 +157,89 @@ describe('PrivateLayout', () => {
     expect(screen.getByText('No credentials')).toBeInTheDocument()
     expect(screen.queryByText('Guarded')).not.toBeInTheDocument()
     expect(screen.queryByText(/reports its guard is development-open/)).not.toBeInTheDocument()
+  })
+})
+
+/**
+ * Mounts the layout the way App.tsx does: ONE layout element with every signed-in
+ * route nested beneath it.
+ *
+ * That structure is the fix, and this is the shape it has to keep. It used to be
+ * two sibling `<PrivateLayout>` elements — one full-width for /browse, one capped
+ * for the rest — and two element positions in a route tree are two component
+ * instances. Crossing between /browse and anything else therefore unmounted the
+ * whole shell and mounted the other one: the `SidebarProvider` was rebuilt from
+ * `defaultOpen`, so a collapsed rail sprang back open, and the sidebar container
+ * remounted part-way through its 200ms `transition-[left,right,width]` and
+ * replayed it. That is the "sticking", and it read as intermittent because it only
+ * happened on the navigations that crossed between the two layouts.
+ */
+function renderRoutedShell(initial = '/projects') {
+  return render(
+    <ConsoleBrandingProvider>
+      <AuthContext.Provider value={auth('authenticated')}>
+        <ScopeContext.Provider value={scope()}>
+          <MemoryRouter initialEntries={[initial]}>
+            <Routes>
+              <Route element={<PrivateLayout />}>
+                <Route path="/browse" element={<p>secrets body</p>} />
+                <Route path="/projects" element={<p>projects body</p>} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </ScopeContext.Provider>
+      </AuthContext.Provider>
+    </ConsoleBrandingProvider>,
+  )
+}
+
+function railState(): string | null | undefined {
+  return document.querySelector('[data-slot="sidebar"]')?.getAttribute('data-state')
+}
+
+describe('PrivateLayout sidebar stability across navigation', () => {
+  beforeEach(() => {
+    document.cookie = 'sidebar_state=; path=/; max-age=0'
+  })
+
+  it('keeps the rail collapsed when navigating between the browse and listing routes', async () => {
+    const user = userEvent.setup()
+    renderRoutedShell('/projects')
+
+    await user.click(screen.getByRole('button', { name: /toggle sidebar/i }))
+    expect(railState()).toBe('collapsed')
+
+    // /browse and /projects are the two routes that used to live under DIFFERENT
+    // layout elements, so this is exactly the navigation that lost the state.
+    await user.click(screen.getAllByRole('link', { name: 'Secrets' })[0])
+    expect(await screen.findByText('secrets body')).toBeInTheDocument()
+    expect(railState()).toBe('collapsed')
+
+    await user.click(screen.getAllByRole('link', { name: 'Projects' })[0])
+    expect(await screen.findByText('projects body')).toBeInTheDocument()
+    expect(railState()).toBe('collapsed')
+  })
+
+  it('keeps the brand bar and rail mounted across that navigation', async () => {
+    const user = userEvent.setup()
+    renderRoutedShell('/browse')
+
+    const barBefore = document.querySelector('[data-console-sidebar]')
+    await user.click(screen.getAllByRole('link', { name: 'Projects' })[0])
+    expect(await screen.findByText('projects body')).toBeInTheDocument()
+
+    // Same DOM node, not a replacement — a remounted rail is what replayed the
+    // slide animation from scratch.
+    expect(document.querySelector('[data-console-sidebar]')).toBe(barBefore)
+  })
+
+  it('leaves the content width to the page, capping nothing itself', async () => {
+    renderRoutedShell('/browse')
+
+    // Auth mounts this layout full-width and lets its listing pages own
+    // `mx-auto max-w-6xl`. Capping here as well double-capped every page that
+    // already capped itself, insetting the tables by the main element's padding.
+    const main = document.querySelector('main[class*="flex-1"]')
+    expect(main?.className).not.toMatch(/max-w-/)
   })
 })

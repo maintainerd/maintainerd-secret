@@ -67,9 +67,33 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       ? capabilities.data.guard_mode !== 'dev-open'
       : identity !== null // fallback: probe failed, guess as this console used to
 
+  /**
+   * Starts a visible sign-in — AT MOST ONCE PER PAGE LOAD.
+   *
+   * The single-flight guard is not a micro-optimization; without it a 401 breaks
+   * sign-in outright. Two independent callers react to the same expiry: the axios
+   * interceptor invokes the unauthenticated handler below, and `clearAccessToken`
+   * simultaneously flips `mode` to `anonymous`, which sends `RequireAuth` to
+   * /login, whose own effect calls this too. Each call mints a fresh `state` +
+   * `code_verifier` and writes them to the SINGLE pending-flow slot in
+   * sessionStorage (`oauthFlow.ts`), then navigates. `startLogin` awaits the PKCE
+   * digest before doing either, so the two interleave freely: the browser can
+   * commit the first authorize URL while the second call has already overwritten
+   * the stored flow. The callback then arrives bearing `state` A against stored
+   * state B, `consumePendingOAuthFlow` correctly refuses it as a CSRF mismatch,
+   * and the operator is told their sign-in link is no longer valid — on every
+   * expiry.
+   *
+   * One flight, one stored flow, one navigation. The ref is never reset because
+   * the page is leaving; a caller that wants a different destination has to win
+   * the race, which is why the interceptor is registered as the LAST word on
+   * where an expired session lands.
+   */
+  const redirectingRef = useRef(false)
   const signIn = useCallback(
     (returnTo?: string) => {
-      if (!identity) return
+      if (!identity || redirectingRef.current) return
+      redirectingRef.current = true
       const target =
         safeReturnTo(returnTo) ??
         safeReturnTo(`${window.location.pathname}${window.location.search}`) ??

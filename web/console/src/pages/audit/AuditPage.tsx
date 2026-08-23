@@ -7,7 +7,6 @@ import {
 } from '@tanstack/react-table'
 import { ScrollText } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { PageContainer } from '@/components/layout/PageContainer'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { DataTable, DataTableEmpty, DataTablePagination } from '@/components/data-table'
 import { FormInputField, FormSelectField } from '@/components/form'
@@ -38,12 +37,20 @@ const TEXT_FILTER_DEBOUNCE_MS = 350
 /**
  * The access trail.
  *
- * Composed on maintainerd-auth's listing primitives — `PageContainer`,
- * `PageHeader`, `DataTable`, `DataTablePagination` — but NOT on
- * `ResourceListing`, whose toolbar is a single free-text search box. This trail
- * needs six distinct predicates with different semantics (two exact, two prefix,
- * a date range) and collapsing them into one box would hide which of them is
- * being applied.
+ * Composed on maintainerd-auth's listing primitives — its page shell,
+ * `PageHeader`, `DataTable`, `DataTablePagination` — but NOT on `ResourceListing`,
+ * whose toolbar is a single free-text search box. This trail needs six distinct
+ * predicates with different semantics (two exact, two prefix, a date range) and
+ * collapsing them into one box would hide which of them is being applied.
+ *
+ * Because it bypasses `ResourceListing`, IT HAS TO REPRODUCE THAT COMPONENT'S
+ * `tableInCard` SHELL BY HAND — the `data-md-table-shell` bordered card with the
+ * 16px first/last-column gutters, copied verbatim from
+ * `components/data-table/ResourceListing.tsx`. It previously used the OTHER branch
+ * of that component (the `-mx-6` full-bleed, which only makes sense inside a
+ * `PageContainer` card) and so was the one listing in this console framed
+ * differently from every other. If that shell ever changes, change it in
+ * `ResourceListing` and mirror it here.
  *
  * THE FILTERS SEARCH THE WHOLE TRAIL. They are query parameters the service
  * applies in SQL, so `total` below is the number of matching events and the
@@ -138,7 +145,7 @@ export default function AuditPage() {
   })
 
   return (
-    <PageContainer>
+    <div className="mx-auto flex w-full max-w-6xl flex-col gap-4">
       <PageHeader
         title="Audit log"
         icon={ScrollText}
@@ -192,7 +199,10 @@ export default function AuditPage() {
         />
       </div>
 
-      <div className="-mx-6 md:[&_td:first-child]:pl-6 md:[&_td:last-child]:pr-6 md:[&_th:first-child]:pl-6 md:[&_th:last-child]:pr-6">
+      <div
+        data-md-table-shell
+        className="overflow-hidden rounded-[3px] border border-border bg-card [&_table]:border-b-0 [&_tbody_tr:last-child]:border-b-0 md:[&_td:first-child]:pl-4 md:[&_td:last-child]:pr-4 md:[&_th:first-child]:pl-4 md:[&_th:last-child]:pr-4"
+      >
         <DataTable
           table={table}
           columnCount={columns.length}
@@ -225,6 +235,6 @@ export default function AuditPage() {
         rowCount={audit.total}
         pageSizeOptions={[PAGE_SIZE]}
       />
-    </PageContainer>
+    </div>
   )
 }

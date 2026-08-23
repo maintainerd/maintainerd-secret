@@ -69,14 +69,19 @@ function App() {
                 />
 
                 <Route element={<ProtectedShell />}>
-                  {/* The browser needs the full width for its folder column. */}
-                  <Route element={<PrivateLayout fullWidth />}>
-                    <Route path="/browse" element={<BrowsePage />} />
-                  </Route>
-
-                  {/* Everything else keeps auth's centred, width-capped column. */}
+                  {/* ONE layout element for every signed-in route — that is what
+                      keeps the chrome mounted across navigation. This used to be
+                      two sibling <PrivateLayout> elements, one full-width for
+                      /browse and one width-capped for the rest; two positions in
+                      the route tree are two component instances, so crossing
+                      between them remounted the sidebar and reset its collapsed
+                      state. Width is the PAGE's business now, which is also auth's
+                      model: the listing pages centre themselves in a max-w-6xl
+                      column and /browse spreads, because its folder tree needs a
+                      column of its own. */}
                   <Route element={<PrivateLayout />}>
                     <Route path="/" element={<Navigate to="/browse" replace />} />
+                    <Route path="/browse" element={<BrowsePage />} />
                     <Route path="/projects" element={<ProjectsPage />} />
                     <Route path="/projects/:slug" element={<ProjectDetailsPage />} />
                     <Route path="/webhooks" element={<WebhooksPage />} />

@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import { FolderPlus, FolderTree as FolderTreeIcon, MoveRight, Plus } from 'lucide-react'
+import type { SortingState } from '@tanstack/react-table'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Label } from '@/components/ui/label'
@@ -23,6 +24,18 @@ import { useScope } from '@/context/scopeContext'
 import { ROOT_PATH, normalizePath } from '@/lib/paths'
 import type { SecretAddress, SecretMeta } from '@/services/api/types'
 
+const DEFAULT_SORT: SortingState = [{ id: 'key', desc: false }]
+
+/**
+ * The fields the toolbar's filter box matches on.
+ *
+ * METADATA ONLY, and that is a constraint rather than a convenience: `SecretMeta`
+ * has no value field, so there is nothing here that could match against a secret's
+ * contents even by accident. Module-level for a stable identity — secret's listing
+ * engine filters in the browser and re-runs its memo whenever this changes.
+ */
+const SEARCH_FIELDS = (row: SecretMeta) => [row.key, row.description, row.tags.join(' ')]
+
 /**
  * The secret browser: folder tree on the left, the folder's secrets on the right.
  *
@@ -40,8 +53,16 @@ import type { SecretAddress, SecretMeta } from '@/services/api/types'
  *     that in history).
  *
  * Everything else is maintainerd-auth's listing shape: a `PageHeader`, a
- * `ResourceListing` (toolbar → table → pagination) and the shared row-actions
- * menu, laid out full-width because the tree needs a column of its own.
+ * `ResourceListing tableInCard` (toolbar → table → pagination) and the shared
+ * row-actions menu, laid out full-width because the tree needs a column of its
+ * own — which is why this page, alone among the listings, does not cap itself to
+ * `max-w-6xl`.
+ *
+ * THE SECRETS PANE IS NOT WRAPPED IN A CARD OF ITS OWN. It used to be, which made
+ * the landing screen the odd one out: the toolbar and pagination sat inside a card
+ * around an unbordered table, where auth puts a bordered table on the page
+ * background with the toolbar and pagination outside it. That is what
+ * `tableInCard` does, and it is passed below.
  */
 export default function BrowsePage() {
   const { project, environment, loading: scopeLoading, error: scopeError } = useScope()
@@ -130,7 +151,7 @@ export default function BrowsePage() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="flex w-full flex-col gap-4">
       <PageHeader
         title="Secrets"
         icon={FolderTreeIcon}
@@ -178,7 +199,7 @@ export default function BrowsePage() {
         }
       />
 
-      <div className="grid gap-6 lg:grid-cols-[260px_minmax(0,1fr)]">
+      <div className="grid gap-4 lg:grid-cols-[260px_minmax(0,1fr)]">
         <Card className="h-fit py-4">
           <CardHeader className="px-4">
             <div className="flex items-center justify-between gap-2">
@@ -201,42 +222,41 @@ export default function BrowsePage() {
           </CardContent>
         </Card>
 
-        <Card className="min-w-0 py-6">
-          <CardContent className="flex min-w-0 flex-col gap-4 px-6">
-            <FolderBreadcrumb path={folderPath} onNavigate={setFolderPath} />
+        <div className="flex min-w-0 flex-col gap-4">
+          <FolderBreadcrumb path={folderPath} onNavigate={setFolderPath} />
 
-            <ResourceListing<SecretMeta>
-              rows={rows}
-              columns={columns}
-              defaultSort={[{ id: 'key', desc: false }]}
-              searchFields={(row) => [row.key, row.description, row.tags.join(' ')]}
-              searchPlaceholder="Filter by key, description or tag"
-              isLoading={secrets.isLoading}
-              error={secrets.error}
-              onRowClick={(secret) => setDetailAddress(addressOf(secret))}
-              emptyTitle="No secrets here"
-              emptyDescription="This folder is empty. Create a secret to get started."
-              onCreate={() => {
-                setFormMode('create')
-                setFormSecret(null)
-                setFormOpen(true)
-              }}
-              createLabel="New secret"
-              extraActions={
-                <div className="flex items-center gap-2">
-                  <Switch
-                    id="include-subfolders"
-                    checked={includeSubfolders}
-                    onCheckedChange={setIncludeSubfolders}
-                  />
-                  <Label htmlFor="include-subfolders" className="text-sm whitespace-nowrap">
-                    Include subfolders
-                  </Label>
-                </div>
-              }
-            />
-          </CardContent>
-        </Card>
+          <ResourceListing<SecretMeta>
+            tableInCard
+            rows={rows}
+            columns={columns}
+            defaultSort={DEFAULT_SORT}
+            searchFields={SEARCH_FIELDS}
+            searchPlaceholder="Filter by key, description or tag"
+            isLoading={secrets.isLoading}
+            error={secrets.error}
+            onRowClick={(secret) => setDetailAddress(addressOf(secret))}
+            emptyTitle="No secrets here"
+            emptyDescription="This folder is empty. Create a secret to get started."
+            onCreate={() => {
+              setFormMode('create')
+              setFormSecret(null)
+              setFormOpen(true)
+            }}
+            createLabel="New secret"
+            extraActions={
+              <div className="flex items-center gap-2">
+                <Switch
+                  id="include-subfolders"
+                  checked={includeSubfolders}
+                  onCheckedChange={setIncludeSubfolders}
+                />
+                <Label htmlFor="include-subfolders" className="text-sm whitespace-nowrap">
+                  Include subfolders
+                </Label>
+              </div>
+            }
+          />
+        </div>
       </div>
 
       {project && environment && (

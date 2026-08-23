@@ -32,6 +32,37 @@ const SIDEBAR_WIDTH_MOBILE = "18rem"
 const SIDEBAR_WIDTH_ICON = "3rem"
 const SIDEBAR_KEYBOARD_SHORTCUT = "b"
 
+/**
+ * Reads back the collapsed/expanded state `setOpen` writes below.
+ *
+ * `sidebar_state` is CHROME STATE — which way the nav rail is pointing — and is
+ * the only cookie this console sets. It must never become anything else: the
+ * access token lives in memory only (see `auth/tokenStore.ts`), and no session,
+ * scope or secret address may be added here.
+ *
+ * Upstream shadcn writes this cookie so a SERVER render can seed `defaultOpen`.
+ * This console has no server render, so nothing ever read it back and the write
+ * was dead weight — every reload snapped a collapsed sidebar open again. The read
+ * happens here instead, during the `useState` initializer, so the first paint is
+ * already correct and there is no expanded-then-collapsed flash.
+ *
+ * Returns `undefined` when absent or unparseable, so the caller keeps its
+ * `defaultOpen`.
+ */
+function readSidebarStateCookie(): boolean | undefined {
+  if (typeof document === "undefined") return undefined
+  for (const entry of document.cookie.split(";")) {
+    const separator = entry.indexOf("=")
+    if (separator === -1) continue
+    if (entry.slice(0, separator).trim() !== SIDEBAR_COOKIE_NAME) continue
+    const value = entry.slice(separator + 1).trim()
+    if (value === "true") return true
+    if (value === "false") return false
+    return undefined
+  }
+  return undefined
+}
+
 type SidebarContextProps = {
   state: "expanded" | "collapsed"
   open: boolean
@@ -71,7 +102,9 @@ function SidebarProvider({
 
   // This is the internal state of the sidebar.
   // We use openProp and setOpenProp for control from outside the component.
-  const [_open, _setOpen] = React.useState(defaultOpen)
+  // Seeded from the persisted cookie so a collapsed rail survives a reload; the
+  // initializer runs once, so a later cookie change never yanks it mid-session.
+  const [_open, _setOpen] = React.useState(() => readSidebarStateCookie() ?? defaultOpen)
   const open = openProp ?? _open
   const setOpen = React.useCallback(
     (value: boolean | ((value: boolean) => boolean)) => {

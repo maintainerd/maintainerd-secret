@@ -1,9 +1,9 @@
 import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Layers, Webhook } from 'lucide-react'
-import { PageContainer } from '@/components/layout/PageContainer'
+import type { SortingState } from '@tanstack/react-table'
 import { PageHeader } from '@/components/layout/PageHeader'
-import { ResourceListing } from '@/components/data-table'
+import { ResourceListing, type FilterGroup } from '@/components/data-table'
 import { EmptyState } from '@/components/details'
 import { WebhookFormDialog } from './components/WebhookFormDialog'
 import { buildWebhookColumns } from './components/webhookColumns'
@@ -11,13 +11,28 @@ import { useDeleteWebhook, useWebhooks } from '@/hooks/useWebhooks'
 import { useScope } from '@/context/scopeContext'
 import type { WebhookEndpoint } from '@/services/api/types'
 
+const DEFAULT_SORT: SortingState = [{ id: 'url', desc: false }]
+const FILTER_GROUPS: readonly FilterGroup[] = [
+  { key: 'status', label: 'Status', options: ['active', 'suspended', 'disabled'] },
+]
+// Stable identity: secret's engine filters client-side and re-runs its memo
+// whenever this changes. See ProjectsPage for the full note.
+const SEARCH_FIELDS = (row: WebhookEndpoint) => [
+  row.url,
+  row.description,
+  row.events.join(' '),
+]
+
 /**
  * Webhook endpoints for the selected project.
  *
- * The standard maintainerd-auth listing: `PageContainer` → `PageHeader` →
- * `ResourceListing`. Deliveries live on the endpoint's detail route, the way
- * auth puts a webhook's deliveries on its detail page — an endpoint UUID in the
- * URL is safe, since it names a destination and not a secret.
+ * maintainerd-auth's standard listing page: a centred `max-w-6xl` column →
+ * `PageHeader` → `ResourceListing tableInCard`, matching
+ * `pages/webhooks/WebhooksPage.tsx` in auth (which passes `tableInCard` too).
+ *
+ * Deliveries live on the endpoint's detail route, the way auth puts a webhook's
+ * deliveries on its detail page — an endpoint UUID in the URL is safe, since it
+ * names a destination and not a secret.
  */
 export default function WebhooksPage() {
   const navigate = useNavigate()
@@ -42,7 +57,7 @@ export default function WebhooksPage() {
   )
 
   return (
-    <PageContainer>
+    <div className="mx-auto flex w-full max-w-6xl flex-col gap-4">
       <PageHeader
         title="Webhooks"
         icon={Webhook}
@@ -57,14 +72,15 @@ export default function WebhooksPage() {
         />
       ) : (
         <ResourceListing<WebhookEndpoint>
+          tableInCard
           rows={webhooks.data?.rows ?? []}
           columns={columns}
-          defaultSort={[{ id: 'url', desc: false }]}
-          searchFields={(row) => [row.url, row.description, row.events.join(' ')]}
+          defaultSort={DEFAULT_SORT}
+          searchFields={SEARCH_FIELDS}
           searchPlaceholder="Search endpoints"
           isLoading={webhooks.isLoading}
           error={webhooks.error}
-          filterGroups={STATUS_FILTERS}
+          filterGroups={FILTER_GROUPS}
           onRowClick={(endpoint) =>
             navigate(`/webhooks/${encodeURIComponent(endpoint.endpoint_uuid)}`)
           }
@@ -79,10 +95,6 @@ export default function WebhooksPage() {
       {project && (
         <WebhookFormDialog project={project} open={createOpen} onOpenChange={setCreateOpen} />
       )}
-    </PageContainer>
+    </div>
   )
 }
-
-const STATUS_FILTERS = [
-  { key: 'status', label: 'Status', options: ['active', 'suspended', 'disabled'] },
-] as const

@@ -6,18 +6,12 @@ import { AppTopNav } from '@/components/navigation/AppTopNav'
 import { ScopeSwitcher } from '@/components/navigation/ScopeSwitcher'
 import { SidebarProvider, SidebarInset } from '@/components/ui/sidebar'
 import { useAuth } from '@/auth/authContext'
-import { cn } from '@/lib/utils'
-
-interface PrivateLayoutProps {
-  fullWidth?: boolean
-}
 
 /**
  * The signed-in chrome: brand bar across the top, sidebar and content beneath.
  *
  * Copied from maintainerd-auth's `components/layout/PrivateLayout.tsx` — same
- * 17rem sidebar, same `pt-14` inset, same max-w-6xl content column — with one
- * addition that is not cosmetic:
+ * 17rem sidebar, same `pt-14` inset — with one addition that is not cosmetic:
  *
  * THE GUARD-OPEN BANNER IS PERMANENT AND NOT DISMISSIBLE. A vault whose API
  * serves unauthenticated callers as a blanket-granted principal is safe only as
@@ -31,10 +25,26 @@ interface PrivateLayoutProps {
  * gets its own banner and its own text, because "no token is needed" and "a token
  * is required and I cannot get one" must not read the same.
  *
+ * THERE IS NO `fullWidth` PROP, AND THIS MOUNTS EXACTLY ONCE. It used to take
+ * one, and App.tsx declared the layout TWICE — `<PrivateLayout fullWidth/>` for
+ * /browse and `<PrivateLayout/>` for everything else. Two `element=` positions in
+ * the route tree are two component instances, so crossing between /browse and any
+ * other route unmounted this whole subtree and mounted the other: the
+ * `SidebarProvider` was recreated (a collapsed rail sprang back open), and the
+ * sidebar container remounted mid-animation, replaying its 200ms
+ * `transition-[left,right,width]` from scratch. That is the "sticking" — it looked
+ * intermittent only because it happened on some navigations and not others.
+ *
+ * The width fix is auth's own: auth mounts this layout once and always
+ * full-width, and its LISTING PAGES own `mx-auto max-w-6xl` (see
+ * `pages/tenants/TenantsPage.tsx`). Capping here as well double-capped every page
+ * that already capped itself, insetting secret's tables by the main element's
+ * padding. Pages that want the centred column ask for it; /browse simply does not.
+ *
  * Access gating (auth, setup completion, scope) is handled by the route tree in
  * App.tsx; this layout only renders chrome.
  */
-export function PrivateLayout({ fullWidth = false }: PrivateLayoutProps) {
+export function PrivateLayout() {
   const { mode, capabilities } = useAuth()
 
   return (
@@ -97,12 +107,7 @@ export function PrivateLayout({ fullWidth = false }: PrivateLayoutProps) {
             <ScopeSwitcher className="[&_button]:border-border [&_button]:bg-background [&_button]:text-foreground" />
           </div>
 
-          <main
-            className={cn(
-              'flex-1 px-4 py-6 sm:px-6 sm:py-8',
-              !fullWidth && 'mx-auto w-full max-w-6xl',
-            )}
-          >
+          <main className="flex-1 px-4 py-6 sm:px-6 sm:py-8">
             <Outlet />
           </main>
         </SidebarInset>
