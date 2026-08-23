@@ -65,11 +65,17 @@ export function AppTopNav() {
           data-console-top-control
           className="size-10 bg-white/5 text-slate-300 hover:bg-white/10 hover:text-white active:!bg-white/15 active:!text-white"
         />
-        {/* The transparent mark, not the plated app icon: the bar is slate-950,
-            and a white icon plate would read as a sticker on it. The label drops
-            below sm, leaving the mark alone — auth's collapsed treatment. */}
+        {/* The SECRET service mark, not the platform mark — this bar belongs to
+            Secret's console, and the padlock is what identifies it.
+
+            It is the `icon` asset rather than `mark`: `mark` inlines the generic
+            maintainerd glyph, which said "maintainerd" where it should say
+            "Secret". The asset is a transparent PNG, so it sits on the slate-950
+            bar without the white plate that would read as a sticker. The label
+            drops below sm, leaving the padlock alone — auth's collapsed
+            treatment. */}
         <BrandLockup
-          asset="mark"
+          asset="icon"
           orientation="inline"
           iconSize={28}
           onDark

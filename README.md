@@ -1,5 +1,5 @@
 <div align="left">
-  <img src=".github/assets/secret.svg" alt="" height="70" align="left">
+  <img src=".github/assets/secret.png" alt="" height="70" align="left">
   <h1>&nbsp;Maintainerd Secret</h1>
 </div>
 

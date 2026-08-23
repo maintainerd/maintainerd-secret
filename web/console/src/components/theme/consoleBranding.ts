@@ -9,6 +9,20 @@
  * branding endpoint, `ConsoleBrandingProvider` is the only file that changes.
  *
  * The asset paths are the OFFICIAL maintainerd assets in `public/`.
+ *
+ * THE ICON IS THE SECRET SERVICE MARK, not the platform mark. `secret.png` and
+ * `secret.svg` are copied byte-for-byte from the platform's service icon set
+ * (`maintainerd.github.io` → `static/assets/icons/secret.svg`), so this console
+ * is identifiable as Secret rather than as maintainerd-in-general. Do not
+ * recolour or redraw them here: a second, subtly different copy of a shipped
+ * brand asset is worse than any contrast problem it might solve, and the fix
+ * belongs in the icon set.
+ *
+ * One asset serves both colour schemes. The padlock is blue on transparency, so
+ * it reads on the light content area and on the dark top nav; there is no
+ * light/dark pair to choose between, which is why `iconUrl` and `iconDarkUrl`
+ * are the same file. The field pair is kept because auth has it and because a
+ * future dark variant would slot in without touching any consumer.
  */
 
 export interface ConsoleBranding {
@@ -20,7 +34,15 @@ export interface ConsoleBranding {
   iconUrl: string
   /** Square icon for a dark background (the top nav, dark mode). */
   iconDarkUrl: string
-  /** The full horizontal lockup. */
+  /**
+   * The large brand asset, used on the login screen.
+   *
+   * Auth points this at a horizontal wordmark. Secret has no wordmark of its own
+   * — the service icon set ships a square mark and nothing else — so this is the
+   * same square asset rendered larger, and `BrandLockup` supplies the product
+   * name as text beside it. If a Secret wordmark is ever drawn, this is the only
+   * field that changes.
+   */
   logoUrl: string
   faviconUrl: string
 }
@@ -28,10 +50,10 @@ export interface ConsoleBranding {
 export const CONSOLE_BRANDING: ConsoleBranding = {
   appName: 'Maintainerd Secret',
   appDetail: 'Secrets & configuration vault',
-  iconUrl: '/maintainerd-icon.svg',
-  iconDarkUrl: '/maintainerd-icon-dark.svg',
-  logoUrl: '/maintainerd-logo.svg',
-  faviconUrl: '/favicon.svg',
+  iconUrl: '/secret.png',
+  iconDarkUrl: '/secret.png',
+  logoUrl: '/secret.png',
+  faviconUrl: '/secret.svg',
 }
 
 /** The colour scheme the console is painting in. */

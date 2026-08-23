@@ -62,15 +62,34 @@ was auth-domain-specific, the *pattern* came over and the domain did not:
 
 ## Branding
 
-The official assets live in `public/` and are wired through `BrandLockup` and
-`ConsoleBrandingProvider`, the way auth wires a tenant's logo:
+The assets live in `public/` and are wired through `BrandLockup` and
+`ConsoleBrandingProvider`, the way auth wires a tenant's logo.
+
+**The mark is the Secret service icon, not the platform icon.** `secret.png` and
+`secret.svg` are copied byte-for-byte from the platform's service icon set
+(`maintainerd.github.io` → `static/assets/icons/secret.svg`), so this console reads as
+Secret rather than as maintainerd-in-general. Do not recolour or redraw them here — a
+second, subtly different copy of a shipped brand asset is worse than the contrast
+problem it would solve, and that fix belongs in the icon set.
 
 | Asset | Where |
 |---|---|
-| `maintainerd-logo.svg` | Sign-in and the first-run wizard (`LoginLayout`) — the full lockup. |
-| `maintainerd-icon.svg` / `maintainerd-icon-dark.svg` | The bootstrap splash. The provider picks the variant matching `prefers-color-scheme`. |
-| `maintainerd-mark.svg` | The slate brand bar, inlined by `components/icon/MaintainerdMark` — a transparent mark, because a white app-icon plate reads as a sticker on a dark bar. The label drops below `sm`, leaving the mark alone. |
-| `favicon.svg` | `index.html`, re-asserted by the provider. |
+| `secret.png` | Every rendered surface: the slate brand bar (`AppTopNav`), the bootstrap splash (`AppLoadingScreen`), and sign-in / the first-run wizard (`LoginLayout`). A transparent PNG, so it sits on the dark bar without the white plate that would read as a sticker. The label drops below `sm`, leaving the padlock alone. |
+| `secret.svg` | The favicon — `index.html`, re-asserted by the provider. Vector, because a favicon renders at 16px. |
+
+`iconUrl` and `iconDarkUrl` point at the **same** file: the padlock is blue on
+transparency, so it reads on both the light content area and the dark bar. The field pair
+is kept because auth has it, and so a future dark variant needs no consumer changes.
+
+Secret has **no horizontal wordmark** — the icon set ships a square mark and nothing else
+— so `logoUrl` is that same square asset rendered larger, with `BrandLockup` supplying the
+product name as text beside it.
+
+The generic platform assets (`maintainerd-logo.svg`, `maintainerd-icon*.svg`,
+`maintainerd-mark.svg`, `favicon.svg`) are still in `public/`, and
+`components/icon/MaintainerdMark` still backs `BrandLockup`'s `mark` variant. Nothing in
+the app renders them now; they are kept because the platform mark remains part of the
+design system.
 
 The app renders as **Maintainerd Secret** everywhere (`components/theme/consoleBranding.ts`).
 Light/dark follows the operator's OS preference; there is no in-app toggle, so the
