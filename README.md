@@ -1,8 +1,5 @@
 <div align="left">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/maintainerd-icon-light.svg">
-    <img src=".github/assets/maintainerd-icon-dark.svg" alt="" height="70" align="left">
-  </picture>
+  <img src=".github/assets/secret.svg" alt="" height="70" align="left">
   <h1>&nbsp;Maintainerd Secret</h1>
 </div>
 
