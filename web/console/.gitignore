@@ -12,6 +12,12 @@ dist
 dist-ssr
 coverage
 *.local
+# ...but NOT the dev stack's build file. `*.local` comes from Vite's template,
+# where it means .env.local and friends — it silently swallowed Dockerfile.local
+# too, so the file docker-compose.yml builds this console FROM was untracked. A
+# fresh clone had no Dockerfile.local and `./maintainerd up --build` failed on a
+# missing file. maintainerd-auth tracks its copies; this brings the two in line.
+!Dockerfile.local
 
 # Local environment. NEVER commit one: even though this console is a public
 # OAuth client with no client secret, a real .env pins an operator's hosts.
